@@ -285,7 +285,7 @@ func cleanResponse(resp string) string {
 }
 
 func IdentifyService(banner string, port int) string {
-	fmt.Printf("\n端口: %d\n[原始Banner开始]==========\n%s\n[原始Banner结束]==========\n", port, banner)
+	//fmt.Printf("\n端口: %d\n[原始Banner开始]==========\n%s\n[原始Banner结束]==========\n", port, banner)
 
 	banner = cleanResponse(banner)
 

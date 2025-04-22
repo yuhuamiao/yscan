@@ -73,27 +73,27 @@ func main() {
 	//fmt.Scan(&count, &timeout)
 
 	if IsHostAlive(scan.ip) {
-		Run(scan.ip, scan.network)
-		//openPorts := Run(scan.ip, scan.network)
-		//for _, result := range openPorts {
-		//	if err := SaveResult(db, result); err != nil {
-		//		log.Printf("存储失败 %s: %v", result.address, err)
-		//	} else {
-		//		log.Printf("成功储存 %s", result.address)
-		//	}
-		//}
+		//Run(scan.ip, scan.network)
+		openPorts := Run(scan.ip, scan.network)
+		for _, result := range openPorts {
+			if err := SaveResult(db, result); err != nil {
+				log.Printf("存储失败 %s: %v", result.address, err)
+			} else {
+				log.Printf("成功储存 %s", result.address)
+			}
+		}
 	} else {
 		fmt.Println("Can't ping")
 		if IsHostAlive_TCP(scan.ip) {
-			Run(scan.ip, scan.network)
-			//openPorts := Run(scan.ip, scan.network)
-			//for _, result := range openPorts {
-			//	if err := SaveResult(db, result); err != nil {
-			//		log.Printf("存储失败 %s: %v", result.address, err)
-			//	} else {
-			//		log.Printf("成功储存 %s", result.address)
-			//	}
-			//}
+			//Run(scan.ip, scan.network)
+			openPorts := Run(scan.ip, scan.network)
+			for _, result := range openPorts {
+				if err := SaveResult(db, result); err != nil {
+					log.Printf("存储失败 %s: %v", result.address, err)
+				} else {
+					log.Printf("成功储存 %s", result.address)
+				}
+			}
 		} else {
 			fmt.Printf("%s is not alive\n", scan.ip)
 		}
