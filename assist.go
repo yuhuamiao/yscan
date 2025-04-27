@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"github.com/PuerkitoBio/goquery"
 	"log"
 	"net"
+	"net/http"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -91,4 +93,22 @@ func ErrType(scan scanResult) string { //产生错误的类型
 	} else {
 		return "other" //fmt.Printf("[-] %s - Error: %v", scan.address, scan.err)
 	}
+}
+
+// GetWebsiteTitle 获取网站标题
+func GetWebsiteTitle(ip string, port int) string { //用于子域名收集功能，提取网站的标题
+	url := fmt.Sprintf("http://%s:%d", ip, port)
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	// 提取<title>标签内容
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return ""
+	}
+	return doc.Find("title").Text()
 }
