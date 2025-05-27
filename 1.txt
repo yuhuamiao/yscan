@@ -1,16 +1,15 @@
+main.go
 package main
 
 import (
+	"database/sql"
 	"fmt"
-	"os/exec"
+	_ "github.com/go-sql-driver/mysql"
 	"strings"
 
 	//"github.com/go-ping/ping"
 	"log"
 	"net"
-	"runtime"
-	"strconv"
-	"sync"
 	"time"
 )
 
@@ -30,185 +29,1269 @@ type scanResult struct {
 	banner  string
 }
 
-func validateInput(network string, address string) error { //检验用户输入
-	switch network {
-	case "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6":
-	default:
-		return fmt.Errorf("invalid network type: %s", network)
-	}
-	_, _, err := net.SplitHostPort(address) //分析地址是否正确
-	if err != nil {
-		return fmt.Errorf("invalid address: %s\nThis is error: %v", address, err)
-	}
-	return nil
+func printProgress(current, total int, start time.Time) { //进度显示打印
+	percent := float64(current) / float64(total) * 100
+	elapsed := time.Since(start).Round(time.Second)
+
+	// \r 让光标回到行首，实现原地刷新
+	fmt.Printf("\rScanning: %d/%d (%.1f%%) | Elapsed: %v",
+		current, total, percent, elapsed)
 }
 
-//func ishostAlive(ip string, count int, timeout time.Duration) bool { //检验主机是否存活，用的是 go-ping 库
-//	pinger, err := ping.NewPinger(ip)
-//	if err != nil {
-//		log.Printf("Error creating pinger: %v", err)
-//		return false
-//	}
-//
-//	pinger.SetPrivileged(true)
-//	pinger.Count = count
-//	pinger.Timeout = timeout
-//
-//	if err := pinger.Run(); err != nil {
-//		log.Printf("Ping failed: %v", err)
-//		return false
-//	}
-//	stats := pinger.Statistics()
-//	return stats.PacketsRecv > 0
-//}
+func printOpenPorts(results []scanResult) { //扫描结果打印
+	fmt.Println("\n=== 开放端口详情 ===")
+	fmt.Printf("%-20s\t%-25s\t%-30s\n", "地址", "服务类型", "Banner信息")
+	for _, r := range results {
+		banner := r.banner
 
-func isHostAlive(ip string) bool { //主机存活检测，用系统 ping 的方式，可以根据不同系统用不同的 ping 命令
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "windows":
-		cmd = exec.Command("ping", "-n", "2", "-w", "2000", ip)
-	default: // Linux/macOS
-		cmd = exec.Command("ping", "-c", "2", "-W", "2", ip)
+		if banner == "" {
+			banner = "[无Banner响应]"
+		} else if len(banner) > 50 {
+			banner = banner[:50] + "..."
+		}
+
+		fmt.Printf("%-20s\t%-25s\t%-30s\n",
+			r.address,
+			r.service,
+			banner)
 	}
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("ping %s failed: %v \noutput: %s", ip, err, string(output))
-		return false
-	}
-	return true
+	fmt.Println("\n=== ---------- ===")
 }
 
-func isHostAlive_TCP(ip string) bool { //主机存活检测，通过 TCP 连接的方法，可以跨系统运用，同时在对应主机禁止 ICMP 的时候使用
-	port := []int{80, 22, 443}
-	for _, port := range port {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 3*time.Second)
-		if err == nil {
-			conn.Close()
+func collectSubdomains(db *sql.DB, scan scanner) { //收集子域名函数
+	var domain string
+
+	fmt.Print("please enter your domain: ")
+	fmt.Scan(&domain)
+
+	var results []CollectResult
+
+	if crtResults, err := (&CRTshCollector{}).Collect(domain, 30*time.Second); err == nil {
+		results = append(results, crtResults...)
+	}
+
+	if searchResults, err := (&SearchEngineCollector{}).Collect(domain, 30*time.Second); err == nil {
+		fmt.Printf("[DEBUG] 搜索引擎结果数量: %d\n", len(searchResults)) // 调试输出，添加这行
+		results = append(results, searchResults...)
+	} else {
+		log.Printf("搜索引擎收集错误: %v", err) // 确保错误可见
+	}
+
+	uniqueIPs := make(map[string]bool) //用于取独特的一个 IP，没有重复
+	var ipsToScan []string
+
+	for _, res := range results {
+		fmt.Printf("[%s] %s (IPs: %v)\n", //打印收集到的子域名结果
+			res.FirstSeen.Format("2006-01-02"),
+			res.Subdomain,
+			res.IPs)
+
+		domainID, err := SaveDomainInfo(db, domain, res.Subdomain, //存入 sql 数据库
+			strings.HasPrefix(res.Subdomain, "*."),
+			"",
+			strings.Join(res.Sources, ","), // ✅ 动态来源
+		)
+
+		if err != nil {
+			log.Printf("保存子域名失败 %s: %v", res.Subdomain, err)
+			continue
+		}
+
+		for _, ip := range res.IPs {
+			ipStr := ip.String()
+			if !uniqueIPs[ipStr] && ip.To4() != nil {
+				uniqueIPs[ipStr] = true
+				ipsToScan = append(ipsToScan, ipStr)
+
+				if err := SaveDomainIP(db, domainID, ipStr, res.Subdomain, nil); err != nil {
+					log.Printf("保存IP关联失败 %s: %v", ipStr, err)
+				}
+			}
+		}
+	}
+
+	var answer string
+	fmt.Print("Subdomain collecting is done. Do the domains need to scan?(y/N): ")
+	fmt.Scan(&answer)
+
+	if answer == "y" {
+		for _, scan.ip = range ipsToScan {
+			domainScan(scan, db)
+		}
+	} else if answer == "n" {
+		fmt.Print("The task is over.")
+	}
+}
+
+func domainScan(scan scanner, db *sql.DB) {
+	fmt.Printf("\n=== 开始域名扫描 %s ===\n", scan.ip)
+
+	if IsHostAlive(scan.ip) {
+		//Run(scan.ip, scan.network)				   //测试用
+		openPorts := Run(scan.ip, scan.network) //真正利用，存储数据库
+		// 3. 保存结果(存储逻辑)
+		if err := SaveDomainScanResult(db, scan.ip, openPorts); err != nil {
+			log.Printf("保存扫描结果失败: %v", err)
+		}
+	} else {
+		fmt.Println("Can't ping")
+		if IsHostAlive_TCP(scan.ip) {
+			//Run(scan.ip, scan.network) 				   //测试用
+			openPorts := Run(scan.ip, scan.network) //真正利用，存储数据库
+			// 3. 保存结果(存储逻辑)
+			if err := SaveDomainScanResult(db, scan.ip, openPorts); err != nil {
+				log.Printf("保存扫描结果失败: %v", err)
+			}
+		} else {
+			log.Print("没有进入TCP连接")
+			fmt.Printf("%s is not alive\n", scan.ip)
+		}
+	}
+}
+
+func portScan(scan scanner, db *sql.DB) { //这是把之前的 端口扫描 和 主机检测 利用整合到一个函数里面，方便调用
+
+	if IsHostAlive(scan.ip) {
+		//Run(scan.ip, scan.network) //这一行是用于测试，结果不进入 sql 数据库
+		openPorts := Run(scan.ip, scan.network) //这一段是真正利用，结果进入 sql 数据库
+		for _, result := range openPorts {
+			if err := SaveResult(db, result); err != nil {
+				log.Printf("存储失败 %s: %v", result.address, err)
+			} else {
+				log.Printf("成功储存 %s", result.address)
+			}
+		}
+	} else {
+		fmt.Println("Can't ping")
+		if IsHostAlive_TCP(scan.ip) {
+			//Run(scan.ip, scan.network) //这一行是用于测试，结果不进入 sql 数据库
+			openPorts := Run(scan.ip, scan.network) //这一段是真正利用，结果进入 sql 数据库
+			for _, result := range openPorts {
+				if err := SaveResult(db, result); err != nil {
+					log.Printf("存储失败 %s: %v", result.address, err)
+				} else {
+					log.Printf("成功储存 %s", result.address)
+				}
+			}
+		} else {
+			log.Print("没有进入TCP连接")
+			fmt.Printf("%s is not alive\n", scan.ip)
+		}
+	}
+}
+
+func main() {
+	db, err := InitDB() //连接数据库
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	var scan scanner
+	scan.network = "tcp"
+
+	var command string
+	fmt.Print("please enter a command(domain/scan): ")
+	fmt.Scan(&command)
+
+	if command == "scan" {
+		fmt.Print("Please enter your ip:")
+		fmt.Scan(&scan.ip)
+
+		portScan(scan, db) //进行扫描
+	} else if command == "domain" {
+		collectSubdomains(db, scan)
+	} else {
+		fmt.Println("please enter a true command.")
+	}
+
+	//var timeout time.Duration
+	//var count int     //这两个是 go-ping 那个主机检测版本要用的变量
+
+	//fmt.Print("Please enter your network:")
+	//fmt.Scan(&scan.network)
+
+	//fmt.Print("IsHostAlive count and time:")
+	//fmt.Scan(&count, &timeout)
+
+}
+domainSearch.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gocolly/colly/v2"
+)
+
+// SearchEngineCollector 结构体命名统一（修复大小写不一致问题）
+type SearchEngineCollector struct {
+	SourceName    string
+	UserAgent     string
+	SearchEngines []SearchEngineConfig
+}
+
+type SearchEngineConfig struct {
+	Name      string
+	URLFormat string
+	Enabled   bool
+}
+
+// 国内搜索引擎配置（修复sogou拼写警告）
+var defaultSearchEngines = []SearchEngineConfig{
+	{
+		Name:      "baidu",
+		URLFormat: "https://www.baidu.com/s?wd=site:%s+-www&rn=50",
+		Enabled:   true,
+	},
+	{
+		Name:      "bing",
+		URLFormat: "https://www.bing.com/search?q=site:%s+-www&count=50",
+		Enabled:   true,
+	},
+	{
+		Name:      "sogou", // 保留但忽略拼写检查
+		URLFormat: "https://www.sogou.com/web?query=site:%s+-www",
+		Enabled:   true,
+	},
+}
+
+// NewSearchEngineCollector 创建收集器（修复函数名大小写）
+func NewSearchEngineCollector() *SearchEngineCollector {
+	return &SearchEngineCollector{
+		SourceName:    "search_engine",
+		UserAgent:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36", // 修复KHTML拼写
+		SearchEngines: defaultSearchEngines,
+	}
+}
+
+func (s *SearchEngineCollector) Collect(domain string, timeout time.Duration) ([]CollectResult, error) {
+	// 保留ctx用于后续扩展（消除未使用警告）
+	_, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	c := colly.NewCollector(
+		colly.UserAgent(s.UserAgent),
+		colly.Async(true),
+	)
+
+	// 配置限制规则
+	c.Limit(&colly.LimitRule{
+		DomainGlob:  "*",
+		Parallelism: 2,
+		Delay:       3 * time.Second,
+	})
+
+	// 子域名正则（修复showurl拼写警告）
+	domainEscaped := regexp.QuoteMeta(domain)
+	re := regexp.MustCompile(`(?i)(?:[a-z0-9-]+\.)+` + domainEscaped)
+
+	var (
+		results     []CollectResult
+		resultMutex sync.Mutex
+	)
+
+	// 回调：提取搜索结果（标准化的class名）
+	c.OnHTML("cite, .c-showurl, .b_algo, a[href*='"+domain+"']", func(e *colly.HTMLElement) {
+		text := strings.TrimSpace(e.Text)
+		if matches := re.FindAllString(text, -1); len(matches) > 0 {
+			resultMutex.Lock()
+			defer resultMutex.Unlock()
+
+			for _, rawSubdomain := range matches {
+				subdomain := strings.ToLower(strings.Trim(rawSubdomain, "."))
+				if !s.isValidSubdomain(subdomain, domain) {
+					continue
+				}
+
+				if !s.containsSubdomain(results, subdomain) {
+					results = append(results, s.createResult(subdomain, e.Request.URL.Host))
+				}
+			}
+		}
+	})
+
+	// 错误处理（修复未处理错误警告）
+	c.OnError(func(r *colly.Response, err error) {
+		log.Printf("[%s] 请求失败: %v", s.SourceName, err)
+	})
+
+	// 并发查询
+	var wg sync.WaitGroup
+	for _, engine := range s.SearchEngines {
+		if !engine.Enabled {
+			continue
+		}
+
+		wg.Add(1)
+		go func(eng SearchEngineConfig) {
+			defer wg.Done()
+			if err := c.Visit(fmt.Sprintf(eng.URLFormat, domain)); err != nil {
+				log.Printf("[%s] %s查询失败: %v", s.SourceName, eng.Name, err)
+			}
+		}(engine)
+	}
+
+	wg.Wait()
+	c.Wait()
+	return results, nil
+}
+
+// 私有方法（避免ValidSubdomain重名问题）
+func (s *SearchEngineCollector) isValidSubdomain(subdomain, root string) bool {
+	return strings.HasSuffix(subdomain, "."+root) || subdomain == root
+}
+
+func (s *SearchEngineCollector) containsSubdomain(results []CollectResult, subdomain string) bool {
+	for _, r := range results {
+		if r.Subdomain == subdomain {
 			return true
 		}
 	}
 	return false
 }
 
-func errType(scan scanResult) string { //产生错误的类型
-	if netErr, ok := scan.err.(net.Error); ok && netErr.Timeout() {
-		return "Timeout" //fmt.Printf("[-] %s - Timeout\n", scan.address)
-	} else if opErr, ok := scan.err.(*net.OpError); ok {
-		if opErr.Op == "dial" {
-			return "refused"
-		} else {
-			return "op_error" //fmt.Printf("[-] %s - Error: %v\n", scan.address, scan.err)
-		}
-	} else {
-		return "other" //fmt.Printf("[-] %s - Error: %v", scan.address, scan.err)
+func (s *SearchEngineCollector) createResult(subdomain, host string) CollectResult {
+	return CollectResult{
+		Subdomain: subdomain,
+		IPs:       s.safeResolveIPs(subdomain),
+		FirstSeen: time.Now(),
+		Sources:   []string{s.SourceName + ":" + host},
 	}
 }
 
-func readBanner(conn net.Conn) string {
-	//timeout := time.Second
+func (s *SearchEngineCollector) safeResolveIPs(subdomain string) []net.IP {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("IP解析异常: %v", r)
+		}
+	}()
 
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 1024)
+	if strings.HasPrefix(subdomain, "*.") {
+		return nil
+	}
 
-	n, err := conn.Read(buf)
+	ips, err := net.LookupIP(subdomain)
 	if err != nil {
-		log.Printf("read banner failed: %v", err)
-	}
-	if n > 0 {
-		return strings.TrimSpace(string(buf[:n]))
+		return nil
 	}
 
-	//如果没有收到Banner，发送通用探测包
-	switch conn.RemoteAddr().(*net.TCPAddr).Port {
-	case 21: // FTP
-		conn.Write([]byte("USER anonymous\r\n"))
-	case 22: // SSH
-		conn.Write([]byte("SSH-2.0-GoScan\r\n"))
-	case 80, 443, 8080, 888, 81: // HTTP/S
-		conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
-	default: // 其他端口保持原样
-		conn.Write([]byte("\x01\x02\x03\x04\n")) //魔法数字探测包
-	}
-	n, _ = conn.Read(buf)
-	return strings.TrimSpace(string(buf[:n]))
-}
-
-func identifyService(conn net.Conn, port int) string { //指纹识别函数
-	banner := readBanner(conn)
-
-	switch {
-	case strings.HasPrefix(banner, "SSH-"):
-		return "ssh"
-	case strings.HasPrefix(banner, "220") && port == 21:
-		return "ftp"
-	case strings.Contains(banner, "HTTP"):
-		return "http"
-	case strings.Contains(banner, "<html>"):
-		return "http"
-	default:
-		// 端口猜测（保底逻辑）
-		switch port {
-		case 22:
-			return "ssh(疑似)"
-		case 80, 443, 8080, 888:
-			return "http(疑似)"
-		case 3306:
-			return "mysql(疑似)"
-		default:
-			return "unknown"
+	var ipv4s []net.IP
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			ipv4s = append(ipv4s, ip)
 		}
 	}
+	return ipv4s
+}
+domainCrtsh.go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type CertRecord struct { //证书记录结构
+	ID          uint64   `json:"id"`              //证书在 crt.sh 数据库中的唯一标识符
+	LoggedAt    string   `json:"entry_timestamp"` //证书被记录到透明日志的时间（格式：2006-01-02T15:04:05）
+	NotBefore   string   `json:"not_before"`      //证书生效的开始日期
+	NotAfter    string   `json:"not_after"`       //证书过期时间
+	CommonName  string   `json:"common_name"`     //证书的主域名（CN字段），可能是通配符如 *.example.com
+	NameValue   string   `json:"name_value"`      //含所有主题备用名称(SANs)，多个域名用换行符(\n)分隔
+	MatchingIPs []net.IP //非API字段，程序自行填充的匹配IP列表
+	IsWildcard  bool     //非API字段，标记是否为通配符证书（根据CommonName或NameValue）
 }
 
-//func probeProtocol(conn net.Conn, port int) string {
+type CollectResult struct {
+	Subdomain string
+	IPs       []net.IP
+	FirstSeen time.Time
+	Sources   []string
+}
+
+type CRTshCollector struct{}
+
+func (c *CRTshCollector) Collect(domain string, timeout time.Duration) ([]CollectResult, error) {
+	return CollectSubdomains_crtsh(domain, timeout)
+}
+
+// CollectSubdomains_crtsh 主收集函数
+func CollectSubdomains_crtsh(domain string, timeout time.Duration) ([]CollectResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// 使用更稳定的API端点
+	apiURL := fmt.Sprintf("https://crt.sh/?q=%s&output=json", domain)
+
+	// 调试输出
+	log.Printf("正在查询: %s", apiURL)
+
+	records, err := fetchCertRecords(ctx, apiURL)
+	if err != nil {
+		return nil, fmt.Errorf("fetchCertRecords失败: %w", err)
+	}
+
+	if len(records) == 0 {
+		return nil, fmt.Errorf("未找到任何证书记录")
+	}
+
+	// 处理结果
+	var results []CollectResult
+	for _, rec := range records {
+		select {
+		case <-ctx.Done():
+			return results, nil
+		default:
+			res := processRecord(rec, domain)
+			if res.Subdomain != "" {
+				results = append(results, res)
+			}
+		}
+	}
+
+	return results, nil
+}
+
+// fetchCertRecords 获取证书记录
+func fetchCertRecords(ctx context.Context, apiURL string) ([]CertRecord, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; MyScanner/1.0)")
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 检查状态码
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API返回错误: %s\n响应: %s", resp.Status, string(body))
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	// 调试输出
+	log.Printf("API响应: %s", string(body[:min(200, len(body))]))
+
+	var records []CertRecord
+	if err := json.Unmarshal(body, &records); err != nil {
+		return nil, fmt.Errorf("JSON解析失败: %w\n响应: %s", err, string(body[:200]))
+	}
+
+	return records, nil
+}
+
+// processRecord 处理单条记录
+func processRecord(rec CertRecord, baseDomain string) CollectResult {
+	rec.IsWildcard = strings.HasPrefix(rec.CommonName, "*.") ||
+		strings.Contains(rec.NameValue, "*.")
+
+	names := append(strings.Split(rec.NameValue, "\n"), rec.CommonName)
+	var validSubdomains []string
+
+	for _, name := range names {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name != "" && isValidSubdomain(name, baseDomain) {
+			validSubdomains = append(validSubdomains, name)
+		}
+	}
+
+	if len(validSubdomains) == 0 {
+		return CollectResult{}
+	}
+
+	// 只处理第一个有效子域名
+	subdomain := validSubdomains[0]
+	var ips []net.IP
+	if !rec.IsWildcard {
+		if resolvedIPs, err := net.LookupIP(subdomain); err == nil {
+			ips = resolvedIPs
+		}
+	}
+
+	var firstSeen time.Time
+	if rec.LoggedAt != "" {
+		firstSeen, _ = time.Parse("2006-01-02T15:04:05", rec.LoggedAt)
+	}
+
+	return CollectResult{
+		Subdomain: subdomain,
+		IPs:       ips,
+		FirstSeen: firstSeen,
+		Sources:   []string{"crt.sh"},
+	}
+}
+
+// isValidSubdomain 验证子域名
+func isValidSubdomain(name, baseDomain string) bool {
+	name = strings.TrimSuffix(name, ".")
+	baseDomain = strings.TrimSuffix(baseDomain, ".")
+	return name == baseDomain || strings.HasSuffix(name, "."+baseDomain)
+}
+identify.go
+//package main
+//
+//import (
+//	"bytes"
+//	"fmt"
+//	"io"
+//	"log"
+//	"net"
+//	"strings"
+//	"time"
+//)
+//
+//func ReadBanner(conn net.Conn) string {
+//	//timeout := time.Second
+//	remoteAddr := conn.RemoteAddr().(*net.TCPAddr) //这两行为调试信息
+//	port := remoteAddr.Port
+//	buf := make([]byte, 2048)
+//	//fmt.Printf("[DEBUG] 开始探测端口 %d\n", remoteAddr.Port) // 添加这行
+//
+//	timeout := 3 * time.Second
 //	switch port {
+//	case 21:
+//		timeout = 5 * time.Second // FTP
+//	case 80, 443, 8080, 81:
+//		timeout = 5 * time.Second // HTTP/S
+//	}
+//	//timeout := 1500 * time.Millisecond
+//	//if port == 21 {
+//	//	timeout = 3000 * time.Millisecond
+//	//}
+//
+//	conn.SetReadDeadline(time.Now().Add(timeout))
+//
+//	n, err := conn.Read(buf) //1. 先读取服务端可能主动发送的Banner
+//	if err != nil {
+//		log.Printf("read banner failed: %v", err)
+//	}
+//	if n > 0 {
+//		//fmt.Printf("[DEBUG] 端口 %d 主动响应: %q\n", port, string(buf[:n]))
+//		return strings.TrimSpace(string(buf[:n]))
+//	}
+//
+//	//2. 如果没有收到Banner，发送通用探测包
+//	switch conn.RemoteAddr().(*net.TCPAddr).Port {
+//	case 21: // FTP
+//		conn.Write([]byte("USER anonymous\r\n"))
+//		time.Sleep(500 * time.Millisecond)
+//		n, _ = conn.Read(buf)
 //	case 22: // SSH
-//		conn.Write([]byte("SSH-2.0-GoScanner\r\n"))
-//		return readBanner(conn)
-//	case 80: // HTTP
-//		conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
-//		return readBanner(conn)
-//	case 443:
-//		conn.Write([]byte("\\x16\\x03\\x01\\x00\\x75"))
-//		return readBanner(conn)
+//		conn.Write([]byte("SSH-2.0-GoScan\r\n"))
+//		n, _ = conn.Read(buf)
+//	case 80, 443, 8080, 888, 81: // HTTP/S
+//		req := fmt.Sprintf(
+//			"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Go-Scanner\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+//			remoteAddr.IP,
+//		)
+//		if _, err := conn.Write([]byte(req)); err != nil { //测试
+//			log.Printf("write banner failed: %v", err)
+//			return ""
+//		}
+//		//time.Sleep(500 * time.Millisecond)
+//		//n, _ = conn.Read(buf)//原来
+//		var resp bytes.Buffer //测试
+//		for {
+//			n, err := conn.Read(buf)
+//			if err != nil {
+//				if err != io.EOF {
+//					log.Printf("读取 HTTP 响应失败: %v", err)
+//				}
+//				break
+//			}
+//			resp.Write(buf[:n])
+//		}
+//		return resp.String()
+//	default: // 其他端口保持原样
+//		conn.Write([]byte("\x01\x02\x03\x04\n")) //魔法数字探测包
+//	}
+//	//n, err = conn.Read(buf)
+//	//if err != nil {
+//	//	//fmt.Printf("[DEBUG] 端口 %d 读取错误: %v\n", port, err)
+//	//	return ""
+//	//}
+//	////fmt.Printf("[DEBUG] 端口 %d 最终响应: %q\n", port, string(buf[:n]))
+//	//return strings.TrimSpace(string(buf[:n]))
+//	if n > 0 {
+//		return strings.TrimSpace(string(buf[:n]))
 //	}
 //	return ""
 //}
+//
+//func IdentifyService(banner string, port int) string { //指纹识别函数
+//
+//	if banner == "" {
+//		switch port {
+//		case 21:
+//			return "ftp(无响应)"
+//		case 80, 443, 8080, 888:
+//			return "http(无响应)"
+//		case 22:
+//			return "ssh(无响应)"
+//		default:
+//			return "unknown"
+//		}
+//	}
+//
+//	if strings.Contains(banner, "HTTP/1.") { //检测 HTTP 响应头，即使返回 400
+//		// 提取 Server 头（如 "Server: nginx"）
+//		if serverHeader := ExtractHeader(banner, "Server"); serverHeader != "" {
+//			return fmt.Sprintf("http | %s", serverHeader)
+//		}
+//		return "http" // 默认标识为 http
+//	}
+//
+//	switch {
+//	case strings.HasPrefix(banner, "SSH-"):
+//		return fmt.Sprintf("ssh | %s", FirstLine(banner))
+//	case strings.HasPrefix(banner, "220") && port == 21: //FTP效应码
+//		return fmt.Sprintf("ftp | %s", FirstLine(banner))
+//	case strings.Contains(banner, "HTTP"):
+//		return fmt.Sprintf("http | %s", FirstLine(banner))
+//	case bytes.HasPrefix([]byte(banner), []byte("\x16\x03")): // TLS
+//		return "https(疑似)"
+//	case strings.Contains(banner, "MySQL"):
+//		return "mysql"
+//	//case strings.Contains(banner, "<html>"):
+//	//	return "http"
+//	default:
+//		// 端口猜测（保底逻辑）
+//		switch port {
+//		case 22:
+//			return "ssh(疑似)"
+//		case 80, 443, 8080, 888:
+//			return "http(疑似)"
+//		case 3306:
+//			return "mysql(疑似)"
+//		default:
+//			return "unknown"
+//		}
+//	}
+//}
 
-func getTimeout(port int) time.Duration {
-	switch port {
-	case 21, 22, 80, 443:
-		return 500 * time.Millisecond
-	case 3306, 3389:
-		return 1 * time.Second
-	default:
-		return 2 * time.Second
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"net"
+	"strings"
+	"time"
+)
+
+// 协议配置
+var protocolConfig = map[int]struct {
+	probe      string
+	timeout    time.Duration
+	identifier func(string) string
+}{
+	21:   {"USER anonymous\r\n", 5 * time.Second, identifyFTP},
+	22:   {"SSH-2.0-GoScan\r\n", 3 * time.Second, identifySSH},
+	80:   {"", 8 * time.Second, identifyHTTP},
+	443:  {"", 8 * time.Second, identifyHTTP},
+	3306: {"", 5 * time.Second, identifyMySQL},
+	902:  {"", 3 * time.Second, identifyVMware},
+	912:  {"", 3 * time.Second, identifyVMware},
+}
+
+func ReadBanner(conn net.Conn) string {
+	remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
+	port := remoteAddr.Port
+
+	// 设置连接参数
+	setupConnection(conn, port)
+
+	// 尝试读取初始banner
+	if banner := tryReadBanner(conn); banner != "" {
+		return banner //cleanResponse(banner)
+	}
+
+	// 协议特定探测
+	if cfg, ok := protocolConfig[port]; ok {
+		return probeProtocol(conn, port, cfg.probe, cfg.timeout)
+	}
+
+	// 默认探测
+	return probeDefault(conn)
+}
+
+func setupConnection(conn net.Conn, port int) {
+	timeout := 3 * time.Second
+	if cfg, ok := protocolConfig[port]; ok {
+		timeout = cfg.timeout
+	}
+	conn.SetReadDeadline(time.Now().Add(timeout))
+
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 }
 
-func scanWorker(id int, ip string, scanner <-chan scanner, results chan<- scanResult, timeout time.Duration) { //需要进行的任务，这里是进行端口扫描
-	for scan := range scanner { //这里的 scanner 是通道，里面是有很多的 scan 个体，这里的 scan 才是一个结构体可以引用 scan 结构体的元素
-		result := scanResult{}                                              //这里是定义一个 scanResult 的结构体
-		result.address = net.JoinHostPort(ip, strconv.Itoa(scan.port))      //这里是用 ip 和端口一起组成地址
-		if err := validateInput(scan.network, result.address); err != nil { //用 validateInput 检验地址和网络方式是否正确
-			log.Println(err)
+func tryReadBanner(conn net.Conn) string {
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err == nil && n > 0 {
+		return string(buf[:n])
+	}
+	return ""
+}
+
+func probeProtocol(conn net.Conn, port int, probe string, timeout time.Duration) string {
+	switch port {
+	case 80, 443, 8888:
+		return probeHTTP(conn)
+	default:
+		if probe != "" {
+			conn.Write([]byte(probe))
+		}
+		return readWithTimeout(conn, timeout)
+	}
+}
+
+func probeHTTP(conn net.Conn) string {
+	//req := buildHTTPRequest(conn.RemoteAddr().(*net.TCPAddr).IP.String())
+	req := fmt.Sprintf(
+		"GET / HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"User-Agent: Mozilla/5.0 (compatible; GoScanner/1.0)\r\n"+
+			"Accept: */*\r\n"+
+			"Connection: close\r\n\r\n",
+		conn.RemoteAddr().(*net.TCPAddr).IP.String(),
+	)
+
+	conn.Write([]byte(req))
+
+	reader := bufio.NewReader(conn)
+	var resp strings.Builder
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil || line == "\r\n" {
 			break
 		}
-		scan.conn, result.err = net.DialTimeout(scan.network, result.address, timeout) //进行连接
-		if result.err == nil {                                                         //连接成功
-			result.open = true //open 赋值为 true
-			result.banner = readBanner(scan.conn)
-			result.service = identifyService(scan.conn, scan.port)
-			scan.conn.Close() //连接关闭
-		} else {
-			result.open = false
-			result.errtype = errType(result)
+		resp.WriteString(line)
+	}
+
+	return resp.String()
+}
+
+//func buildHTTPRequest(host string) string {
+//	return fmt.Sprintf(
+//		"GET / HTTP/1.1\r\n"+
+//			"Host: %s\r\n"+
+//			"User-Agent: Mozilla/5.0\r\n"+
+//			"Connection: close\r\n\r\n",
+//		host,
+//	)
+//}
+
+func probeDefault(conn net.Conn) string {
+	conn.Write([]byte("\x01\x02\x03\x04\n"))
+	return readWithTimeout(conn, 1*time.Second)
+}
+
+func readWithTimeout(conn net.Conn, timeout time.Duration) string {
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	buf := make([]byte, 1024)
+	n, _ := conn.Read(buf)
+	return string(buf[:n])
+}
+
+func cleanResponse(resp string) string {
+	// 过滤非ASCII字符
+	resp = strings.Map(func(r rune) rune {
+		if r >= 32 && r < 127 || r == '\n' || r == '\r' {
+			return r
 		}
+		return -1
+	}, resp)
+
+	// 截断过长的响应
+	if len(resp) > 200 {
+		return resp[:200] + "..."
+	}
+	return resp
+}
+
+func IdentifyService(banner string, port int) string {
+	//fmt.Printf("\n端口: %d\n[原始Banner开始]==========\n%s\n[原始Banner结束]==========\n", port, banner)
+
+	banner = cleanResponse(banner)
+
+	if cfg, ok := protocolConfig[port]; ok {
+		return cfg.identifier(banner)
+	}
+
+	switch {
+	case strings.Contains(banner, "HTTP/"):
+		return identifyHTTP(banner)
+	case port == 80 || port == 443 || port == 8080 || port == 8888:
+		return "http"
+	default:
+		return "unknown"
+	}
+}
+
+// 协议识别函数
+func identifyHTTP(banner string) string {
+	// 优先通过指纹库匹配
+	if server := ExtractHeader(banner, "Server"); server != "" {
+		// 返回标准化服务名（小写、去除版本号）
+		switch {
+		case strings.Contains(server, "nginx"):
+			return "nginx"
+		case strings.Contains(server, "Apache"):
+			return "apache"
+		case strings.Contains(server, "Microsoft-IIS"):
+			return "iis"
+		case strings.Contains(server, "lighttpd"):
+			return "lighttpd"
+		case strings.Contains(server, "Caddy"):
+			return "caddy"
+		}
+	}
+
+	// 次之通过特征匹配
+	if strings.Contains(banner, "nginx") {
+		return "nginx"
+	}
+	if strings.Contains(banner, "Apache") {
+		return "apache"
+	}
+
+	// 最后返回通用标识
+	return "http-unknown"
+}
+
+//	func identifyFTP(banner string) string {
+//		return fmt.Sprintf("ftp | %s", FirstLine(banner))
+//	}
+func identifyFTP(banner string) string { //因为原来的在banner库中识别不到，所以换成通用的ftp
+	if strings.Contains(banner, "Pure-FTPd") {
+		return "pure-ftpd" // 精确匹配PureFTPd
+	}
+	return "ftp" // 通用FTP服务
+}
+
+//	func identifySSH(banner string) string {
+//		return fmt.Sprintf("ssh | %s", FirstLine(banner))
+//	}
+func identifySSH(banner string) string { //因为原来的在banner库中识别不到，所以换成通用的ssh
+	if strings.Contains(banner, "OpenSSH") {
+		return "openssh" // 标准化为openssh而非带版本信息
+	}
+	return "ssh" // 通用SSH服务
+}
+
+func identifyMySQL(banner string) string {
+	return "mysql"
+}
+
+func identifyVMware(banner string) string {
+	return "vmware-auth"
+}
+sql.go
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+func InitDB() (*sql.DB, error) {
+	db, err := sql.Open("mysql", "root:mysqlyd0ngAlicloud@tcp(47.113.206.220:3306)/ASM?parseTime=true")
+	if err != nil {
+		return nil, fmt.Errorf("数据库连接失败: %v", err)
+	}
+
+	// 设置连接池参数
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("数据库连接测试失败: %v", err)
+	}
+
+	return db, nil
+}
+
+// 修改saveResult函数
+func SaveResult(db *sql.DB, result scanResult) error { //用于存放 scan_results 库
+	if !result.open || result.service == "unknown" {
+		return nil // 只存储开放端口
+	}
+
+	ip, portStr, err := net.SplitHostPort(result.address)
+	if err != nil {
+		return fmt.Errorf("解析地址失败: %v", err)
+	}
+
+	serviceType := MatchFingerprint(db, result.banner)
+	if serviceType == "" {
+		serviceType = strings.ToLower(result.service)
+		if strings.HasPrefix(serviceType, "http") {
+			serviceType = "http-unknown"
+		}
+	}
+	if len(serviceType) > 255 {
+		serviceType = serviceType[:255]
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("端口转换失败: %v", err)
+	}
+
+	// 限制banner长度以避免溢出
+	banner := result.banner
+	if len(banner) > 65535 {
+		banner = banner[:65535]
+	}
+
+	//a, _ := db.Exec(`select * from scan_results `)
+	//fmt.Println(a)
+
+	_, err = db.Exec(`
+        INSERT INTO scan_results 
+        (ip, port, service_id, service_type)
+        VALUES (?, ?, 
+            (SELECT id FROM banner WHERE service_name = ? LIMIT 1),
+            ?)
+        ON DUPLICATE KEY UPDATE
+            service_id = VALUES(service_id),
+            service_type = VALUES(service_type)`,
+		ip, port, serviceType, serviceType,
+	)
+
+	//b, _ := db.Exec(`select * from scan_results `)
+	//fmt.Println(b)
+
+	return err
+}
+
+func MatchFingerprint(db *sql.DB, banner string) string { //和 banner 库进行匹配
+	var serviceName string
+	db.QueryRow(`
+        SELECT service_name FROM service_fingerprints 
+        WHERE ? REGEXP banner_pattern  -- 改用REGEXP
+        ORDER BY 
+            LENGTH(banner_pattern) DESC,  -- 优先匹配更长模式
+            CASE WHEN banner_pattern LIKE '^%' THEN 0 ELSE 1 END  -- 优先匹配开头模式
+        LIMIT 1`, banner).Scan(&serviceName)
+	return serviceName
+}
+
+// SaveDomainScanResult 保存域名扫描结果
+//func SaveDomainScanResult(db *sql.DB, ip string, openPorts []scanResult) error {//原先的
+//	// 提取端口号列表
+//	var ports []int
+//	var title string
+//
+//	for _, result := range openPorts {
+//		_, portStr, _ := net.SplitHostPort(result.address)
+//		port, _ := strconv.Atoi(portStr)
+//		ports = append(ports, port)
+//
+//		// 从第一个HTTP服务获取标题
+//		if title == "" && strings.HasPrefix(result.service, "http") {
+//			title = extractTitleFromBanner(result.banner)
+//		}
+//	}
+//
+//	// 更新domain_info中的标题(如果有)
+//	if title != "" {
+//		_, err := db.Exec(`
+//            UPDATE domain_info d
+//            JOIN domain_ips di ON d.id = di.domain_id
+//            SET d.title = ?, d.last_scan = NOW()
+//            WHERE di.ip = ?`,
+//			title, ip)
+//		if err != nil {
+//			return fmt.Errorf("更新标题失败: %v", err)
+//		}
+//	}
+//
+//	// 更新domain_ips中的端口信息
+//	_, err := db.Exec(`
+//        UPDATE domain_ips
+//        SET ports = ?
+//        WHERE ip = ?`,
+//		toJSON(ports),
+//		ip)
+//	if err != nil {
+//		return fmt.Errorf("更新端口信息失败: %v", err)
+//	}
+//
+//	return nil
+//}
+
+func SaveDomainScanResult(db *sql.DB, ip string, openPorts []scanResult) error {
+	var ports []int
+	var title string
+
+	// 优先从HTTP服务中提取标题
+	for _, result := range openPorts {
+		_, portStr, _ := net.SplitHostPort(result.address)
+		port, _ := strconv.Atoi(portStr)
+		ports = append(ports, port)
+
+		if title == "" && strings.HasPrefix(result.service, "http") {
+			title = extractTitleFromBanner(result.banner)
+			// 如果从banner中没提取到，尝试直接请求
+			if title == "" {
+				title = GetWebsiteTitle(ip, port)
+			}
+		}
+	}
+
+	// 更新标题和端口信息
+	_, err := db.Exec(`
+        UPDATE domain_ips 
+        SET ports = ?,
+            subdomain = (SELECT subdomain FROM domain_info WHERE id = domain_id LIMIT 1)
+        WHERE ip = ?`,
+		toJSON(ports),
+		ip)
+	if err != nil {
+		return fmt.Errorf("更新端口信息失败: %v", err)
+	}
+
+	// 如果有标题，更新到domain_info
+	if title != "" {
+		_, err = db.Exec(`
+            UPDATE domain_info 
+            SET title = ?, last_scan = NOW()
+            WHERE id = (SELECT domain_id FROM domain_ips WHERE ip = ? LIMIT 1)`,
+			title, ip)
+		if err != nil {
+			return fmt.Errorf("更新标题失败: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// 辅助函数
+func extractTitleFromBanner(banner string) string {
+	// 先检查是否是HTTP响应
+	if !strings.Contains(banner, "HTTP/") {
+		return ""
+	}
+
+	// 更健壮的标题提取方式
+	re := regexp.MustCompile(`(?is)<title>(.*?)</title>`)
+	matches := re.FindStringSubmatch(banner)
+	if len(matches) > 1 {
+		title := strings.TrimSpace(matches[1])
+		// 去除换行和多余空格
+		title = strings.ReplaceAll(title, "\n", " ")
+		title = strings.Join(strings.Fields(title), " ")
+		if len(title) > 250 {
+			title = title[:250] + "..."
+		}
+		return title
+	}
+	return ""
+}
+
+func toJSON(data interface{}) string {
+	b, _ := json.Marshal(data)
+	return string(b)
+}
+
+// SaveDomainInfo 保存子域名信息
+func SaveDomainInfo(db *sql.DB, mainDomain, subdomain string, isWildcard bool, title string, source string) (int64, error) {
+	log.Printf("保存子域名：%s（来源：%s）", subdomain, source)
+	//res, err := db.Exec(`
+	//    INSERT INTO domain_info
+	//    (domain, subdomain, is_wildcard, title, first_seen, source)
+	//    VALUES (?, ?, ?, ?, NOW(), ?)
+	//    ON DUPLICATE KEY UPDATE
+	//        title = COALESCE(VALUES(title), title),
+	//        last_scan = CURRENT_TIMESTAMP`,
+	//	mainDomain,
+	//	subdomain,
+	//	isWildcard,
+	//	title,
+	//	source)
+	// 去重处理来源
+	existingSources := make(map[string]bool)
+	if existing, err := db.Query("SELECT source FROM domain_info WHERE subdomain = ?", subdomain); err == nil {
+		for existing.Next() {
+			var oldSource string
+			if err := existing.Scan(&oldSource); err == nil {
+				for _, s := range strings.Split(oldSource, ",") {
+					existingSources[s] = true
+				}
+			}
+		}
+		existing.Close()
+	}
+
+	// 合并新来源
+	if !existingSources[source] {
+		existingSources[source] = true
+	}
+
+	// 构建新来源字符串
+	var uniqueSources []string
+	for s := range existingSources {
+		uniqueSources = append(uniqueSources, s)
+	}
+	newSource := strings.Join(uniqueSources, ",")
+
+	// 限制长度（假设source字段是VARCHAR(255)）
+	if len(newSource) > 255 {
+		newSource = newSource[:255]
+	}
+
+	res, err := db.Exec(`
+        INSERT INTO domain_info 
+        (domain, subdomain, is_wildcard, title, first_seen, source)
+        VALUES (?, ?, ?, ?, NOW(), ?)
+        ON DUPLICATE KEY UPDATE
+            source = VALUES(source),
+            last_scan = NOW()`,
+		mainDomain, subdomain, isWildcard, title, newSource)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// SaveDomainIP 保存域名解析IP
+func SaveDomainIP(db *sql.DB, domainID int64, ip string, subdomain string, ports []int) error {
+	portsJSON, _ := json.Marshal(ports)
+	_, err := db.Exec(`
+        INSERT INTO domain_ips 
+        (domain_id, subdomain, ip, ports)
+        VALUES (?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+            subdomain = VALUES(subdomain),
+            ports = VALUES(ports)`,
+		domainID,
+		subdomain,
+		ip,
+		portsJSON)
+	return err
+}
+work.go
+package main
+
+import (
+	"fmt"
+	"net"
+	"runtime"
+	"strconv"
+	"sync"
+	"time"
+)
+
+// 定义重要端口列表（根据实际需求调整）
+var importantPorts = []int{
+	// 常用服务
+	21, 22, 23, 25, 53, 80, 110, 143,
+	443, 465, 587, 993, 995, 3306, 3389,
+	5432, 5900, 6379, 8080, 8443, 8888,
+
+	// 安全相关
+	161, 389, 636, 5985, 5986,
+
+	// 数据库
+	27017, 1521, 1433,
+}
+
+func probePort(ip string, network string, port int, timeout time.Duration) scanResult {
+	result := scanResult{}
+	result.address = net.JoinHostPort(ip, strconv.Itoa(port))
+
+	conn, err := net.DialTimeout(network, result.address, timeout)
+	if err != nil {
+		result.open = false
+		result.errtype = ErrType(scanResult{err: err})
+	} else {
+		result.open = true //open 赋值为 true
+		result.banner = ReadBanner(conn)
+		result.service = IdentifyService(result.banner, port)
+		conn.Close() //连接关闭
+	}
+	return result
+}
+
+func ScanWorker(id int, ip string, scanner <-chan scanner, results chan<- scanResult, timeout time.Duration) { //需要进行的任务，这里是进行端口扫描
+	for scan := range scanner { //这里的 scanner 是通道，里面是有很多的 scan 个体，这里的 scan 才是一个结构体可以引用 scan 结构体的元素
+		result := probePort(ip, scan.network, scan.port, timeout)
 		results <- result
 	}
 }
 
-func run(ip string, network string) {
+func scanImportantPorts(ip, network string) []scanResult { //先扫描重要端口
+	var openPorts []scanResult
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	concurrentLimit := make(chan struct{}, runtime.NumCPU()*10)
+
+	for _, port := range importantPorts {
+		wg.Add(1)
+		go func(port int) {
+			defer wg.Done()
+			concurrentLimit <- struct{}{}
+			defer func() { <-concurrentLimit }()
+
+			result := probePort(ip, network, port, 2*time.Second)
+			if result.open {
+				mu.Lock()
+				openPorts = append(openPorts, result)
+				fmt.Printf("[+] 重要端口 %s 开放 (%s)\n", result.address, result.service)
+				mu.Unlock()
+			}
+		}(port)
+	}
+	wg.Wait()
+	close(concurrentLimit)
+	return openPorts
+}
+
+func Run(ip string, network string) []scanResult {
+	importantPorts := scanImportantPorts(ip, network) //一阶段：重要端口
+
+	//二阶段：全端口
 	var (
 		totalPorts = 65535      // 总端口数
 		scanned    = 0          // 已扫描计数
@@ -216,31 +1299,42 @@ func run(ip string, network string) {
 	)
 	var wg sync.WaitGroup
 	tasks := make(chan scanner, 1000)
+
+	skipPorts := make(map[int]bool)
+	for _, r := range importantPorts { //这里因为 scanResults 结构体没有 port 部分，所以通过 address 分解出 port。
+		_, portStr, _ := net.SplitHostPort(r.address) // 分解address
+		port, _ := strconv.Atoi(portStr)              // 字符串转整数
+		skipPorts[port] = true
+	}
+
 	results := make(chan scanResult, 1000)
 	var openPorts []scanResult
 	workers := runtime.NumCPU() * 100
 
-	for i := 0; i < workers; i++ {
+	for i := 0; i < workers; i++ { //分配工作
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			scanWorker(id, ip, tasks, results, 2*time.Second)
+			ScanWorker(id, ip, tasks, results, 2*time.Second)
 		}(i)
 	}
 
-	go func() {
+	go func() { //添加工作
 		for i := 1; i < 65536; i++ {
-			tasks <- scanner{network: network, ip: ip, port: i, conn: nil}
+			if !skipPorts[i] { //跳过重要端口
+				tasks <- scanner{network: network, ip: ip, port: i, conn: nil}
+			}
 		}
 		close(tasks)
 	}()
 
-	go func() {
+	go func() { //等待所有任务结束后关闭 worker 池
 		wg.Wait()
-		close(results)
+		close(results) //关闭 results 通道，不再接受其他数据
 	}()
+
 	errCount := make(map[string]int)
-	for result := range results {
+	for result := range results { //处理数据
 		scanned++
 		if scanned%100 == 0 || scanned == totalPorts {
 			printProgress(scanned, totalPorts, startTime)
@@ -256,58 +1350,128 @@ func run(ip string, network string) {
 
 		}
 	}
+
+	for _, importantPort := range importantPorts {
+		openPorts = append(openPorts, importantPort)
+	}
+
 	fmt.Println()
 	printOpenPorts(openPorts)
+
+	return openPorts
+}
+assist.go
+package main
+
+import (
+	"fmt"
+	"github.com/PuerkitoBio/goquery"
+	"log"
+	"net"
+	"net/http"
+	"os/exec"
+	"regexp"
+	"runtime"
+	"strings"
+	"time"
+)
+
+func ValidateInput(network string, address string) error { //检验用户输入
+	switch network {
+	case "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6":
+	default:
+		return fmt.Errorf("invalid network type: %s", network)
+	}
+	_, _, err := net.SplitHostPort(address) //分析地址是否正确
+	if err != nil {
+		return fmt.Errorf("invalid address: %s\nThis is error: %v", address, err)
+	}
+	return nil
 }
 
-func printProgress(current, total int, start time.Time) {
-	percent := float64(current) / float64(total) * 100
-	elapsed := time.Since(start).Round(time.Second)
-
-	// \r 让光标回到行首，实现原地刷新
-	fmt.Printf("\rScanning: %d/%d (%.1f%%) | Elapsed: %v",
-		current, total, percent, elapsed)
+func IsHostAlive(ip string) bool { //主机存活检测，用系统 ping 的方式，可以根据不同系统用不同的 ping 命令
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("ping", "-n", "2", "-w", "2000", ip)
+	default: // Linux/macOS
+		cmd = exec.Command("ping", "-c", "2", "-W", "2", ip)
+	}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("ping %s failed: %v \noutput: %s", ip, err, string(output))
+		return false
+	}
+	return true
 }
 
-func printOpenPorts(results []scanResult) {
-	fmt.Println("\n=== 开放端口详情 ===")
-	fmt.Printf("%-20s\t%-15s\t%-30s\n", "地址", "服务类型", "Banner信息")
-	for _, r := range results {
-		banner := r.banner
-		if banner == "" {
-			banner = "[无Banner响应]"
-		} else if len(banner) > 50 {
-			banner = banner[:50] + "..."
+func IsHostAlive_TCP(ip string) bool { //主机存活检测，通过 TCP 连接的方法，可以跨系统运用，同时在对应主机禁止 ICMP 的时候使用
+	port := []int{80, 22, 443}
+	for _, port := range port {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 3*time.Second)
+		if err == nil {
+			conn.Close()
+			return true
 		}
+	}
+	return false
+}
 
-		fmt.Printf("%-20s\t%-15s\t%-30s\n",
-			r.address,
-			r.service,
-			banner)
+func getTimeout(port int) time.Duration {
+	switch port {
+	case 21, 22, 80, 443:
+		return 500 * time.Millisecond
+	case 3306, 3389:
+		return 1 * time.Second
+	default:
+		return 2 * time.Second
 	}
 }
 
-func main() {
-	var scan scanner
-	//var timeout time.Duration
-	//var count int     //这两个是 go-ping 那个主机检测版本要用的变量
+func FirstLine(s string) string { //辅助函数：提取第一行
+	if idx := strings.Index(s, "\r\n"); idx > 0 {
+		return s[:idx]
+	}
+	return s
+}
 
-	//fmt.Print("Please enter your network:")
-	//fmt.Scan(&scan.network)
-	scan.network = "tcp"
-	fmt.Print("Please enter your ip:")
-	fmt.Scan(&scan.ip)
-	//fmt.Print("IsHostAlive count and time:")
-	//fmt.Scan(&count, &timeout)
+func ExtractHeader(banner, headerName string) string { //辅助函数：从 HTTP 响应头提取特定字段
+	re := regexp.MustCompile(fmt.Sprintf(`(?i)%s:\s*(.*?)\r\n`, headerName))
+	match := re.FindStringSubmatch(banner)
+	if len(match) > 1 {
+		return strings.TrimSpace(match[1])
+	}
+	return ""
+}
 
-	if isHostAlive(scan.ip) {
-		run(scan.ip, scan.network)
-	} else {
-		fmt.Println("Can't ping")
-		if isHostAlive_TCP(scan.ip) {
-			run(scan.ip, scan.network)
+func ErrType(scan scanResult) string { //产生错误的类型
+	if netErr, ok := scan.err.(net.Error); ok && netErr.Timeout() {
+		return "Timeout" //fmt.Printf("[-] %s - Timeout\n", scan.address)
+	} else if opErr, ok := scan.err.(*net.OpError); ok {
+		if opErr.Op == "dial" {
+			return "refused"
 		} else {
-			fmt.Printf("%s is not alive\n", scan.ip)
+			return "op_error" //fmt.Printf("[-] %s - Error: %v\n", scan.address, scan.err)
 		}
+	} else {
+		return "other" //fmt.Printf("[-] %s - Error: %v", scan.address, scan.err)
 	}
+}
+
+// GetWebsiteTitle 获取网站标题
+func GetWebsiteTitle(ip string, port int) string { //用于子域名收集功能，提取网站的标题
+	url := fmt.Sprintf("http://%s:%d", ip, port)
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	// 提取<title>标签内容
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return ""
+	}
+	return doc.Find("title").Text()
 }

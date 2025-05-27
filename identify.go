@@ -144,6 +144,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"net"
 	"strings"
 	"time"
@@ -246,7 +247,7 @@ func probeHTTP(conn net.Conn) string {
 	return resp.String()
 }
 
-//func buildHTTPRequest(host string) string {
+//func buildHTTPRequest(host string) string { //并入 probeHTTP 函数
 //	return fmt.Sprintf(
 //		"GET / HTTP/1.1\r\n"+
 //			"Host: %s\r\n"+
@@ -256,7 +257,7 @@ func probeHTTP(conn net.Conn) string {
 //	)
 //}
 
-func probeDefault(conn net.Conn) string {
+func probeDefault(conn net.Conn) string { //万能请求包
 	conn.Write([]byte("\x01\x02\x03\x04\n"))
 	return readWithTimeout(conn, 1*time.Second)
 }
@@ -287,13 +288,37 @@ func cleanResponse(resp string) string {
 func IdentifyService(banner string, port int) string {
 	//fmt.Printf("\n端口: %d\n[原始Banner开始]==========\n%s\n[原始Banner结束]==========\n", port, banner)
 
-	banner = cleanResponse(banner)
+	//banner = cleanResponse(banner) //这是基于简单的端口和 banner 信息指纹识别
+	//
+	//if cfg, ok := protocolConfig[port]; ok {
+	//	return cfg.identifier(banner)
+	//}
 
-	if cfg, ok := protocolConfig[port]; ok {
-		return cfg.identifier(banner)
+	db, err := InitDB() //这里是通过连接数据库，和指纹库里的数据进行匹配
+	if err != nil {
+		log.Printf("数据库连接失败: %v", err)
+		return "unknown"
+	}
+	defer db.Close()
+
+	if strings.Contains(banner, "HTTP/") {
+		bannerNew := ExtractHeader(banner, "Server")
+		if bannerNew != "" {
+			if service := MatchFingerprint(db, bannerNew); service != "" {
+				return service
+			} else {
+				fmt.Println("no")
+			}
+		}
+	}
+	// 1. 尝试指纹匹配
+	if service := MatchFingerprint(db, banner); service != "" {
+		return service
+	} else {
+		fmt.Println("no")
 	}
 
-	switch {
+	switch { //保底逻辑
 	case strings.Contains(banner, "HTTP/"):
 		return identifyHTTP(banner)
 	case port == 80 || port == 443 || port == 8080 || port == 8888:

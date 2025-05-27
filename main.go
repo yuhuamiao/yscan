@@ -63,9 +63,17 @@ func collectSubdomains(db *sql.DB, scan scanner) { //收集子域名函数
 	fmt.Print("please enter your domain: ")
 	fmt.Scan(&domain)
 
-	results, err := CollectSubdomains_crtsh(domain, 30*time.Second)
-	if err != nil {
-		log.Fatal(err)
+	var results []CollectResult
+
+	if crtResults, err := (&CRTshCollector{}).Collect(domain, 30*time.Second); err == nil {
+		results = append(results, crtResults...)
+	}
+
+	if searchResults, err := (&SearchEngineCollector{}).Collect(domain, 30*time.Second); err == nil {
+		fmt.Printf("[DEBUG] 搜索引擎结果数量: %d\n", len(searchResults)) // 调试输出，添加这行
+		results = append(results, searchResults...)
+	} else {
+		log.Printf("搜索引擎收集错误: %v", err) // 确保错误可见
 	}
 
 	uniqueIPs := make(map[string]bool) //用于取独特的一个 IP，没有重复
@@ -77,8 +85,12 @@ func collectSubdomains(db *sql.DB, scan scanner) { //收集子域名函数
 			res.Subdomain,
 			res.IPs)
 
-		domainID, err := SaveDomainInfo(db, domain, res.Subdomain, strings.HasPrefix(res.Subdomain, "*."),
-			"", "crt.sh")
+		domainID, err := SaveDomainInfo(db, domain, res.Subdomain, //存入 sql 数据库
+			strings.HasPrefix(res.Subdomain, "*."),
+			"",
+			strings.Join(res.Sources, ","), // ✅ 动态来源
+		)
+
 		if err != nil {
 			log.Printf("保存子域名失败 %s: %v", res.Subdomain, err)
 			continue
@@ -90,7 +102,7 @@ func collectSubdomains(db *sql.DB, scan scanner) { //收集子域名函数
 				uniqueIPs[ipStr] = true
 				ipsToScan = append(ipsToScan, ipStr)
 
-				if err := SaveDomainIP(db, domainID, ipStr, nil); err != nil {
+				if err := SaveDomainIP(db, domainID, ipStr, res.Subdomain, nil); err != nil {
 					log.Printf("保存IP关联失败 %s: %v", ipStr, err)
 				}
 			}
@@ -114,21 +126,21 @@ func domainScan(scan scanner, db *sql.DB) {
 	fmt.Printf("\n=== 开始域名扫描 %s ===\n", scan.ip)
 
 	if IsHostAlive(scan.ip) {
-		//Run(scan.ip, scan.network)				   //测试用
-		openPorts := Run(scan.ip, scan.network) //真正利用，存储数据库
-		// 3. 保存结果(存储逻辑)
-		if err := SaveDomainScanResult(db, scan.ip, openPorts); err != nil {
-			log.Printf("保存扫描结果失败: %v", err)
-		}
+		Run(scan.ip, scan.network) //测试用
+		//openPorts := Run(scan.ip, scan.network) //真正利用，存储数据库
+		//// 3. 保存结果(存储逻辑)
+		//if err := SaveDomainScanResult(db, scan.ip, openPorts); err != nil {
+		//	log.Printf("保存扫描结果失败: %v", err)
+		//}
 	} else {
 		fmt.Println("Can't ping")
 		if IsHostAlive_TCP(scan.ip) {
-			//Run(scan.ip, scan.network) 				   //测试用
-			openPorts := Run(scan.ip, scan.network) //真正利用，存储数据库
-			// 3. 保存结果(存储逻辑)
-			if err := SaveDomainScanResult(db, scan.ip, openPorts); err != nil {
-				log.Printf("保存扫描结果失败: %v", err)
-			}
+			Run(scan.ip, scan.network) //测试用
+			//openPorts := Run(scan.ip, scan.network) //真正利用，存储数据库
+			//// 3. 保存结果(存储逻辑)
+			//if err := SaveDomainScanResult(db, scan.ip, openPorts); err != nil {
+			//	log.Printf("保存扫描结果失败: %v", err)
+			//}
 		} else {
 			log.Print("没有进入TCP连接")
 			fmt.Printf("%s is not alive\n", scan.ip)
@@ -139,27 +151,27 @@ func domainScan(scan scanner, db *sql.DB) {
 func portScan(scan scanner, db *sql.DB) { //这是把之前的 端口扫描 和 主机检测 利用整合到一个函数里面，方便调用
 
 	if IsHostAlive(scan.ip) {
-		//Run(scan.ip, scan.network) //这一行是用于测试，结果不进入 sql 数据库
-		openPorts := Run(scan.ip, scan.network) //这一段是真正利用，结果进入 sql 数据库
-		for _, result := range openPorts {
-			if err := SaveResult(db, result); err != nil {
-				log.Printf("存储失败 %s: %v", result.address, err)
-			} else {
-				log.Printf("成功储存 %s", result.address)
-			}
-		}
+		Run(scan.ip, scan.network) //这一行是用于测试，结果不进入 sql 数据库
+		//openPorts := Run(scan.ip, scan.network) //这一段是真正利用，结果进入 sql 数据库
+		//for _, result := range openPorts {
+		//	if err := SaveResult(db, result); err != nil {
+		//		log.Printf("存储失败 %s: %v", result.address, err)
+		//	} else {
+		//		log.Printf("成功储存 %s", result.address)
+		//	}
+		//}
 	} else {
 		fmt.Println("Can't ping")
 		if IsHostAlive_TCP(scan.ip) {
-			//Run(scan.ip, scan.network) //这一行是用于测试，结果不进入 sql 数据库
-			openPorts := Run(scan.ip, scan.network) //这一段是真正利用，结果进入 sql 数据库
-			for _, result := range openPorts {
-				if err := SaveResult(db, result); err != nil {
-					log.Printf("存储失败 %s: %v", result.address, err)
-				} else {
-					log.Printf("成功储存 %s", result.address)
-				}
-			}
+			Run(scan.ip, scan.network) //这一行是用于测试，结果不进入 sql 数据库
+			//openPorts := Run(scan.ip, scan.network) //这一段是真正利用，结果进入 sql 数据库
+			//for _, result := range openPorts {
+			//	if err := SaveResult(db, result); err != nil {
+			//		log.Printf("存储失败 %s: %v", result.address, err)
+			//	} else {
+			//		log.Printf("成功储存 %s", result.address)
+			//	}
+			//}
 		} else {
 			log.Print("没有进入TCP连接")
 			fmt.Printf("%s is not alive\n", scan.ip)

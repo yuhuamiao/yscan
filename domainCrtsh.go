@@ -30,6 +30,12 @@ type CollectResult struct {
 	Sources   []string
 }
 
+type CRTshCollector struct{}
+
+func (c *CRTshCollector) Collect(domain string, timeout time.Duration) ([]CollectResult, error) {
+	return CollectSubdomains_crtsh(domain, timeout)
+}
+
 // CollectSubdomains_crtsh 主收集函数
 func CollectSubdomains_crtsh(domain string, timeout time.Duration) ([]CollectResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
