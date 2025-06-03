@@ -166,7 +166,7 @@ var protocolConfig = map[int]struct {
 }
 
 func ReadBanner(conn net.Conn) string {
-	remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
+	remoteAddr := conn.RemoteAddr().(*net.TCPAddr) //conn.RemoteAddr()返回一个 net.Addr 接口，包含对端（客户端）的网络地址信息（IP、port、Zone）
 	port := remoteAddr.Port
 
 	// 设置连接参数
