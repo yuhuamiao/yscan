@@ -232,18 +232,3 @@ func main() {
 //	stats := pinger.Statistics()
 //	return stats.PacketsRecv > 0
 //}
-
-//func probeProtocol(conn net.Conn, port int) string {
-//	switch port {
-//	case 22: // SSH
-//		conn.Write([]byte("SSH-2.0-GoScanner\r\n"))
-//		return readBanner(conn)
-//	case 80: // HTTP
-//		conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
-//		return readBanner(conn)
-//	case 443:
-//		conn.Write([]byte("\\x16\\x03\\x01\\x00\\x75"))
-//		return readBanner(conn)
-//	}
-//	return ""
-//}
