@@ -3,74 +3,36 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	_ "github.com/go-sql-driver/mysql"
-	"strings"
-
-	//"github.com/go-ping/ping"  //经实验，这个不咋好用
 	"log"
-	"net"
+	"strings"
 	"time"
+
+	"golandproject/yscan/internal/assist"
+	"golandproject/yscan/internal/domain"
+	"golandproject/yscan/internal/model"
+	"golandproject/yscan/internal/scan"
+	"golandproject/yscan/internal/storage"
 )
 
-type scanner struct {
-	network string
-	ip      string
-	port    int
-	conn    net.Conn
-}
-
-type scanResult struct {
-	address string
-	err     error
-	errtype string
-	open    bool
-	service string //指纹识别部分
-	banner  string
-}
-
-func printProgress(current, total int, start time.Time) { //进度显示打印
-	percent := float64(current) / float64(total) * 100
-	elapsed := time.Since(start).Round(time.Second)
-
-	// \r 让光标回到行首，实现原地刷新
-	fmt.Printf("\rScanning: %d/%d (%.1f%%) | Elapsed: %v",
-		current, total, percent, elapsed)
-}
-
-func printOpenPorts(results []scanResult) { //扫描结果打印
-	fmt.Println("\n=== 开放端口详情 ===")
-	fmt.Printf("%-20s\t%-25s\t%-30s\n", "地址", "服务类型", "Banner信息")
-	for _, r := range results {
-		banner := r.banner
-
-		if banner == "" {
-			banner = "[无Banner响应]"
-		} else if len(banner) > 50 {
-			banner = banner[:50] + "..."
-		}
-
-		fmt.Printf("%-20s\t%-25s\t%-30s\n",
-			r.address,
-			r.service,
-			banner)
-	}
-	fmt.Println("\n=== ---------- ===")
-}
-
-func aggregateSubdomains(results []CollectResult) map[string]*CollectResult { //聚合重复子域名
-	res := make(map[string]*CollectResult)
+func aggregateSubdomains(results []domain.CollectResult) map[string]*domain.CollectResult {
+	res := make(map[string]*domain.CollectResult)
 
 	for _, r := range results {
 		key := r.Subdomain
 		agg, ok := res[key]
 		if !ok {
-			agg = &CollectResult{
+			agg = &domain.CollectResult{
 				Subdomain: r.Subdomain,
 				IPs:       r.IPs,
+				FirstSeen: r.FirstSeen,
 				Sources:   r.Sources,
 			}
 			res[key] = agg
 			continue
+		}
+
+		if agg.FirstSeen.IsZero() || (!r.FirstSeen.IsZero() && r.FirstSeen.Before(agg.FirstSeen)) {
+			agg.FirstSeen = r.FirstSeen
 		}
 
 		ipSet := make(map[string]bool)
@@ -85,7 +47,6 @@ func aggregateSubdomains(results []CollectResult) map[string]*CollectResult { //
 			}
 		}
 
-		// 合并来源（Sources）
 		sourceSet := make(map[string]bool)
 		for _, s := range agg.Sources {
 			sourceSet[s] = true
@@ -96,47 +57,45 @@ func aggregateSubdomains(results []CollectResult) map[string]*CollectResult { //
 				agg.Sources = append(agg.Sources, s)
 			}
 		}
-
 	}
 	return res
 }
 
-func collectSubdomains(db *sql.DB, scan scanner) { //收集子域名函数
-	var domain string
+func collectSubdomains(db *sql.DB, task model.Scanner) {
+	var domainName string
 
 	fmt.Print("Please enter your domain: ")
-	fmt.Scan(&domain)
+	fmt.Scan(&domainName)
 
-	var results []CollectResult
+	var results []domain.CollectResult
 
-	if crtResults, err := (&CRTshCollector{}).Collect(domain, 30*time.Second); err == nil {
+	if crtResults, err := (&domain.CRTshCollector{}).Collect(domainName, 30*time.Second); err == nil {
 		results = append(results, crtResults...)
 	}
 
-	if searchResults, err := NewSearchEngineCollector().Collect(domain, 30*time.Second); err == nil {
-		fmt.Printf("[DEBUG] 搜索引擎结果数量: %d\n", len(searchResults)) // 调试输出，添加这行
+	if searchResults, err := domain.NewSearchEngineCollector().Collect(domainName, 30*time.Second); err == nil {
+		fmt.Printf("[DEBUG] 搜索引擎结果数量: %d\n", len(searchResults))
 		results = append(results, searchResults...)
 	} else {
-		log.Printf("搜索引擎收集错误: %v", err) // 确保错误可见
+		log.Printf("搜索引擎收集错误: %v", err)
 	}
 
-	uniqueIPs := make(map[string]bool) //用于取独特的一个 IP，没有重复
+	uniqueIPs := make(map[string]bool)
 	var ipsToScan []string
 
-	result := aggregateSubdomains(results)
+	aggregated := aggregateSubdomains(results)
 
-	for _, res := range result {
-		fmt.Printf("[%s] %s (IPs: %v)\n", //打印收集到的子域名结果
+	for _, res := range aggregated {
+		fmt.Printf("[%s] %s (IPs: %v)\n",
 			res.FirstSeen.Format("2006-01-02"),
 			res.Subdomain,
 			res.IPs)
 
-		domainID, err := SaveDomainInfo(db, domain, res.Subdomain, //存入 sql 数据库
+		domainID, err := storage.SaveDomainInfo(db, domainName, res.Subdomain,
 			strings.HasPrefix(res.Subdomain, "*."),
 			"",
-			strings.Join(res.Sources, ","), // ✅ 动态来源
+			strings.Join(res.Sources, ","),
 		)
-
 		if err != nil {
 			log.Printf("保存子域名失败 %s: %v", res.Subdomain, err)
 			continue
@@ -148,7 +107,7 @@ func collectSubdomains(db *sql.DB, scan scanner) { //收集子域名函数
 				uniqueIPs[ipStr] = true
 				ipsToScan = append(ipsToScan, ipStr)
 
-				if err := SaveDomainIP(db, domainID, ipStr, res.Subdomain, nil); err != nil {
+				if err := storage.SaveDomainIP(db, domainID, ipStr, res.Subdomain, nil); err != nil {
 					log.Printf("保存IP关联失败 %s: %v", ipStr, err)
 				}
 			}
@@ -160,103 +119,68 @@ func collectSubdomains(db *sql.DB, scan scanner) { //收集子域名函数
 	fmt.Scan(&answer)
 
 	if answer == "y" {
-		for _, scan.ip = range ipsToScan {
-			domainScan(scan, db)
+		for _, ip := range ipsToScan {
+			task.IP = ip
+			domainScan(task, db)
 		}
 	} else if answer == "n" {
 		fmt.Print("The task is over.")
 	}
 }
 
-func domainScan(scan scanner, db *sql.DB) {
-	fmt.Printf("\n=== 开始域名扫描 %s ===\n", scan.ip)
+func domainScan(task model.Scanner, db *sql.DB) {
+	fmt.Printf("\n=== 开始域名扫描 %s ===\n", task.IP)
 
-	if IsHostAlive(scan.ip) {
-		//Run(scan.ip, scan.network) //测试用
-		openPorts := Run(scan.ip, scan.network) //真正利用，存储数据库
-		// 3. 保存结果(存储逻辑)
-		if err := SaveDomainScanResult(db, scan.ip, openPorts); err != nil {
+	if assist.IsHostAlive(task.IP) {
+		openPorts := scan.Run(task.IP, task.Network)
+		if err := storage.SaveDomainScanResult(db, task.IP, openPorts); err != nil {
 			log.Printf("保存扫描结果失败: %v", err)
 		}
 	} else {
 		fmt.Println("Can't ping")
-		if IsHostAlive_TCP(scan.ip) {
-			//Run(scan.ip, scan.network) //测试用
-			openPorts := Run(scan.ip, scan.network) //真正利用，存储数据库
-			// 3. 保存结果(存储逻辑)
-			if err := SaveDomainScanResult(db, scan.ip, openPorts); err != nil {
+		if assist.IsHostAliveTCP(task.IP) {
+			openPorts := scan.Run(task.IP, task.Network)
+			if err := storage.SaveDomainScanResult(db, task.IP, openPorts); err != nil {
 				log.Printf("保存扫描结果失败: %v", err)
 			}
 		} else {
 			log.Print("没有进入TCP连接")
-			fmt.Printf("%s is not alive\n", scan.ip)
+			fmt.Printf("%s is not alive\n", task.IP)
 		}
 	}
 }
 
-//func portScan(scan scanner, db *sql.DB) { //这是把之前的 端口扫描 和 主机检测 利用整合到一个函数里面，方便调用
-//
-//	if IsHostAlive(scan.ip) {
-//		//Run(scan.ip, scan.network) //这一行是用于测试，结果不进入 sql 数据库
-//		openPorts := Run(scan.ip, scan.network) //这一段是真正利用，结果进入 sql 数据库
-//		for _, result := range openPorts {
-//			if err := SaveResult(db, result); err != nil {
-//				log.Printf("存储失败 %s: %v", result.address, err)
-//			} else {
-//				log.Printf("成功储存 %s", result.address)
-//			}
-//		}
-//	} else {
-//		fmt.Println("Can't ping")
-//		if IsHostAlive_TCP(scan.ip) {
-//			//Run(scan.ip, scan.network) //这一行是用于测试，结果不进入 sql 数据库
-//			openPorts := Run(scan.ip, scan.network) //这一段是真正利用，结果进入 sql 数据库
-//			for _, result := range openPorts {
-//				if err := SaveResult(db, result); err != nil {
-//					log.Printf("存储失败 %s: %v", result.address, err)
-//				} else {
-//					log.Printf("成功储存 %s", result.address)
-//				}
-//			}
-//		} else {
-//			log.Print("没有进入TCP连接")
-//			fmt.Printf("%s is not alive\n", scan.ip)
-//		}
-//	}
-//}
-
-func portScan(scan scanner, db *sql.DB) {
-	if IsHostAlive(scan.ip) || IsHostAlive_TCP(scan.ip) {
-		openPorts := Run(scan.ip, scan.network)
+func portScan(task model.Scanner, db *sql.DB) {
+	if assist.IsHostAlive(task.IP) || assist.IsHostAliveTCP(task.IP) {
+		openPorts := scan.Run(task.IP, task.Network)
 		for _, result := range openPorts {
-			if !result.open {
+			if !result.Open {
 				continue
 			}
-			if result.service == "unknown" {
-				log.Printf("跳过未识别服务 %s", result.address)
+			if result.Service == "unknown" {
+				log.Printf("跳过未识别服务 %s", result.Address)
 				continue
 			}
-			if err := SaveResult(db, result); err != nil {
-				log.Printf("存储失败 %s: %v", result.address, err)
+			if err := storage.SaveResult(db, result); err != nil {
+				log.Printf("存储失败 %s: %v", result.Address, err)
 			} else {
-				log.Printf("成功储存 %s (%s)", result.address, result.service)
+				log.Printf("成功储存 %s (%s)", result.Address, result.Service)
 			}
 		}
 	} else {
 		log.Print("没有进入TCP连接")
-		fmt.Printf("%s is not alive\n", scan.ip)
+		fmt.Printf("%s is not alive\n", task.IP)
 	}
 }
 
 func main() {
-	db, err := InitDB() //连接数据库
+	db, err := storage.InitDB()
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	var scan scanner
-	scan.network = "tcp"
+	task := model.Scanner{Network: "tcp"}
 
 	var command string
 	fmt.Print("Please enter a command(domain/scan): ")
@@ -264,40 +188,11 @@ func main() {
 
 	if command == "scan" {
 		fmt.Print("Please enter your ip:")
-		fmt.Scan(&scan.ip)
-		portScan(scan, db) //进行扫描
+		fmt.Scan(&task.IP)
+		portScan(task, db)
 	} else if command == "domain" {
-		collectSubdomains(db, scan)
+		collectSubdomains(db, task)
 	} else {
 		fmt.Println("please enter a true command.")
 	}
-
-	//var timeout time.Duration
-	//var count int     //这两个是 go-ping 那个主机检测版本要用的变量
-
-	//fmt.Print("Please enter your network:")
-	//fmt.Scan(&scan.network)
-
-	//fmt.Print("IsHostAlive count and time:")
-	//fmt.Scan(&count, &timeout)
-
 }
-
-//func ishostAlive(ip string, count int, timeout time.Duration) bool { //检验主机是否存活，用的是 go-ping 库
-//	pinger, err := ping.NewPinger(ip)
-//	if err != nil {
-//		log.Printf("Error creating pinger: %v", err)
-//		return false
-//	}
-//
-//	pinger.SetPrivileged(true)
-//	pinger.Count = count
-//	pinger.Timeout = timeout
-//
-//	if err := pinger.Run(); err != nil {
-//		log.Printf("Ping failed: %v", err)
-//		return false
-//	}
-//	stats := pinger.Statistics()
-//	return stats.PacketsRecv > 0
-//}

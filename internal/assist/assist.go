@@ -1,4 +1,4 @@
-package main
+package assist
 
 import (
 	"fmt"
@@ -11,27 +11,29 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"golandproject/yscan/internal/model"
 )
 
-func ValidateInput(network string, address string) error { //检验用户输入
+func ValidateInput(network string, address string) error {
 	switch network {
 	case "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6":
 	default:
 		return fmt.Errorf("invalid network type: %s", network)
 	}
-	_, _, err := net.SplitHostPort(address) //分析地址是否正确
+	_, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return fmt.Errorf("invalid address: %s\nThis is error: %v", address, err)
 	}
 	return nil
 }
 
-func IsHostAlive(ip string) bool { //主机存活检测，用系统 ping 的方式，可以根据不同系统用不同的 ping 命令
+func IsHostAlive(ip string) bool {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
 		cmd = exec.Command("ping", "-n", "2", "-w", "2000", ip)
-	default: // Linux/macOS
+	default:
 		cmd = exec.Command("ping", "-c", "2", "-W", "2", ip)
 	}
 	output, err := cmd.CombinedOutput()
@@ -42,9 +44,9 @@ func IsHostAlive(ip string) bool { //主机存活检测，用系统 ping 的方�
 	return true
 }
 
-func IsHostAlive_TCP(ip string) bool { //主机存活检测，通过 TCP 连接的方法，可以跨系统运用，同时在对应主机禁止 ICMP 的时候使用
-	port := []int{80, 22, 443}
-	for _, port := range port {
+func IsHostAliveTCP(ip string) bool {
+	ports := []int{80, 22, 443}
+	for _, port := range ports {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 3*time.Second)
 		if err == nil {
 			conn.Close()
@@ -52,6 +54,10 @@ func IsHostAlive_TCP(ip string) bool { //主机存活检测，通过 TCP 连接�
 		}
 	}
 	return false
+}
+
+func IsHostAlive_TCP(ip string) bool {
+	return IsHostAliveTCP(ip)
 }
 
 func getTimeout(port int) time.Duration {
@@ -65,14 +71,14 @@ func getTimeout(port int) time.Duration {
 	}
 }
 
-func FirstLine(s string) string { //辅助函数：提取第一行
+func FirstLine(s string) string {
 	if idx := strings.Index(s, "\r\n"); idx > 0 {
 		return s[:idx]
 	}
 	return s
 }
 
-func ExtractHeader(banner, headerName string) string { //辅助函数：从 HTTP 响应头提取特定字段
+func ExtractHeader(banner, headerName string) string {
 	re := regexp.MustCompile(fmt.Sprintf(`(?i)%s:\s*(.*?)\r\n`, headerName))
 	match := re.FindStringSubmatch(banner)
 	if len(match) > 1 {
@@ -81,22 +87,21 @@ func ExtractHeader(banner, headerName string) string { //辅助函数：从 HTTP
 	return ""
 }
 
-func ErrType(scan scanResult) string { //产生错误的类型
-	if netErr, ok := scan.err.(net.Error); ok && netErr.Timeout() {
-		return "Timeout" //fmt.Printf("[-] %s - Timeout\n", scan.address)
-	} else if opErr, ok := scan.err.(*net.OpError); ok {
+func ErrType(scan model.ScanResult) string {
+	if netErr, ok := scan.Err.(net.Error); ok && netErr.Timeout() {
+		return "Timeout"
+	}
+	if opErr, ok := scan.Err.(*net.OpError); ok {
 		if opErr.Op == "dial" {
 			return "refused"
-		} else {
-			return "op_error" //fmt.Printf("[-] %s - Error: %v\n", scan.address, scan.err)
 		}
-	} else {
-		return "other" //fmt.Printf("[-] %s - Error: %v", scan.address, scan.err)
+		return "op_error"
 	}
+	return "other"
 }
 
 // GetWebsiteTitle 获取网站标题
-func GetWebsiteTitle(ip string, port int) string { //用于子域名收集功能，提取网站的标题
+func GetWebsiteTitle(ip string, port int) string {
 	url := fmt.Sprintf("http://%s:%d", ip, port)
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(url)
@@ -105,7 +110,6 @@ func GetWebsiteTitle(ip string, port int) string { //用于子域名收集功能
 	}
 	defer resp.Body.Close()
 
-	// 提取<title>标签内容
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
 		return ""

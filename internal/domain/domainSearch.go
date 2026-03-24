@@ -1,4 +1,4 @@
-package main
+package domain
 
 import (
 	"context"
@@ -52,18 +52,37 @@ func NewSearchEngineCollector() *SearchEngineCollector {
 		SearchEngines: defaultSearchEngines,
 		UsePlaywright: true, // 需要时打开
 		Proxy:         "",   // 如无代理则留空
-		Headless:      true,
+		Headless:      false,
 		BrowserType:   "chromium",
 	}
 }
 
 func (s *SearchEngineCollector) Collect(domain string, timeout time.Duration) ([]CollectResult, error) {
-	// 若启用 Playwright，优先走 Playwright；失败再降级 Colly
 	if s.UsePlaywright {
-		if subs, err := s.collectWithPlaywright(domain, timeout); err == nil && len(subs) > 0 {
-			return subs, nil
-		} else if err != nil {
-			log.Printf("[playwright] fallback to colly, err=%v", err)
+		type pwResult struct {
+			subs []CollectResult
+			err  error
+		}
+		ch := make(chan pwResult, 1)
+
+		go func() {
+			subs, err := s.collectWithPlaywright(domain, timeout)
+			ch <- pwResult{subs: subs, err: err}
+		}()
+
+		watchdog := timeout + 15*time.Second
+		select {
+		case r := <-ch:
+			if r.err == nil && len(r.subs) > 0 {
+				return r.subs, nil
+			}
+			if r.err != nil {
+				log.Printf("[playwright] fallback to colly, err=%v", r.err)
+			} else {
+				log.Printf("[playwright] fallback to colly, no subdomains found")
+			}
+		case <-time.After(watchdog):
+			log.Printf("[playwright] timeout after %v, fallback to colly", watchdog)
 		}
 	}
 	return s.collectWithColly(domain, timeout)
@@ -129,19 +148,23 @@ func (s *SearchEngineCollector) collectWithPlaywright(domain string, timeout tim
 		return nil, err
 	}
 
-	page.WaitForSelector("body", pw.PageWaitForSelectorOptions{Timeout: pw.Float(10_000)})
-	page.WaitForSelector("a", pw.PageWaitForSelectorOptions{Timeout: pw.Float(10_000)})
+	_, _ = page.WaitForSelector("body", pw.PageWaitForSelectorOptions{Timeout: pw.Float(10_000)})
+	_, _ = page.WaitForSelector("a", pw.PageWaitForSelectorOptions{Timeout: pw.Float(10_000)})
 	time.Sleep(2 * time.Second)
 
 	htmlContent, err := page.Content()
 	if err != nil {
 		return nil, err
 	}
-	// 可选：调试落盘
-	// _ = os.WriteFile("brave_debug.html", []byte(htmlContent), 0644)
+	bodyText, err := page.InnerText("body")
+	if err != nil {
+		bodyText = ""
+	}
 
+	target := strings.ToLower(htmlContent + "\n" + bodyText)
 	re := regexp.MustCompile(`(?i)(?:[a-z0-9-]+\.)+` + regexp.QuoteMeta(domain))
-	matches := re.FindAllString(strings.ToLower(htmlContent), -1)
+	matches := re.FindAllString(target, -1)
+
 	uniq := make(map[string]CollectResult)
 	for _, m := range matches {
 		sub := strings.Trim(strings.ToLower(m), ".")
@@ -151,14 +174,58 @@ func (s *SearchEngineCollector) collectWithPlaywright(domain string, timeout tim
 		if _, ok := uniq[sub]; ok {
 			continue
 		}
-		uniq[sub] = s.createResult(sub, "playwright:brave")
+		// Playwright 路径先返回子域名本身，避免 DNS 解析拖慢导致被 watchdog 超时截断。
+		uniq[sub] = CollectResult{
+			Subdomain: sub,
+			IPs:       nil,
+			FirstSeen: time.Now(),
+			Sources:   []string{s.SourceName + ":playwright:brave"},
+		}
 	}
 
-	var results []CollectResult
+	log.Printf("[playwright] raw_matches=%d, unique_subdomains=%d", len(matches), len(uniq))
+
+	results := make([]CollectResult, 0, len(uniq))
 	for _, r := range uniq {
 		results = append(results, r)
 	}
+	results = s.resolveIPsConcurrent(results, 8)
 	return results, nil
+}
+
+func (s *SearchEngineCollector) resolveIPsConcurrent(results []CollectResult, workers int) []CollectResult {
+	if len(results) == 0 {
+		return results
+	}
+	if workers <= 0 {
+		workers = 4
+	}
+
+	type job struct{ idx int }
+	jobs := make(chan job, len(results))
+	var wg sync.WaitGroup
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				sub := results[j.idx].Subdomain
+				if strings.HasPrefix(sub, "*.") {
+					continue
+				}
+				ips := s.safeResolveIPs(sub)
+				results[j.idx].IPs = ips
+			}
+		}()
+	}
+
+	for i := range results {
+		jobs <- job{idx: i}
+	}
+	close(jobs)
+	wg.Wait()
+	return results
 }
 
 // 简单频率控制
@@ -188,11 +255,12 @@ func (s *SearchEngineCollector) collectWithColly(domain string, timeout time.Dur
 		colly.Async(false),
 		colly.AllowURLRevisit(),
 	)
+	c.SetRequestTimeout(timeout)
 	if s.Proxy != "" {
 		_ = c.SetProxy(s.Proxy)
 	}
 
-	c.Limit(&colly.LimitRule{
+	_ = c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
 		Parallelism: 1,
 		Delay:       3 * time.Second,
@@ -249,7 +317,8 @@ func (s *SearchEngineCollector) collectWithColly(domain string, timeout time.Dur
 		wg.Add(1)
 		go func(eng SearchEngineConfig) {
 			defer wg.Done()
-			if err := c.Visit(fmt.Sprintf(eng.URLFormat, domain)); err != nil {
+			visitURL := fmt.Sprintf(eng.URLFormat, domain)
+			if err := c.Visit(visitURL); err != nil {
 				log.Printf("[%s] %s 访问失败: %v", s.SourceName, eng.Name, err)
 			}
 		}(eng)
@@ -306,7 +375,9 @@ func (s *SearchEngineCollector) safeResolveIPs(subdomain string) []net.IP {
 	if strings.HasPrefix(subdomain, "*.") {
 		return nil
 	}
-	return resolveA(context.Background(), subdomain)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	return resolveA(ctx, subdomain)
 }
 
 //// ------------- Cookie 复用示例（可选） -------------

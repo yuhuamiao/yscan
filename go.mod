@@ -4,14 +4,12 @@ go 1.24.0
 
 require (
 	github.com/PuerkitoBio/goquery v1.10.3
-	github.com/go-sql-driver/mysql v1.9.2
 	github.com/gocolly/colly/v2 v2.2.0
 	github.com/mattn/go-sqlite3 v1.14.32
 	github.com/playwright-community/playwright-go v0.5700.1
 )
 
 require (
-	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/antchfx/htmlquery v1.3.4 // indirect
 	github.com/antchfx/xmlquery v1.4.4 // indirect

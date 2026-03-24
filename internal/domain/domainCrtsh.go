@@ -1,4 +1,4 @@
-package main
+package domain
 
 import (
 	"context"
@@ -177,12 +177,21 @@ func isValidSubdomain(name, baseDomain string) bool {
 }
 
 // 全局自定义解析器与保留网段过滤
-var publicResolver = &net.Resolver{
-	PreferGo: true,
-	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-		d := net.Dialer{Timeout: 5 * time.Second}
-		return d.DialContext(ctx, "udp", "1.1.1.1:53")
-	},
+func dnsResolver(server string) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 2 * time.Second}
+			return d.DialContext(ctx, "udp", server)
+		},
+	}
+}
+
+var resolverChain = []*net.Resolver{
+	dnsResolver("223.5.5.5:53"),    // AliDNS
+	dnsResolver("119.29.29.29:53"), // DNSPod
+	dnsResolver("1.1.1.1:53"),
+	net.DefaultResolver,
 }
 
 func isReservedIP(ip net.IP) bool {
@@ -200,15 +209,35 @@ func isReservedIP(ip net.IP) bool {
 }
 
 func resolveA(ctx context.Context, name string) []net.IP {
-	ips, err := publicResolver.LookupIP(ctx, "ip4", name)
-	if err != nil {
-		return nil
-	}
+	seen := make(map[string]struct{})
 	var out []net.IP
-	for _, ip := range ips {
-		if ip.To4() != nil && !isReservedIP(ip) {
+
+	for _, r := range resolverChain {
+		lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		ips, err := r.LookupIP(lookupCtx, "ip4", name)
+		cancel()
+
+		if err != nil || len(ips) == 0 {
+			lookupCtx2, cancel2 := context.WithTimeout(ctx, 2*time.Second)
+			ips, err = r.LookupIP(lookupCtx2, "ip", name)
+			cancel2()
+			if err != nil || len(ips) == 0 {
+				continue
+			}
+		}
+
+		for _, ip := range ips {
+			key := ip.String()
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			if ip.To4() != nil && isReservedIP(ip) {
+				continue
+			}
+			seen[key] = struct{}{}
 			out = append(out, ip)
 		}
 	}
+
 	return out
 }
