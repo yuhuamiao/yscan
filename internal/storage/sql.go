@@ -267,7 +267,7 @@ func SaveDomainScanResult(db *sql.DB, ip string, openPorts []model.ScanResult) e
 	if title != "" {
 		_, err = db.Exec(`
             UPDATE domain_info 
-            SET title = ?, last_scan = NOW()
+            SET title = ?, last_scan = datetime('now')
             WHERE id = (SELECT domain_id FROM domain_ips WHERE ip = ? LIMIT 1)`,
 			title, ip)
 		if err != nil {

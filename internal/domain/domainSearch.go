@@ -2,10 +2,13 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -59,30 +62,26 @@ func NewSearchEngineCollector() *SearchEngineCollector {
 
 func (s *SearchEngineCollector) Collect(domain string, timeout time.Duration) ([]CollectResult, error) {
 	if s.UsePlaywright {
-		type pwResult struct {
-			subs []CollectResult
-			err  error
-		}
-		ch := make(chan pwResult, 1)
+		if !isPlaywrightReady() {
+			log.Printf("[playwright] fallback to colly, runtime not ready")
+		} else {
+			watchdog := timeout + 15*time.Second
+			ctx, cancel := context.WithTimeout(context.Background(), watchdog)
+			defer cancel()
 
-		go func() {
-			subs, err := s.collectWithPlaywright(domain, timeout)
-			ch <- pwResult{subs: subs, err: err}
-		}()
-
-		watchdog := timeout + 15*time.Second
-		select {
-		case r := <-ch:
-			if r.err == nil && len(r.subs) > 0 {
-				return r.subs, nil
+			subs, err := s.collectWithPlaywright(ctx, domain, timeout)
+			if err == nil && len(subs) > 0 {
+				return subs, nil
 			}
-			if r.err != nil {
-				log.Printf("[playwright] fallback to colly, err=%v", r.err)
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					log.Printf("[playwright] timeout after %v, fallback to colly", watchdog)
+				} else {
+					log.Printf("[playwright] fallback to colly, err=%v", err)
+				}
 			} else {
 				log.Printf("[playwright] fallback to colly, no subdomains found")
 			}
-		case <-time.After(watchdog):
-			log.Printf("[playwright] timeout after %v, fallback to colly", watchdog)
 		}
 	}
 	return s.collectWithColly(domain, timeout)
@@ -90,11 +89,13 @@ func (s *SearchEngineCollector) Collect(domain string, timeout time.Duration) ([
 
 // ============ Playwright Brave 搜索 ============
 
-func (s *SearchEngineCollector) collectWithPlaywright(domain string, timeout time.Duration) ([]CollectResult, error) {
+func (s *SearchEngineCollector) collectWithPlaywright(scanCtx context.Context, domain string, timeout time.Duration) ([]CollectResult, error) {
 	throttle(1200 * time.Millisecond) // 频率限制
 
-	if err := pw.Install(); err != nil {
-		return nil, err
+	select {
+	case <-scanCtx.Done():
+		return nil, scanCtx.Err()
+	default:
 	}
 
 	launchOpts := pw.BrowserTypeLaunchOptions{
@@ -125,32 +126,41 @@ func (s *SearchEngineCollector) collectWithPlaywright(domain string, timeout tim
 	}
 	defer browser.Close()
 
-	ctx, err := browser.NewContext(pw.BrowserNewContextOptions{
+	browserCtx, err := browser.NewContext(pw.BrowserNewContextOptions{
 		UserAgent: pw.String("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
 	})
 	if err != nil {
 		return nil, err
 	}
-	defer ctx.Close()
+	defer browserCtx.Close()
 
-	page, err := ctx.NewPage()
+	page, err := browserCtx.NewPage()
 	if err != nil {
 		return nil, err
 	}
-	page.SetDefaultTimeout(float64(timeout.Milliseconds()))
+	page.SetDefaultTimeout(float64(playwrightStepTimeout(scanCtx, timeout).Milliseconds()))
 
 	url := "https://search.brave.com/search?q=site:" + domain + "&source=web"
 	_, err = page.Goto(url, pw.PageGotoOptions{
 		WaitUntil: pw.WaitUntilStateDomcontentloaded,
-		Timeout:   pw.Float(float64(timeout.Milliseconds())),
+		Timeout:   pw.Float(float64(playwrightStepTimeout(scanCtx, timeout).Milliseconds())),
 	})
 	if err != nil {
+		if scanCtx.Err() != nil {
+			return nil, scanCtx.Err()
+		}
 		return nil, err
 	}
 
-	_, _ = page.WaitForSelector("body", pw.PageWaitForSelectorOptions{Timeout: pw.Float(10_000)})
-	_, _ = page.WaitForSelector("a", pw.PageWaitForSelectorOptions{Timeout: pw.Float(10_000)})
+	_, _ = page.WaitForSelector("body", pw.PageWaitForSelectorOptions{Timeout: pw.Float(float64(playwrightStepTimeout(scanCtx, 10*time.Second).Milliseconds()))})
+	_, _ = page.WaitForSelector("a", pw.PageWaitForSelectorOptions{Timeout: pw.Float(float64(playwrightStepTimeout(scanCtx, 10*time.Second).Milliseconds()))})
+	if scanCtx.Err() != nil {
+		return nil, scanCtx.Err()
+	}
 	time.Sleep(2 * time.Second)
+	if scanCtx.Err() != nil {
+		return nil, scanCtx.Err()
+	}
 
 	htmlContent, err := page.Content()
 	if err != nil {
@@ -189,11 +199,14 @@ func (s *SearchEngineCollector) collectWithPlaywright(domain string, timeout tim
 	for _, r := range uniq {
 		results = append(results, r)
 	}
-	results = s.resolveIPsConcurrent(results, 8)
+	results = s.resolveIPsConcurrent(scanCtx, results, 8)
+	if scanCtx.Err() != nil {
+		return nil, scanCtx.Err()
+	}
 	return results, nil
 }
 
-func (s *SearchEngineCollector) resolveIPsConcurrent(results []CollectResult, workers int) []CollectResult {
+func (s *SearchEngineCollector) resolveIPsConcurrent(ctx context.Context, results []CollectResult, workers int) []CollectResult {
 	if len(results) == 0 {
 		return results
 	}
@@ -210,22 +223,62 @@ func (s *SearchEngineCollector) resolveIPsConcurrent(results []CollectResult, wo
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
 				sub := results[j.idx].Subdomain
 				if strings.HasPrefix(sub, "*.") {
 					continue
 				}
-				ips := s.safeResolveIPs(sub)
+				ips := s.safeResolveIPs(ctx, sub)
 				results[j.idx].IPs = ips
 			}
 		}()
 	}
 
 	for i := range results {
+		if ctx.Err() != nil {
+			break
+		}
 		jobs <- job{idx: i}
 	}
 	close(jobs)
 	wg.Wait()
 	return results
+}
+
+func playwrightStepTimeout(ctx context.Context, preferred time.Duration) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 1 * time.Millisecond
+		}
+		if remaining < preferred {
+			return remaining
+		}
+	}
+	return preferred
+}
+
+func isPlaywrightReady() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+
+	driverDir := filepath.Join(home, ".cache", "ms-playwright-go")
+	browserDir := filepath.Join(home, ".cache", "ms-playwright")
+
+	if st, err := os.Stat(driverDir); err != nil || !st.IsDir() {
+		return false
+	}
+
+	chromiumBuilds, _ := filepath.Glob(filepath.Join(browserDir, "chromium-*"))
+	if len(chromiumBuilds) == 0 {
+		return false
+	}
+
+	return true
 }
 
 // 简单频率控制
@@ -360,13 +413,13 @@ func (s *SearchEngineCollector) containsSubdomain(results []CollectResult, subdo
 func (s *SearchEngineCollector) createResult(subdomain, host string) CollectResult {
 	return CollectResult{
 		Subdomain: subdomain,
-		IPs:       s.safeResolveIPs(subdomain),
+		IPs:       s.safeResolveIPs(context.Background(), subdomain),
 		FirstSeen: time.Now(),
 		Sources:   []string{s.SourceName + ":" + host},
 	}
 }
 
-func (s *SearchEngineCollector) safeResolveIPs(subdomain string) []net.IP {
+func (s *SearchEngineCollector) safeResolveIPs(parent context.Context, subdomain string) []net.IP {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("IP解析异常: %v", r)
@@ -375,7 +428,7 @@ func (s *SearchEngineCollector) safeResolveIPs(subdomain string) []net.IP {
 	if strings.HasPrefix(subdomain, "*.") {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
 	return resolveA(ctx, subdomain)
 }

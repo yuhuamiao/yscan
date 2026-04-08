@@ -3,14 +3,18 @@ package identify
 import (
 	"bufio"
 	"fmt"
-	"log"
 	"net"
 	"strings"
 	"time"
 
 	"golandproject/yscan/internal/assist"
-	"golandproject/yscan/internal/storage"
 )
+
+var matchFingerprint func(string) string
+
+func SetFingerprintMatcher(matcher func(string) string) {
+	matchFingerprint = matcher
+}
 
 // 协议配置
 var protocolConfig = map[int]struct {
@@ -132,7 +136,7 @@ func readWithTimeout(conn net.Conn, timeout time.Duration) string {
 }
 
 func IdentifyService(banner string, port int) string {
-	fmt.Printf("\n端口: %d\n[原始Banner开始]==========\n%s\n[原始Banner结束]==========\n", port, banner)
+	//fmt.Printf("\n端口: %d\n[原始Banner开始]==========\n%s\n[原始Banner结束]==========\n", port, banner)
 
 	//banner = cleanResponse(banner) //这是基于简单的端口和 banner 信息指纹识别
 	//
@@ -140,28 +144,21 @@ func IdentifyService(banner string, port int) string {
 	//	return cfg.identifier(banner)
 	//}
 
-	db, err := storage.InitDB() //这里是通过连接数据库，和指纹库里的数据进行匹配
-	if err != nil {
-		log.Printf("数据库连接失败: %v", err)
-		return "unknown"
-	}
-	defer db.Close()
-
 	if strings.Contains(banner, "HTTP/") {
 		bannerNew := assist.ExtractHeader(banner, "Server")
-		if bannerNew != "" {
-			if service := storage.MatchFingerprint(db, bannerNew); service != "" {
+		if bannerNew != "" && matchFingerprint != nil {
+			if service := matchFingerprint(bannerNew); service != "" {
 				return service
 			}
-			fmt.Println("no")
 		}
 	}
 
 	// 1. 尝试指纹匹配
-	if service := storage.MatchFingerprint(db, banner); service != "" {
-		return service
+	if matchFingerprint != nil {
+		if service := matchFingerprint(banner); service != "" {
+			return service
+		}
 	}
-	fmt.Println("no")
 
 	switch { //保底逻辑
 	case strings.Contains(banner, "HTTP/"):

@@ -83,24 +83,26 @@ func scanImportantPorts(ip, network string) []model.ScanResult {
 func Run(ip string, network string) []model.ScanResult {
 	important := scanImportantPorts(ip, network)
 
-	var (
-		totalPorts = 65535      // 总端口数
-		scanned    = 0          // 已扫描计数
-		startTime  = time.Now() // 记录开始时间
-	)
+	skipPorts := make(map[int]bool, len(importantPorts))
+	for _, p := range importantPorts {
+		skipPorts[p] = true
+	}
+
+	totalPorts := 65535 - len(skipPorts)
+	scanned := 0
+	startTime := time.Now()
 	var wg sync.WaitGroup
 	tasks := make(chan model.Scanner, 1000)
 
-	skipPorts := make(map[int]bool)
-	for _, r := range important {
-		_, portStr, _ := net.SplitHostPort(r.Address) // 分解address
-		port, _ := strconv.Atoi(portStr)              // 字符串转整数
-		skipPorts[port] = true
-	}
-
 	results := make(chan model.ScanResult, 1000)
 	var openPorts []model.ScanResult
-	workers := runtime.NumCPU() * 100
+	workers := runtime.NumCPU() * 20
+	if workers < 64 {
+		workers = 64
+	}
+	if workers > 512 {
+		workers = 512
+	}
 
 	for i := 0; i < workers; i++ { //分配工作
 		wg.Add(1)

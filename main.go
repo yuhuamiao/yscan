@@ -4,11 +4,13 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
 	"golandproject/yscan/internal/assist"
 	"golandproject/yscan/internal/domain"
+	"golandproject/yscan/internal/identify"
 	"golandproject/yscan/internal/model"
 	"golandproject/yscan/internal/scan"
 	"golandproject/yscan/internal/storage"
@@ -61,11 +63,12 @@ func aggregateSubdomains(results []domain.CollectResult) map[string]*domain.Coll
 	return res
 }
 
-func collectSubdomains(db *sql.DB, task model.Scanner) {
-	var domainName string
-
-	fmt.Print("Please enter your domain: ")
-	fmt.Scan(&domainName)
+func collectSubdomains(db *sql.DB, domainName string) []string {
+	domainName = strings.TrimSpace(domainName)
+	if domainName == "" {
+		log.Print("域名不能为空")
+		return nil
+	}
 
 	var results []domain.CollectResult
 
@@ -103,28 +106,30 @@ func collectSubdomains(db *sql.DB, task model.Scanner) {
 
 		for _, ip := range res.IPs {
 			ipStr := ip.String()
-			if !uniqueIPs[ipStr] && ip.To4() != nil {
+			if ip.To4() == nil {
+				continue
+			}
+
+			// 每个子域名都应记录到domain_ips，避免共享IP时丢失资产关系。
+			if err := storage.SaveDomainIP(db, domainID, ipStr, res.Subdomain, nil); err != nil {
+				log.Printf("保存IP关联失败 %s: %v", ipStr, err)
+			}
+
+			if !uniqueIPs[ipStr] {
 				uniqueIPs[ipStr] = true
 				ipsToScan = append(ipsToScan, ipStr)
-
-				if err := storage.SaveDomainIP(db, domainID, ipStr, res.Subdomain, nil); err != nil {
-					log.Printf("保存IP关联失败 %s: %v", ipStr, err)
-				}
 			}
 		}
 	}
 
-	answer := "n"
-	fmt.Print("Subdomain collecting is done. Do the domains need to scan?(y/N): ")
-	fmt.Scan(&answer)
+	return ipsToScan
+}
 
-	if answer == "y" {
-		for _, ip := range ipsToScan {
-			task.IP = ip
-			domainScan(task, db)
-		}
-	} else if answer == "n" {
-		fmt.Print("The task is over.")
+
+func scanCollectedIPs(task model.Scanner, db *sql.DB, ips []string) {
+	for _, ip := range ips {
+		task.IP = ip
+		domainScan(task, db)
 	}
 }
 
@@ -180,8 +185,47 @@ func main() {
 	}
 	defer db.Close()
 
+	identify.SetFingerprintMatcher(func(banner string) string {
+		return storage.MatchFingerprint(db, banner)
+	})
+
 	task := model.Scanner{Network: "tcp"}
 
+	args := os.Args[1:]
+	if len(args) > 0 {
+		runByArgs(args, task, db)
+		return
+	}
+
+	runInteractive(task, db)
+}
+
+func runByArgs(args []string, task model.Scanner, db *sql.DB) {
+	command := strings.ToLower(strings.TrimSpace(args[0]))
+	switch command {
+	case "scan":
+		if len(args) < 2 {
+			fmt.Println("usage: yscan scan <ip>")
+			return
+		}
+		task.IP = strings.TrimSpace(args[1])
+		portScan(task, db)
+	case "domain":
+		if len(args) < 2 {
+			fmt.Println("usage: yscan domain <domain> [--scan]")
+			return
+		}
+		domainName := strings.TrimSpace(args[1])
+		ipsToScan := collectSubdomains(db, domainName)
+		if len(args) >= 3 && strings.EqualFold(args[2], "--scan") {
+			scanCollectedIPs(task, db, ipsToScan)
+		}
+	default:
+		fmt.Println("please enter a true command.")
+	}
+}
+
+func runInteractive(task model.Scanner, db *sql.DB) {
 	var command string
 	fmt.Print("Please enter a command(domain/scan): ")
 	fmt.Scan(&command)
@@ -190,9 +234,26 @@ func main() {
 		fmt.Print("Please enter your ip:")
 		fmt.Scan(&task.IP)
 		portScan(task, db)
-	} else if command == "domain" {
-		collectSubdomains(db, task)
-	} else {
-		fmt.Println("please enter a true command.")
+		return
 	}
+
+	if command == "domain" {
+		var domainName string
+		fmt.Print("Please enter your domain: ")
+		fmt.Scan(&domainName)
+
+		ipsToScan := collectSubdomains(db, domainName)
+
+		answer := "n"
+		fmt.Print("Subdomain collecting is done. Do the domains need to scan?(y/N): ")
+		fmt.Scan(&answer)
+		if answer == "y" {
+			scanCollectedIPs(task, db, ipsToScan)
+		} else if answer == "n" {
+			fmt.Print("The task is over.")
+		}
+		return
+	}
+
+	fmt.Println("please enter a true command.")
 }

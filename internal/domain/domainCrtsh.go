@@ -63,9 +63,9 @@ func CollectSubdomains_crtsh(domain string, timeout time.Duration) ([]CollectRes
 		case <-ctx.Done():
 			return results, nil
 		default:
-			res := processRecord(rec, domain)
-			if res.Subdomain != "" {
-				results = append(results, res)
+			recordResults := processRecord(rec, domain)
+			if len(recordResults) > 0 {
+				results = append(results, recordResults...)
 			}
 		}
 	}
@@ -113,7 +113,7 @@ func fetchCertRecords(ctx context.Context, apiURL string) ([]CertRecord, error) 
 }
 
 // processRecord 处理单条记录
-func processRecord(rec CertRecord, baseDomain string) CollectResult {
+func processRecord(rec CertRecord, baseDomain string) []CollectResult {
 	rec.IsWildcard = strings.HasPrefix(rec.CommonName, "*.") ||
 		strings.Contains(rec.NameValue, "*.")
 
@@ -128,45 +128,49 @@ func processRecord(rec CertRecord, baseDomain string) CollectResult {
 	}
 
 	if len(validSubdomains) == 0 {
-		return CollectResult{}
+		return nil
 	}
-
-	// 只处理第一个有效子域名
-	subdomain := validSubdomains[0]
-	var ips []net.IP
-	//if !rec.IsWildcard {
-	//	if resolvedIPs, err := net.LookupIP(subdomain); err == nil {
-	//		ips = resolvedIPs
-	//	}
-	//}
-	if !rec.IsWildcard {
-		resolved := resolveA(context.Background(), subdomain)
-		if len(resolved) > 0 {
-			ips = resolved
-		}
-	}
-	// 最终再过滤一次，避免任何遗漏
-	var clean []net.IP
-	for _, ip := range ips {
-		if isReservedIP(ip) {
-			log.Printf("[filter] drop reserved ip for %s: %s", subdomain, ip)
-			continue
-		}
-		clean = append(clean, ip)
-	}
-	ips = clean
 
 	var firstSeen time.Time
 	if rec.LoggedAt != "" {
 		firstSeen, _ = time.Parse("2006-01-02T15:04:05", rec.LoggedAt)
 	}
 
-	return CollectResult{
-		Subdomain: subdomain,
-		IPs:       ips,
-		FirstSeen: firstSeen,
-		Sources:   []string{"crt.sh"},
+	seen := make(map[string]struct{})
+	results := make([]CollectResult, 0, len(validSubdomains))
+	for _, subdomain := range validSubdomains {
+		if _, ok := seen[subdomain]; ok {
+			continue
+		}
+		seen[subdomain] = struct{}{}
+
+		var ips []net.IP
+		if !strings.HasPrefix(subdomain, "*.") {
+			resolved := resolveA(context.Background(), subdomain)
+			if len(resolved) > 0 {
+				ips = resolved
+			}
+		}
+
+		// 最终再过滤一次，避免任何遗漏
+		var clean []net.IP
+		for _, ip := range ips {
+			if isReservedIP(ip) {
+				log.Printf("[filter] drop reserved ip for %s: %s", subdomain, ip)
+				continue
+			}
+			clean = append(clean, ip)
+		}
+
+		results = append(results, CollectResult{
+			Subdomain: subdomain,
+			IPs:       clean,
+			FirstSeen: firstSeen,
+			Sources:   []string{"crt.sh"},
+		})
 	}
+
+	return results
 }
 
 // isValidSubdomain 验证子域名
