@@ -37,10 +37,14 @@ func InitDB() (*sql.DB, error) {
 
 	if !dbExists {
 		log.Printf("检测到不存在 %s，正在初始化数据库结构...", sqliteFile)
-		if err := initSQLiteSchema(db); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("初始化 SQLite 表结构失败: %v", err)
-		}
+	}
+
+	if err := initSQLiteSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("初始化 SQLite 表结构失败: %v", err)
+	}
+
+	if !dbExists {
 		log.Println("SQLite 数据库初始化完成")
 	}
 
@@ -52,7 +56,7 @@ func InitDB() (*sql.DB, error) {
 }
 
 func resetSequencesIfEmpty(db *sql.DB) error {
-	tables := []string{"banner", "scan_results", "domain_info", "domain_ips"}
+	tables := []string{"banner", "scan_results", "domain_info", "domain_ips", "tasks", "pocs", "vulnerabilities"}
 	for _, tbl := range tables {
 		var cnt int
 		if err := db.QueryRow(fmt.Sprintf("SELECT COUNT(1) FROM %s", tbl)).Scan(&cnt); err != nil {
@@ -106,9 +110,447 @@ CREATE TABLE IF NOT EXISTS domain_ips (
     ports      TEXT,
     UNIQUE(domain_id, ip)
 );
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_type   TEXT    NOT NULL,
+    target      TEXT    NOT NULL,
+    status      TEXT    NOT NULL,
+    progress    INTEGER NOT NULL DEFAULT 0,
+    error_msg   TEXT,
+    started_at  DATETIME,
+    finished_at DATETIME,
+    created_at  DATETIME NOT NULL DEFAULT (datetime('now')),
+    updated_at  DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS pocs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id TEXT    NOT NULL UNIQUE,
+    name        TEXT,
+    severity    TEXT,
+    tags        TEXT,
+    description TEXT,
+    updated_at  DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS vulnerabilities (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id        INTEGER NOT NULL,
+    scan_result_id INTEGER,
+    poc_id         INTEGER,
+    template_id    TEXT,
+    vuln_type      TEXT,
+    name           TEXT,
+    severity       TEXT,
+    target         TEXT,
+    target_ip      TEXT,
+    target_port    INTEGER,
+    matched_at     TEXT,
+    evidence       TEXT,
+    scan_time      DATETIME NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(task_id, template_id, target, matched_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_task_id ON vulnerabilities(task_id);
+CREATE INDEX IF NOT EXISTS idx_vuln_scan_result_id ON vulnerabilities(scan_result_id);
 `
 	_, err := db.Exec(schema)
 	return err
+}
+
+func SaveNucleiFindings(db *sql.DB, taskID int64, findings []model.NucleiFinding) error {
+	if len(findings) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	for _, f := range findings {
+		pocID, err2 := upsertPOC(tx, f)
+		if err2 != nil {
+			err = err2
+			return err
+		}
+
+		scanResultID, err2 := getScanResultID(tx, f.TargetIP, f.TargetPort)
+		if err2 != nil {
+			err = err2
+			return err
+		}
+
+		_, err2 = tx.Exec(`
+			INSERT INTO vulnerabilities
+			(task_id, scan_result_id, poc_id, template_id, vuln_type, name, severity, target, target_ip, target_port, matched_at, evidence, scan_time)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+			ON CONFLICT(task_id, template_id, target, matched_at) DO UPDATE SET
+				scan_result_id = excluded.scan_result_id,
+				poc_id         = excluded.poc_id,
+				vuln_type      = excluded.vuln_type,
+				name           = excluded.name,
+				severity       = excluded.severity,
+				target_ip      = excluded.target_ip,
+				target_port    = excluded.target_port,
+				evidence       = excluded.evidence,
+				scan_time      = datetime('now')`,
+			taskID,
+			scanResultID,
+			pocID,
+			f.TemplateID,
+			f.VulnType,
+			f.Name,
+			f.Severity,
+			f.Target,
+			f.TargetIP,
+			f.TargetPort,
+			f.MatchedAt,
+			f.Evidence,
+		)
+		if err2 != nil {
+			err = err2
+			return err
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ListVulnerabilitiesByTask(db *sql.DB, taskID int64) ([]model.Vulnerability, error) {
+	return ListVulnerabilitiesByTaskWithSeverity(db, taskID, "")
+}
+
+func ListVulnerabilitiesByTaskWithSeverity(db *sql.DB, taskID int64, severity string) ([]model.Vulnerability, error) {
+	severity = strings.ToLower(strings.TrimSpace(severity))
+
+	query := `
+		SELECT id, task_id, scan_result_id, poc_id, template_id, vuln_type, name, severity, target, target_ip, target_port, matched_at, scan_time
+		FROM vulnerabilities
+		WHERE task_id = ?`
+	args := []interface{}{taskID}
+	if severity != "" {
+		query += ` AND LOWER(severity) = ?`
+		args = append(args, severity)
+	}
+	query += ` ORDER BY id DESC`
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []model.Vulnerability
+	for rows.Next() {
+		var v model.Vulnerability
+		var scanResultID, pocID sql.NullInt64
+		if err := rows.Scan(
+			&v.ID,
+			&v.TaskID,
+			&scanResultID,
+			&pocID,
+			&v.TemplateID,
+			&v.VulnType,
+			&v.Name,
+			&v.Severity,
+			&v.Target,
+			&v.TargetIP,
+			&v.TargetPort,
+			&v.MatchedAt,
+			&v.ScanTime,
+		); err != nil {
+			return nil, err
+		}
+		if scanResultID.Valid {
+			v.ScanResultID = scanResultID.Int64
+		}
+		if pocID.Valid {
+			v.PocID = pocID.Int64
+		}
+		out = append(out, v)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
+func upsertPOC(tx *sql.Tx, f model.NucleiFinding) (int64, error) {
+	if strings.TrimSpace(f.TemplateID) == "" {
+		return 0, nil
+	}
+
+	_, err := tx.Exec(`
+		INSERT INTO pocs (template_id, name, severity, tags, description, updated_at)
+		VALUES (?, ?, ?, ?, ?, datetime('now'))
+		ON CONFLICT(template_id) DO UPDATE SET
+			name        = excluded.name,
+			severity    = excluded.severity,
+			tags        = excluded.tags,
+			description = excluded.description,
+			updated_at  = datetime('now')`,
+		f.TemplateID,
+		f.Name,
+		f.Severity,
+		f.Tags,
+		f.Description,
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	var pocID int64
+	err = tx.QueryRow(`SELECT id FROM pocs WHERE template_id = ?`, f.TemplateID).Scan(&pocID)
+	if err != nil {
+		return 0, err
+	}
+	return pocID, nil
+}
+
+func getScanResultID(tx *sql.Tx, ip string, port int) (sql.NullInt64, error) {
+	var id sql.NullInt64
+	if strings.TrimSpace(ip) == "" || port <= 0 {
+		return id, nil
+	}
+
+	err := tx.QueryRow(`SELECT id FROM scan_results WHERE ip = ? AND port = ? LIMIT 1`, ip, port).Scan(&id)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return sql.NullInt64{}, nil
+		}
+		return sql.NullInt64{}, err
+	}
+	return id, nil
+}
+
+func CreateTask(db *sql.DB, taskType, target string) (int64, error) {
+	res, err := db.Exec(`
+		INSERT INTO tasks (task_type, target, status, progress, created_at, updated_at)
+		VALUES (?, ?, ?, 0, datetime('now'), datetime('now'))`,
+		taskType,
+		target,
+		model.TaskStatusQueued,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func GetTaskStatus(db *sql.DB, taskID int64) (string, error) {
+	var status string
+	err := db.QueryRow(`SELECT status FROM tasks WHERE id = ?`, taskID).Scan(&status)
+	if err != nil {
+		return "", err
+	}
+	return status, nil
+}
+
+func GetTaskByID(db *sql.DB, taskID int64) (model.Task, error) {
+	var t model.Task
+	var startedAt, finishedAt, errorMsg, updatedAt sql.NullString
+
+	err := db.QueryRow(`
+		SELECT id, task_type, target, status, progress, error_msg, started_at, finished_at, created_at, updated_at
+		FROM tasks
+		WHERE id = ?`, taskID).Scan(
+		&t.ID,
+		&t.TaskType,
+		&t.Target,
+		&t.Status,
+		&t.Progress,
+		&errorMsg,
+		&startedAt,
+		&finishedAt,
+		&t.CreatedAt,
+		&updatedAt,
+	)
+	if err != nil {
+		return model.Task{}, err
+	}
+
+	applyNullableTaskFields(&t, errorMsg, startedAt, finishedAt, updatedAt)
+
+	return t, nil
+}
+
+func ListTasks(db *sql.DB) ([]model.Task, error) {
+	rows, err := db.Query(`
+		SELECT id, task_type, target, status, progress, error_msg, started_at, finished_at, created_at, updated_at
+		FROM tasks
+		ORDER BY id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []model.Task
+	for rows.Next() {
+		var t model.Task
+		var startedAt, finishedAt, errorMsg, updatedAt sql.NullString
+		if err := rows.Scan(
+			&t.ID,
+			&t.TaskType,
+			&t.Target,
+			&t.Status,
+			&t.Progress,
+			&errorMsg,
+			&startedAt,
+			&finishedAt,
+			&t.CreatedAt,
+			&updatedAt,
+		); err != nil {
+			return nil, err
+		}
+		applyNullableTaskFields(&t, errorMsg, startedAt, finishedAt, updatedAt)
+		tasks = append(tasks, t)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return tasks, nil
+}
+
+func applyNullableTaskFields(t *model.Task, errorMsg, startedAt, finishedAt, updatedAt sql.NullString) {
+	if errorMsg.Valid {
+		t.ErrorMsg = errorMsg.String
+	}
+	if startedAt.Valid {
+		t.StartedAt = startedAt.String
+	}
+	if finishedAt.Valid {
+		t.FinishedAt = finishedAt.String
+	}
+	if updatedAt.Valid {
+		t.UpdatedAt = updatedAt.String
+	}
+}
+
+func UpdateTaskStatus(db *sql.DB, taskID int64, toStatus string, errorMsg string) error {
+	fromStatus, err := GetTaskStatus(db, taskID)
+	if err != nil {
+		return err
+	}
+
+	if !isValidTaskTransition(fromStatus, toStatus) {
+		return fmt.Errorf("invalid task transition: %s -> %s", fromStatus, toStatus)
+	}
+
+	switch toStatus {
+	case model.TaskStatusRunning:
+		_, err = db.Exec(`
+			UPDATE tasks
+			SET status = ?, started_at = datetime('now'), updated_at = datetime('now')
+			WHERE id = ?`,
+			toStatus,
+			taskID,
+		)
+	case model.TaskStatusSuccess:
+		_, err = db.Exec(`
+			UPDATE tasks
+			SET status = ?, progress = 100, finished_at = datetime('now'), error_msg = NULL, updated_at = datetime('now')
+			WHERE id = ?`,
+			toStatus,
+			taskID,
+		)
+	case model.TaskStatusFailed:
+		_, err = db.Exec(`
+			UPDATE tasks
+			SET status = ?, finished_at = datetime('now'), error_msg = ?, updated_at = datetime('now')
+			WHERE id = ?`,
+			toStatus,
+			errorMsg,
+			taskID,
+		)
+	case model.TaskStatusCanceled:
+		_, err = db.Exec(`
+			UPDATE tasks
+			SET status = ?, finished_at = datetime('now'), updated_at = datetime('now')
+			WHERE id = ?`,
+			toStatus,
+			taskID,
+		)
+	default:
+		_, err = db.Exec(`
+			UPDATE tasks
+			SET status = ?, updated_at = datetime('now')
+			WHERE id = ?`,
+			toStatus,
+			taskID,
+		)
+	}
+
+	return err
+}
+
+func UpdateTaskProgress(db *sql.DB, taskID int64, progress int) error {
+	if progress < 0 {
+		progress = 0
+	}
+	if progress > 100 {
+		progress = 100
+	}
+	_, err := db.Exec(`
+		UPDATE tasks
+		SET progress = ?, updated_at = datetime('now')
+		WHERE id = ?`,
+		progress,
+		taskID,
+	)
+	return err
+}
+
+func CancelTask(db *sql.DB, taskID int64) error {
+	return UpdateTaskStatus(db, taskID, model.TaskStatusCanceled, "")
+}
+
+func IsTaskCanceled(db *sql.DB, taskID int64) (bool, error) {
+	status, err := GetTaskStatus(db, taskID)
+	if err != nil {
+		return false, err
+	}
+	return status == model.TaskStatusCanceled, nil
+}
+
+func isValidTaskTransition(fromStatus, toStatus string) bool {
+	if fromStatus == toStatus {
+		return true
+	}
+
+	allowed := map[string]map[string]bool{
+		model.TaskStatusQueued: {
+			model.TaskStatusRunning:  true,
+			model.TaskStatusCanceled: true,
+		},
+		model.TaskStatusRunning: {
+			model.TaskStatusSuccess:  true,
+			model.TaskStatusFailed:   true,
+			model.TaskStatusCanceled: true,
+		},
+		model.TaskStatusSuccess:  {},
+		model.TaskStatusFailed:   {},
+		model.TaskStatusCanceled: {},
+	}
+
+	next, ok := allowed[fromStatus]
+	if !ok {
+		return false
+	}
+	return next[toStatus]
 }
 
 func fileExists(name string) bool {
@@ -381,4 +823,33 @@ func SaveDomainIP(db *sql.DB, domainID int64, ip string, subdomain string, ports
 		string(portsJSON),
 	)
 	return err
+}
+
+func ListOpenPortsByIP(db *sql.DB, ip string) ([]int, error) {
+	rows, err := db.Query(`
+		SELECT port
+		FROM scan_results
+		WHERE ip = ?
+		ORDER BY port ASC`, strings.TrimSpace(ip))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ports []int
+	for rows.Next() {
+		var p int
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		if p > 0 {
+			ports = append(ports, p)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return ports, nil
 }
