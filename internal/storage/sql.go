@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -56,7 +57,7 @@ func InitDB() (*sql.DB, error) {
 }
 
 func resetSequencesIfEmpty(db *sql.DB) error {
-	tables := []string{"banner", "scan_results", "domain_info", "domain_ips", "tasks", "pocs", "vulnerabilities"}
+	tables := []string{"banner", "scan_results", "domain_info", "domain_ips", "host_inventory", "tasks", "pocs", "vulnerabilities"}
 	for _, tbl := range tables {
 		var cnt int
 		if err := db.QueryRow(fmt.Sprintf("SELECT COUNT(1) FROM %s", tbl)).Scan(&cnt); err != nil {
@@ -71,12 +72,71 @@ func resetSequencesIfEmpty(db *sql.DB) error {
 	return nil
 }
 
+func ensureSQLiteMigrations(db *sql.DB) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS host_inventory (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			ip TEXT NOT NULL UNIQUE,
+			source TEXT,
+			first_seen DATETIME NOT NULL DEFAULT (datetime('now')),
+			last_seen DATETIME NOT NULL DEFAULT (datetime('now')),
+			last_scan DATETIME,
+			is_active INTEGER NOT NULL DEFAULT 1
+		)`,
+		`CREATE TABLE IF NOT EXISTS task_change_summaries (
+			task_id INTEGER PRIMARY KEY,
+			target TEXT NOT NULL,
+			summary_json TEXT NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`ALTER TABLE banner ADD COLUMN match_type TEXT NOT NULL DEFAULT 'contains'`,
+		`ALTER TABLE banner ADD COLUMN protocol TEXT`,
+		`ALTER TABLE banner ADD COLUMN port INTEGER`,
+		`ALTER TABLE domain_info ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE domain_info ADD COLUMN last_seen DATETIME`,
+		`ALTER TABLE domain_ips ADD COLUMN first_seen DATETIME`,
+		`ALTER TABLE domain_ips ADD COLUMN last_seen DATETIME`,
+		`ALTER TABLE domain_ips ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1`,
+		`UPDATE domain_info SET last_seen = COALESCE(last_seen, first_seen, datetime('now'))`,
+		`UPDATE domain_info SET is_active = COALESCE(is_active, 1)`,
+		`UPDATE domain_ips SET first_seen = COALESCE(first_seen, datetime('now'))`,
+		`UPDATE domain_ips SET last_seen = COALESCE(last_seen, datetime('now'))`,
+		`UPDATE domain_ips SET is_active = COALESCE(is_active, 1)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_banner_service_pattern ON banner(service_name, banner_pattern)`,
+		`CREATE INDEX IF NOT EXISTS idx_domain_info_subdomain_active ON domain_info(subdomain, is_active)`,
+		`CREATE INDEX IF NOT EXISTS idx_domain_ips_ip_active ON domain_ips(ip, is_active)`,
+		`CREATE INDEX IF NOT EXISTS idx_host_inventory_ip_active ON host_inventory(ip, is_active)`,
+		`CREATE INDEX IF NOT EXISTS idx_host_inventory_source_active ON host_inventory(source, is_active)`,
+		`CREATE INDEX IF NOT EXISTS idx_task_change_summaries_target ON task_change_summaries(target)`,
+	}
+
+	for _, stmt := range statements {
+		if _, err := db.Exec(stmt); err != nil && !isIgnorableSQLiteMigrationError(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func isIgnorableSQLiteMigrationError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate column name")
+}
+
 func initSQLiteSchema(db *sql.DB) error {
 	schema := `
 CREATE TABLE IF NOT EXISTS banner (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     service_name   TEXT    NOT NULL,
     banner_pattern TEXT    NOT NULL,
+    match_type     TEXT    NOT NULL DEFAULT 'contains',
+    protocol       TEXT,
+    port           INTEGER,
     description    TEXT
 );
 
@@ -95,8 +155,10 @@ CREATE TABLE IF NOT EXISTS domain_info (
     domain      TEXT    NOT NULL,
     subdomain   TEXT    NOT NULL,
     is_wildcard INTEGER NOT NULL DEFAULT 0,
+    is_active   INTEGER NOT NULL DEFAULT 1,
     title       TEXT,
     first_seen  DATETIME NOT NULL,
+    last_seen   DATETIME NOT NULL DEFAULT (datetime('now')),
     last_scan   DATETIME,
     source      TEXT,
     UNIQUE(subdomain)
@@ -108,7 +170,28 @@ CREATE TABLE IF NOT EXISTS domain_ips (
     subdomain  TEXT    NOT NULL,
     ip         TEXT    NOT NULL,
     ports      TEXT,
+    first_seen DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_seen  DATETIME NOT NULL DEFAULT (datetime('now')),
+    is_active  INTEGER NOT NULL DEFAULT 1,
     UNIQUE(domain_id, ip)
+);
+
+CREATE TABLE IF NOT EXISTS host_inventory (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip         TEXT    NOT NULL UNIQUE,
+    source     TEXT,
+    first_seen DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_seen  DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_scan  DATETIME,
+    is_active  INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS task_change_summaries (
+    task_id      INTEGER PRIMARY KEY,
+    target       TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    created_at   DATETIME NOT NULL DEFAULT (datetime('now')),
+    updated_at   DATETIME NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -154,9 +237,21 @@ CREATE TABLE IF NOT EXISTS vulnerabilities (
 
 CREATE INDEX IF NOT EXISTS idx_vuln_task_id ON vulnerabilities(task_id);
 CREATE INDEX IF NOT EXISTS idx_vuln_scan_result_id ON vulnerabilities(scan_result_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_banner_service_pattern ON banner(service_name, banner_pattern);
+CREATE INDEX IF NOT EXISTS idx_host_inventory_ip_active ON host_inventory(ip, is_active);
+CREATE INDEX IF NOT EXISTS idx_host_inventory_source_active ON host_inventory(source, is_active);
+CREATE INDEX IF NOT EXISTS idx_task_change_summaries_target ON task_change_summaries(target);
 `
 	_, err := db.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	if err := ensureSQLiteMigrations(db); err != nil {
+		return err
+	}
+
+	return seedBuiltinFingerprints(db)
 }
 
 func SaveNucleiFindings(db *sql.DB, taskID int64, findings []model.NucleiFinding) error {
@@ -250,7 +345,7 @@ func ListVulnerabilitiesByTaskWithSeverity(db *sql.DB, taskID int64, severity st
 	}
 	defer rows.Close()
 
-	var out []model.Vulnerability
+	out := make([]model.Vulnerability, 0)
 	for rows.Next() {
 		var v model.Vulnerability
 		var scanResultID, pocID sql.NullInt64
@@ -396,7 +491,7 @@ func ListTasks(db *sql.DB) ([]model.Task, error) {
 	}
 	defer rows.Close()
 
-	var tasks []model.Task
+	tasks := make([]model.Task, 0)
 	for rows.Next() {
 		var t model.Task
 		var startedAt, finishedAt, errorMsg, updatedAt sql.NullString
@@ -561,53 +656,219 @@ func fileExists(name string) bool {
 	return !info.IsDir()
 }
 
+type builtinFingerprint struct {
+	ServiceName   string
+	BannerPattern string
+	MatchType     string
+	Protocol      string
+	Port          int
+	Description   string
+}
+
+func seedBuiltinFingerprints(db *sql.DB) error {
+	rules := []builtinFingerprint{
+		{ServiceName: "nginx", BannerPattern: "nginx", MatchType: "contains", Protocol: "http", Description: "Nginx HTTP server"},
+		{ServiceName: "apache", BannerPattern: "apache", MatchType: "contains", Protocol: "http", Description: "Apache HTTP Server"},
+		{ServiceName: "iis", BannerPattern: "microsoft-iis", MatchType: "contains", Protocol: "http", Description: "Microsoft IIS"},
+		{ServiceName: "caddy", BannerPattern: "caddy", MatchType: "contains", Protocol: "http", Description: "Caddy web server"},
+		{ServiceName: "lighttpd", BannerPattern: "lighttpd", MatchType: "contains", Protocol: "http", Description: "Lighttpd web server"},
+		{ServiceName: "jetty", BannerPattern: "jetty", MatchType: "contains", Protocol: "http", Description: "Jetty web server"},
+		{ServiceName: "grafana", BannerPattern: "grafana", MatchType: "contains", Protocol: "http", Description: "Grafana dashboard"},
+		{ServiceName: "jenkins", BannerPattern: "x-jenkins", MatchType: "contains", Protocol: "http", Description: "Jenkins CI"},
+		{ServiceName: "harbor", BannerPattern: "harbor", MatchType: "contains", Protocol: "http", Description: "Harbor registry"},
+		{ServiceName: "kibana", BannerPattern: "kibana", MatchType: "contains", Protocol: "http", Description: "Kibana"},
+		{ServiceName: "elasticsearch", BannerPattern: "elasticsearch", MatchType: "contains", Protocol: "http", Description: "Elasticsearch"},
+		{ServiceName: "docker-api", BannerPattern: "docker", MatchType: "contains", Protocol: "http", Port: 2375, Description: "Docker Remote API"},
+		{ServiceName: "kubernetes-api", BannerPattern: "kubernetes", MatchType: "contains", Protocol: "http", Port: 6443, Description: "Kubernetes API Server"},
+		{ServiceName: "redis", BannerPattern: "redis_version", MatchType: "contains", Protocol: "tcp", Port: 6379, Description: "Redis server"},
+		{ServiceName: "mysql", BannerPattern: "mysql", MatchType: "contains", Protocol: "tcp", Port: 3306, Description: "MySQL server"},
+		{ServiceName: "postgresql", BannerPattern: "postgresql", MatchType: "contains", Protocol: "tcp", Port: 5432, Description: "PostgreSQL server"},
+		{ServiceName: "mongodb", BannerPattern: "mongodb", MatchType: "contains", Protocol: "tcp", Port: 27017, Description: "MongoDB server"},
+		{ServiceName: "openssh", BannerPattern: "openssh", MatchType: "contains", Protocol: "tcp", Port: 22, Description: "OpenSSH server"},
+		{ServiceName: "pure-ftpd", BannerPattern: "pure-ftpd", MatchType: "contains", Protocol: "tcp", Port: 21, Description: "Pure-FTPd server"},
+		{ServiceName: "vsftpd", BannerPattern: "vsftpd", MatchType: "contains", Protocol: "tcp", Port: 21, Description: "vsftpd server"},
+		{ServiceName: "vmware-auth", BannerPattern: "vmware", MatchType: "contains", Protocol: "tcp", Description: "VMware auth daemon"},
+		{ServiceName: "rdp", BannerPattern: "ms-wbt-server", MatchType: "contains", Protocol: "tcp", Port: 3389, Description: "Remote Desktop Protocol"},
+	}
+
+	for _, rule := range rules {
+		if _, err := db.Exec(`
+            INSERT INTO banner (service_name, banner_pattern, match_type, protocol, port, description)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(service_name, banner_pattern) DO NOTHING`,
+			rule.ServiceName,
+			rule.BannerPattern,
+			rule.MatchType,
+			rule.Protocol,
+			nullIfZero(rule.Port),
+			rule.Description,
+		); err != nil {
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "on conflict clause does not match") {
+				if _, err2 := db.Exec(`
+                    INSERT OR IGNORE INTO banner (service_name, banner_pattern, match_type, protocol, port, description)
+                    VALUES (?, ?, ?, ?, ?, ?)`,
+					rule.ServiceName,
+					rule.BannerPattern,
+					rule.MatchType,
+					rule.Protocol,
+					nullIfZero(rule.Port),
+					rule.Description,
+				); err2 != nil {
+					return err2
+				}
+				continue
+			}
+			return err
+		}
+	}
+
+	return nil
+}
+
+func nullIfZero(v int) interface{} {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
 func SaveResult(db *sql.DB, result model.ScanResult) error {
-	if !result.Open || result.Service == "unknown" || result.Service == "None_unknown" {
-		return fmt.Errorf("skip: not open or unknown service")
+	record, err := normalizeScanResult(db, result)
+	if err != nil {
+		return err
+	}
+	return upsertScanResult(db, record)
+}
+
+type scanResultRecord struct {
+	ip          string
+	port        int
+	serviceType string
+}
+
+type sqlExecer interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
+
+func normalizeScanResult(db *sql.DB, result model.ScanResult) (scanResultRecord, error) {
+	if !result.Open {
+		return scanResultRecord{}, fmt.Errorf("skip: port is not open")
 	}
 
 	ip, portStr, err := net.SplitHostPort(result.Address)
 	if err != nil {
-		return fmt.Errorf("解析地址失败: %v", err)
+		return scanResultRecord{}, fmt.Errorf("解析地址失败: %w", err)
 	}
-
 	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return fmt.Errorf("端口转换失败: %v", err)
+	if err != nil || port < 1 || port > 65535 {
+		return scanResultRecord{}, fmt.Errorf("端口转换失败: %s", portStr)
 	}
 
-	serviceType := MatchFingerprint(db, result.Banner)
+	serviceType := strings.TrimSpace(strings.ToLower(result.Product))
 	if serviceType == "" {
-		serviceType = strings.ToLower(result.Service)
-		if strings.HasPrefix(serviceType, "http") {
-			serviceType = "http-unknown"
-		}
+		serviceType = MatchFingerprint(db, result.Banner)
+	}
+	if serviceType == "" {
+		serviceType = strings.TrimSpace(strings.ToLower(result.Service))
+	}
+	if serviceType == "" || serviceType == "none_unknown" {
+		serviceType = "unknown"
+	}
+	if strings.HasPrefix(serviceType, "http") {
+		serviceType = "http-unknown"
 	}
 	if len(serviceType) > 255 {
 		serviceType = serviceType[:255]
 	}
 
-	_, err = db.Exec(`
-        INSERT OR REPLACE INTO scan_results 
-        (ip, port, service_id, service_type, scan_time)
-        VALUES (
-            ?, 
-            ?, 
-            (SELECT id FROM banner WHERE service_name = ? LIMIT 1),
-            ?,
-            datetime('now')
-        )
+	return scanResultRecord{ip: ip, port: port, serviceType: serviceType}, nil
+}
+
+func upsertScanResult(execer sqlExecer, record scanResultRecord) error {
+	_, err := execer.Exec(`
+        INSERT INTO scan_results (ip, port, service_id, service_type, scan_time)
+        VALUES (?, ?, (SELECT id FROM banner WHERE service_name = ? LIMIT 1), ?, datetime('now'))
 		ON CONFLICT(ip, port) DO UPDATE SET
             service_id   = excluded.service_id,
             service_type = excluded.service_type,
-            scan_time    = datetime('now')               
-		`, ip, port, serviceType, serviceType,
+            scan_time    = datetime('now')`,
+		record.ip,
+		record.port,
+		record.serviceType,
+		record.serviceType,
 	)
-
 	return err
 }
 
+// SyncOpenPorts updates one host's current port inventory and removes ports
+// that were not observed in the current scan.
+func SyncOpenPorts(db *sql.DB, ip string, results []model.ScanResult) error {
+	ip = strings.TrimSpace(ip)
+	if net.ParseIP(ip) == nil {
+		return fmt.Errorf("invalid host IP: %s", ip)
+	}
+
+	recordsByPort := make(map[int]scanResultRecord)
+	for _, result := range results {
+		if !result.Open {
+			continue
+		}
+		record, err := normalizeScanResult(db, result)
+		if err != nil {
+			return err
+		}
+		if record.ip != ip {
+			return fmt.Errorf("scan result IP %s does not match host %s", record.ip, ip)
+		}
+		recordsByPort[record.port] = record
+	}
+
+	ports := make([]int, 0, len(recordsByPort))
+	for port := range recordsByPort {
+		ports = append(ports, port)
+	}
+	sort.Ints(ports)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	for _, port := range ports {
+		if err = upsertScanResult(tx, recordsByPort[port]); err != nil {
+			return err
+		}
+	}
+
+	statement := `DELETE FROM scan_results WHERE ip = ?`
+	args := []interface{}{ip}
+	if len(ports) > 0 {
+		statement += ` AND port NOT IN (` + sqlPlaceholders(len(ports)) + `)`
+		for _, port := range ports {
+			args = append(args, port)
+		}
+	}
+	if _, err = tx.Exec(statement, args...); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func MatchFingerprint(db *sql.DB, banner string) string {
+	return MatchFingerprintWithHint(db, banner, "", 0)
+}
+
+func MatchFingerprintWithHint(db *sql.DB, banner string, protocol string, port int) string {
 	var serviceName string
 
 	cleaned := regexp.MustCompile(`[^\x09\x0A\x0D\x20-\x7E]+`).ReplaceAllString(banner, " ")
@@ -618,64 +879,91 @@ func MatchFingerprint(db *sql.DB, banner string) string {
 		return ""
 	}
 
-	var service string
-	if err := db.QueryRow(`
-        SELECT service_name FROM banner
+	protocol = strings.TrimSpace(strings.ToLower(protocol))
+	rows, err := db.Query(`
+        SELECT service_name, banner_pattern, match_type, protocol, port
+        FROM banner
         WHERE banner_pattern <> '' AND service_name <> 'unknown'
-          AND INSTR(?, banner_pattern) > 0
-        ORDER BY LENGTH(banner_pattern) DESC
-        LIMIT 1`, cleaned).Scan(&service); err == nil && service != "" {
-		return service
-	}
-
-	rows, err := db.Query(`SELECT service_name, banner_pattern FROM banner WHERE banner_pattern <> '' AND service_name <> 'unknown'`)
+        ORDER BY LENGTH(banner_pattern) DESC`)
 	if err != nil {
 		return ""
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var s, p string
-		if err := rows.Scan(&s, &p); err != nil {
+		var s, p, matchType string
+		var ruleProtocol sql.NullString
+		var rulePort sql.NullInt64
+		if err := rows.Scan(&s, &p, &matchType, &ruleProtocol, &rulePort); err != nil {
 			continue
 		}
-		re, err := regexp.Compile(p)
-		if err != nil {
+
+		if ruleProtocol.Valid && protocol != "" && strings.ToLower(ruleProtocol.String) != protocol {
 			continue
 		}
-		if re.MatchString(cleaned) {
+		if rulePort.Valid && port > 0 && int(rulePort.Int64) != port {
+			continue
+		}
+
+		if fingerprintRuleMatches(cleaned, p, matchType) {
 			return s
 		}
 	}
 
-	if err := db.QueryRow(`
-	   SELECT service_name FROM banner
-	   WHERE ? LIKE banner_pattern
-	   ORDER BY LENGTH(banner_pattern) DESC
-	   LIMIT 1`, cleaned).Scan(&serviceName); err == nil && serviceName != "" {
-		return serviceName
-	}
-
 	if strings.Contains(cleaned, "HTTP/") {
 		if server := assist.ExtractHeader(cleaned, "Server"); server != "" {
-			if err := db.QueryRow(`
-			   SELECT service_name FROM banner
-			   WHERE ? REGEXP banner_pattern
-			   ORDER BY LENGTH(banner_pattern) DESC
-			   LIMIT 1`, server).Scan(&serviceName); err == nil && serviceName != "" {
-				return serviceName
-			}
-			if err := db.QueryRow(`
-			   SELECT service_name FROM banner
-			   WHERE ? LIKE banner_pattern
-			   ORDER BY LENGTH(banner_pattern) DESC
-			   LIMIT 1`, server).Scan(&serviceName); err == nil && serviceName != "" {
-				return serviceName
+			server = strings.TrimSpace(server)
+			serverRows, err := db.Query(`
+                SELECT service_name, banner_pattern, match_type
+                FROM banner
+                WHERE banner_pattern <> '' AND service_name <> 'unknown'
+                ORDER BY LENGTH(banner_pattern) DESC`)
+			if err == nil {
+				for serverRows.Next() {
+					var s, p, matchType string
+					if err := serverRows.Scan(&s, &p, &matchType); err != nil {
+						continue
+					}
+					if fingerprintRuleMatches(server, p, matchType) {
+						_ = serverRows.Close()
+						return s
+					}
+				}
+				_ = serverRows.Close()
 			}
 		}
 	}
 
 	return serviceName
+}
+
+func fingerprintRuleMatches(target string, pattern string, matchType string) bool {
+	target = strings.TrimSpace(target)
+	pattern = strings.TrimSpace(pattern)
+	matchType = strings.TrimSpace(strings.ToLower(matchType))
+	if target == "" || pattern == "" {
+		return false
+	}
+
+	switch matchType {
+	case "regexp", "regex":
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return false
+		}
+		return re.MatchString(target)
+	case "like":
+		quoted := regexp.QuoteMeta(pattern)
+		quoted = strings.ReplaceAll(quoted, "%", ".*")
+		quoted = strings.ReplaceAll(quoted, "_", ".")
+		re, err := regexp.Compile("^" + quoted + "$")
+		if err != nil {
+			return false
+		}
+		return re.MatchString(target)
+	default:
+		return strings.Contains(strings.ToLower(target), strings.ToLower(pattern))
+	}
 }
 
 func SaveDomainScanResult(db *sql.DB, ip string, openPorts []model.ScanResult) error {
@@ -698,6 +986,8 @@ func SaveDomainScanResult(db *sql.DB, ip string, openPorts []model.ScanResult) e
 	_, err := db.Exec(`
         UPDATE domain_ips 
         SET ports = ?,
+            is_active = 1,
+            last_seen = datetime('now'),
             subdomain = (SELECT subdomain FROM domain_info WHERE id = domain_id LIMIT 1)
         WHERE ip = ?`,
 		toJSON(ports),
@@ -709,15 +999,247 @@ func SaveDomainScanResult(db *sql.DB, ip string, openPorts []model.ScanResult) e
 	if title != "" {
 		_, err = db.Exec(`
             UPDATE domain_info 
-            SET title = ?, last_scan = datetime('now')
+            SET title = ?, last_scan = datetime('now'), last_seen = datetime('now'), is_active = 1
             WHERE id = (SELECT domain_id FROM domain_ips WHERE ip = ? LIMIT 1)`,
 			title, ip)
 		if err != nil {
 			return fmt.Errorf("更新标题失败: %v", err)
 		}
+	} else {
+		_, err = db.Exec(`
+            UPDATE domain_info
+            SET last_scan = datetime('now'), last_seen = datetime('now'), is_active = 1
+            WHERE id = (SELECT domain_id FROM domain_ips WHERE ip = ? LIMIT 1)`,
+			ip)
+		if err != nil {
+			return fmt.Errorf("更新域名活跃状态失败: %v", err)
+		}
 	}
 
 	return nil
+}
+
+func SyncHostInventory(db *sql.DB, source string, aliveIPs []string) error {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	seen := make(map[string]struct{}, len(aliveIPs))
+	uniqueIPs := make([]string, 0, len(aliveIPs))
+	for _, ip := range aliveIPs {
+		ip = strings.TrimSpace(ip)
+		if net.ParseIP(ip) == nil {
+			continue
+		}
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		uniqueIPs = append(uniqueIPs, ip)
+		if _, err = tx.Exec(`
+			INSERT INTO host_inventory (ip, source, first_seen, last_seen, last_scan, is_active)
+			VALUES (?, ?, datetime('now'), datetime('now'), datetime('now'), 1)
+			ON CONFLICT(ip) DO UPDATE SET
+				source = excluded.source,
+				last_seen = datetime('now'),
+				last_scan = datetime('now'),
+				is_active = 1`,
+			ip, source,
+		); err != nil {
+			return err
+		}
+	}
+
+	query := `
+		UPDATE host_inventory
+		SET is_active = 0, last_scan = datetime('now')
+		WHERE source = ?`
+	args := []interface{}{source}
+	if len(uniqueIPs) > 0 {
+		query += ` AND ip NOT IN (` + sqlPlaceholders(len(uniqueIPs)) + `)`
+		for _, ip := range uniqueIPs {
+			args = append(args, ip)
+		}
+	}
+	if _, err = tx.Exec(query, args...); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+type HostInventoryQuery struct {
+	Source   string
+	IsActive *bool
+}
+
+func ListHostInventory(db *sql.DB, query HostInventoryQuery) ([]model.HostInventory, error) {
+	clauses := make([]string, 0, 2)
+	args := make([]interface{}, 0, 2)
+
+	if source := strings.TrimSpace(query.Source); source != "" {
+		clauses = append(clauses, "source = ?")
+		args = append(args, source)
+	}
+	if query.IsActive != nil {
+		clauses = append(clauses, "is_active = ?")
+		if *query.IsActive {
+			args = append(args, 1)
+		} else {
+			args = append(args, 0)
+		}
+	}
+
+	statement := `
+		SELECT id, ip, source, first_seen, last_seen, last_scan, is_active
+		FROM host_inventory`
+	if len(clauses) > 0 {
+		statement += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	statement += " ORDER BY ip ASC"
+
+	rows, err := db.Query(statement, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	hosts := make([]model.HostInventory, 0)
+	for rows.Next() {
+		var host model.HostInventory
+		var lastScan sql.NullString
+		var isActive int
+		if err := rows.Scan(
+			&host.ID,
+			&host.IP,
+			&host.Source,
+			&host.FirstSeen,
+			&host.LastSeen,
+			&lastScan,
+			&isActive,
+		); err != nil {
+			return nil, err
+		}
+		host.LastScan = lastScan.String
+		host.IsActive = isActive != 0
+		hosts = append(hosts, host)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return hosts, nil
+}
+
+func GetAssetDetail(db *sql.DB, ip string) (model.AssetDetail, error) {
+	ip = strings.TrimSpace(ip)
+	if net.ParseIP(ip) == nil {
+		return model.AssetDetail{}, fmt.Errorf("invalid host IP: %s", ip)
+	}
+
+	var detail model.AssetDetail
+	var lastScan sql.NullString
+	var isActive int
+	err := db.QueryRow(`
+		SELECT id, ip, source, first_seen, last_seen, last_scan, is_active
+		FROM host_inventory
+		WHERE ip = ?`, ip).Scan(
+		&detail.Host.ID,
+		&detail.Host.IP,
+		&detail.Host.Source,
+		&detail.Host.FirstSeen,
+		&detail.Host.LastSeen,
+		&lastScan,
+		&isActive,
+	)
+	if err != nil {
+		return model.AssetDetail{}, err
+	}
+	detail.Host.LastScan = lastScan.String
+	detail.Host.IsActive = isActive != 0
+
+	rows, err := db.Query(`
+		SELECT port, service_type, scan_time
+		FROM scan_results
+		WHERE ip = ?
+		ORDER BY port ASC`, ip)
+	if err != nil {
+		return model.AssetDetail{}, err
+	}
+	defer rows.Close()
+
+	detail.Ports = make([]model.AssetPort, 0)
+	for rows.Next() {
+		var port model.AssetPort
+		if err := rows.Scan(&port.Port, &port.Service, &port.LastSeenAt); err != nil {
+			return model.AssetDetail{}, err
+		}
+		detail.Ports = append(detail.Ports, port)
+	}
+	if err := rows.Err(); err != nil {
+		return model.AssetDetail{}, err
+	}
+	return detail, nil
+}
+
+func SaveTaskChangeSummary(db *sql.DB, summary model.TaskChangeSummary) error {
+	if summary.TaskID <= 0 {
+		return fmt.Errorf("invalid task ID: %d", summary.TaskID)
+	}
+	summary.Target = strings.TrimSpace(summary.Target)
+	if summary.Target == "" {
+		return fmt.Errorf("task change summary target is required")
+	}
+
+	payload, err := json.Marshal(summary)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`
+		INSERT INTO task_change_summaries (task_id, target, summary_json, created_at, updated_at)
+		VALUES (?, ?, ?, datetime('now'), datetime('now'))
+		ON CONFLICT(task_id) DO UPDATE SET
+			target = excluded.target,
+			summary_json = excluded.summary_json,
+			updated_at = datetime('now')`,
+		summary.TaskID,
+		summary.Target,
+		string(payload),
+	)
+	return err
+}
+
+func GetTaskChangeSummary(db *sql.DB, taskID int64) (model.TaskChangeSummary, error) {
+	var payload string
+	var generatedAt string
+	err := db.QueryRow(`
+		SELECT summary_json, updated_at
+		FROM task_change_summaries
+		WHERE task_id = ?`, taskID).Scan(&payload, &generatedAt)
+	if err != nil {
+		return model.TaskChangeSummary{}, err
+	}
+
+	var summary model.TaskChangeSummary
+	if err := json.Unmarshal([]byte(payload), &summary); err != nil {
+		return model.TaskChangeSummary{}, err
+	}
+	summary.GeneratedAt = generatedAt
+	return summary, nil
 }
 
 func extractTitleFromBanner(banner string) string {
@@ -744,7 +1266,7 @@ func toJSON(data interface{}) string {
 	return string(b)
 }
 
-func SaveDomainInfo(db *sql.DB, mainDomain, subdomain string, isWildcard bool, title string, source string) (int64, error) {
+func SaveDomainInfo(db *sql.DB, mainDomain, subdomain string, isWildcard bool, title string, source string, firstSeen time.Time) (int64, error) {
 	log.Printf("保存子域名：%s（来源：%s）", subdomain, source)
 
 	existingSources := make(map[string]bool)
@@ -774,14 +1296,17 @@ func SaveDomainInfo(db *sql.DB, mainDomain, subdomain string, isWildcard bool, t
 		newSource = newSource[:255]
 	}
 
+	firstSeenValue := sqliteTimeOrNow(firstSeen)
+
 	res, err := db.Exec(`
         INSERT INTO domain_info 
-        (domain, subdomain, is_wildcard, title, first_seen, last_scan, source)
-        VALUES (?, ?, ?, ?, datetime('now'), datetime('now'), ?)`,
+        (domain, subdomain, is_wildcard, is_active, title, first_seen, last_seen, last_scan, source)
+        VALUES (?, ?, ?, 1, ?, ?, datetime('now'), datetime('now'), ?)`,
 		mainDomain,
 		subdomain,
 		isWildcard,
 		title,
+		firstSeenValue,
 		newSource,
 	)
 	if err == nil {
@@ -794,10 +1319,22 @@ func SaveDomainInfo(db *sql.DB, mainDomain, subdomain string, isWildcard bool, t
         SET 
             title     = CASE WHEN ? <> '' THEN ? ELSE title END,
             source    = ?,
+            is_wildcard = CASE WHEN ? THEN 1 ELSE is_wildcard END,
+            first_seen = CASE
+                WHEN first_seen IS NULL OR first_seen = '' THEN ?
+                WHEN ? < first_seen THEN ?
+                ELSE first_seen
+            END,
+            is_active = 1,
+            last_seen = datetime('now'),
             last_scan = datetime('now')
         WHERE subdomain = ?`,
 		title, title,
 		newSource,
+		isWildcard,
+		firstSeenValue,
+		firstSeenValue,
+		firstSeenValue,
 		subdomain,
 	)
 	if err != nil {
@@ -811,18 +1348,129 @@ func SaveDomainInfo(db *sql.DB, mainDomain, subdomain string, isWildcard bool, t
 	return id, nil
 }
 
+func sqliteTimeOrNow(t time.Time) string {
+	if t.IsZero() {
+		return time.Now().UTC().Format("2006-01-02 15:04:05")
+	}
+	return t.UTC().Format("2006-01-02 15:04:05")
+}
+
 func SaveDomainIP(db *sql.DB, domainID int64, ip string, subdomain string, ports []int) error {
 	portsJSON, _ := json.Marshal(ports)
 	_, err := db.Exec(`
-        INSERT OR REPLACE INTO domain_ips 
-        (domain_id, subdomain, ip, ports)
-        VALUES (?, ?, ?, ?)`,
+        INSERT INTO domain_ips
+        (domain_id, subdomain, ip, ports, first_seen, last_seen, is_active)
+        VALUES (?, ?, ?, ?, datetime('now'), datetime('now'), 1)
+        ON CONFLICT(domain_id, ip) DO UPDATE SET
+            subdomain = excluded.subdomain,
+            ports     = CASE WHEN excluded.ports <> 'null' THEN excluded.ports ELSE domain_ips.ports END,
+            last_seen = datetime('now'),
+            is_active = 1`,
 		domainID,
 		subdomain,
 		ip,
 		string(portsJSON),
 	)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+        UPDATE domain_info
+        SET is_active = 1, last_seen = datetime('now')
+        WHERE id = ?`,
+		domainID,
+	)
 	return err
+}
+
+func SyncDomainIPs(db *sql.DB, domainID int64, subdomain string, ips []string, ports []int) error {
+	subdomain = strings.TrimSpace(subdomain)
+	if domainID <= 0 || subdomain == "" {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(ips))
+	uniqueIPs := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		uniqueIPs = append(uniqueIPs, ip)
+		if err := SaveDomainIP(db, domainID, ip, subdomain, ports); err != nil {
+			return err
+		}
+	}
+
+	query := `
+        UPDATE domain_ips
+        SET is_active = 0
+        WHERE domain_id = ? AND subdomain = ?`
+	args := []interface{}{domainID, subdomain}
+
+	if len(uniqueIPs) > 0 {
+		query += ` AND ip NOT IN (` + sqlPlaceholders(len(uniqueIPs)) + `)`
+		for _, ip := range uniqueIPs {
+			args = append(args, ip)
+		}
+	}
+
+	_, err := db.Exec(query, args...)
+	return err
+}
+
+func MarkDomainInactive(db *sql.DB, subdomain string) error {
+	subdomain = strings.TrimSpace(subdomain)
+	if subdomain == "" {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err = tx.Exec(`
+        UPDATE domain_info
+        SET is_active = 0, last_scan = datetime('now')
+        WHERE subdomain = ?`,
+		subdomain,
+	); err != nil {
+		return err
+	}
+
+	if _, err = tx.Exec(`
+        UPDATE domain_ips
+        SET is_active = 0
+        WHERE subdomain = ?`,
+		subdomain,
+	); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func sqlPlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = "?"
+	}
+	return strings.Join(parts, ",")
 }
 
 func ListOpenPortsByIP(db *sql.DB, ip string) ([]int, error) {
@@ -852,4 +1500,43 @@ func ListOpenPortsByIP(db *sql.DB, ip string) ([]int, error) {
 	}
 
 	return ports, nil
+}
+
+func ListKnownSubdomains(db *sql.DB, mainDomain string) ([]string, error) {
+	mainDomain = strings.TrimSpace(strings.ToLower(mainDomain))
+	if mainDomain == "" {
+		return nil, nil
+	}
+
+	rows, err := db.Query(`
+        SELECT subdomain
+        FROM domain_info
+        WHERE domain = ? OR subdomain = ? OR subdomain LIKE ?
+        ORDER BY subdomain ASC`,
+		mainDomain,
+		mainDomain,
+		"%."+mainDomain,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var subdomains []string
+	for rows.Next() {
+		var subdomain string
+		if err := rows.Scan(&subdomain); err != nil {
+			return nil, err
+		}
+		subdomain = strings.TrimSpace(strings.ToLower(subdomain))
+		if subdomain != "" {
+			subdomains = append(subdomains, subdomain)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return subdomains, nil
 }

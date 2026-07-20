@@ -10,12 +10,6 @@ import (
 	"golandproject/yscan/internal/assist"
 )
 
-var matchFingerprint func(string) string
-
-func SetFingerprintMatcher(matcher func(string) string) {
-	matchFingerprint = matcher
-}
-
 // 协议配置
 var protocolConfig = map[int]struct {
 	probe      string
@@ -136,33 +130,25 @@ func readWithTimeout(conn net.Conn, timeout time.Duration) string {
 }
 
 func IdentifyService(banner string, port int) string {
-	//fmt.Printf("\n端口: %d\n[原始Banner开始]==========\n%s\n[原始Banner结束]==========\n", port, banner)
-
-	//banner = cleanResponse(banner) //这是基于简单的端口和 banner 信息指纹识别
-	//
-	//if cfg, ok := protocolConfig[port]; ok {
-	//	return cfg.identifier(banner)
-	//}
-
-	if strings.Contains(banner, "HTTP/") {
-		bannerNew := assist.ExtractHeader(banner, "Server")
-		if bannerNew != "" && matchFingerprint != nil {
-			if service := matchFingerprint(bannerNew); service != "" {
-				return service
-			}
-		}
-	}
-
-	// 1. 尝试指纹匹配
-	if matchFingerprint != nil {
-		if service := matchFingerprint(banner); service != "" {
-			return service
-		}
-	}
-
-	switch { //保底逻辑
+	switch {
 	case strings.Contains(banner, "HTTP/"):
 		return identifyHTTP(banner)
+	case port == 21:
+		return identifyFTP(banner)
+	case port == 22:
+		return identifySSH(banner)
+	case port == 3306:
+		return identifyMySQL(banner)
+	case port == 902 || port == 912:
+		return identifyVMware(banner)
+	case port == 3389:
+		return "rdp"
+	case port == 5432:
+		return "postgresql"
+	case port == 6379:
+		return "redis"
+	case port == 27017:
+		return "mongodb"
 	case port == 80 || port == 443:
 		return "http"
 	case banner == "":
@@ -174,32 +160,32 @@ func IdentifyService(banner string, port int) string {
 
 // 协议识别函数
 func identifyHTTP(banner string) string {
-	// 优先通过指纹库匹配
 	if server := assist.ExtractHeader(banner, "Server"); server != "" {
-		// 返回标准化服务名（小写、去除版本号）
+		server = strings.ToLower(server)
 		switch {
 		case strings.Contains(server, "nginx"):
 			return "nginx"
-		case strings.Contains(server, "Apache"):
+		case strings.Contains(server, "apache"):
 			return "apache"
-		case strings.Contains(server, "Microsoft-IIS"):
+		case strings.Contains(server, "microsoft-iis"):
 			return "iis"
 		case strings.Contains(server, "lighttpd"):
 			return "lighttpd"
-		case strings.Contains(server, "Caddy"):
+		case strings.Contains(server, "caddy"):
 			return "caddy"
+		case strings.Contains(server, "jetty"):
+			return "jetty"
 		}
 	}
 
-	// 次之通过特征匹配
-	if strings.Contains(banner, "nginx") {
+	lower := strings.ToLower(banner)
+	if strings.Contains(lower, "nginx") {
 		return "nginx"
 	}
-	if strings.Contains(banner, "Apache") {
+	if strings.Contains(lower, "apache") {
 		return "apache"
 	}
 
-	// 最后返回通用标识
 	return "http-unknown"
 }
 

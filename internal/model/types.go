@@ -11,6 +11,8 @@ const (
 
 	TaskTypeScanIP          = "scan_ip"
 	TaskTypeScanIPVuln      = "scan_ip_vuln"
+	TaskTypeScanSubnet      = "scan_subnet"
+	TaskTypeScanSubnetVuln  = "scan_subnet_vuln"
 	TaskTypeVulnIP          = "vuln_ip"
 	TaskTypeCollectDomain   = "collect_domain"
 	TaskTypeCollectAndScan  = "collect_and_scan"
@@ -18,19 +20,24 @@ const (
 )
 
 type Scanner struct {
-	Network string
-	IP      string
-	Port    int
-	Conn    net.Conn
+	Network         string
+	IP              string
+	Port            int
+	Conn            net.Conn
+	NucleiTemplates string
+	DNSResolveMode  string
+	DNSDenyCIDRs    []string
 }
 
 type ScanResult struct {
-	Address string
-	Err     error
-	ErrType string
-	Open    bool
-	Service string
-	Banner  string
+	Address           string
+	Err               error
+	ErrType           string
+	Open              bool
+	Service           string
+	Product           string
+	FingerprintSource string
+	Banner            string
 }
 
 type Task struct {
@@ -44,6 +51,50 @@ type Task struct {
 	FinishedAt string `json:"finished_at,omitempty"`
 	CreatedAt  string `json:"created_at"`
 	UpdatedAt  string `json:"updated_at,omitempty"`
+}
+
+type HostInventory struct {
+	ID        int64  `json:"id"`
+	IP        string `json:"ip"`
+	Source    string `json:"source"`
+	FirstSeen string `json:"first_seen"`
+	LastSeen  string `json:"last_seen"`
+	LastScan  string `json:"last_scan,omitempty"`
+	IsActive  bool   `json:"is_active"`
+}
+
+type AssetPort struct {
+	Port       int    `json:"port"`
+	Service    string `json:"service"`
+	LastSeenAt string `json:"last_seen_at"`
+}
+
+type AssetDetail struct {
+	Host  HostInventory `json:"host"`
+	Ports []AssetPort   `json:"ports"`
+}
+
+type HostChanges struct {
+	NewHosts      []string `json:"new_hosts"`
+	InactiveHosts []string `json:"inactive_hosts"`
+}
+
+type PortChange struct {
+	IP   string `json:"ip"`
+	Port int    `json:"port"`
+}
+
+type PortChanges struct {
+	Opened []PortChange `json:"opened"`
+	Closed []PortChange `json:"closed"`
+}
+
+type TaskChangeSummary struct {
+	TaskID      int64       `json:"task_id"`
+	Target      string      `json:"target"`
+	HostChanges HostChanges `json:"host_changes"`
+	PortChanges PortChanges `json:"port_changes"`
+	GeneratedAt string      `json:"generated_at,omitempty"`
 }
 
 type NucleiFinding struct {

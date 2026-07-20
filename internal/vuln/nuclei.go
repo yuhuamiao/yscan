@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,8 +35,19 @@ type nucleiJSONLine struct {
 	} `json:"info"`
 }
 
-func RunNucleiForOpenPorts(ctx context.Context, ip string, openPorts []model.ScanResult) ([]model.NucleiFinding, error) {
+func RunNucleiForOpenPorts(ctx context.Context, ip string, openPorts []model.ScanResult, templatesPath string) ([]model.NucleiFinding, error) {
+	return RunNucleiForOpenPortsWithTags(ctx, ip, openPorts, templatesPath, nil)
+}
+
+// RunNucleiForOpenPortsWithTags restricts Nuclei to a set of template tags
+// when tags are supplied. An empty tag set keeps the legacy full-template mode.
+func RunNucleiForOpenPortsWithTags(ctx context.Context, ip string, openPorts []model.ScanResult, templatesPath string, tags []string) ([]model.NucleiFinding, error) {
 	nucleiPath, err := DetectNucleiBinary()
+	if err != nil {
+		return nil, err
+	}
+
+	resolvedTemplates, err := ResolveNucleiTemplatesPath(templatesPath)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +74,9 @@ func RunNucleiForOpenPorts(ctx context.Context, ip string, openPorts []model.Sca
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, nucleiPath, "-jsonl", "-silent", "-l", tmp.Name())
+	args := buildNucleiArgs(tmp.Name(), resolvedTemplates, tags)
+
+	cmd := exec.CommandContext(ctx, nucleiPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -132,6 +147,34 @@ func RunNucleiForOpenPorts(ctx context.Context, ip string, openPorts []model.Sca
 	return findings, nil
 }
 
+func buildNucleiArgs(targetFile, templatesPath string, tags []string) []string {
+	args := []string{"-jsonl", "-silent", "-l", targetFile}
+	if templatesPath != "" {
+		args = append(args, "-t", templatesPath)
+	}
+	if normalizedTags := normalizeTagList(tags); len(normalizedTags) > 0 {
+		args = append(args, "-tags", strings.Join(normalizedTags, ","))
+	}
+	return args
+}
+
+func normalizeTagList(tags []string) []string {
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		tag = strings.TrimSpace(strings.ToLower(tag))
+		if tag == "" {
+			continue
+		}
+		seen[tag] = struct{}{}
+	}
+	result := make([]string, 0, len(seen))
+	for tag := range seen {
+		result = append(result, tag)
+	}
+	sort.Strings(result)
+	return result
+}
+
 func DetectNucleiBinary() (string, error) {
 	for _, name := range nucleiBinaryNames() {
 		if p, err := exec.LookPath(name); err == nil {
@@ -151,11 +194,75 @@ func DetectNucleiBinary() (string, error) {
 	return "", fmt.Errorf("nuclei not found in PATH or GOPATH/bin")
 }
 
+func ResolveNucleiTemplatesPath(input string) (string, error) {
+	if p := strings.TrimSpace(input); p != "" {
+		return validateNucleiTemplatesPath(p)
+	}
+
+	for _, p := range nucleiTemplatesFallbackPaths() {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		if resolved, err := validateNucleiTemplatesPath(p); err == nil {
+			return resolved, nil
+		}
+	}
+
+	return "", errors.New("nuclei templates not found, please specify --templates <path>")
+}
+
 func nucleiBinaryNames() []string {
 	if runtime.GOOS == "windows" {
 		return []string{"nuclei.exe", "nuclei"}
 	}
 	return []string{"nuclei"}
+}
+
+func nucleiTemplatesFallbackPaths() []string {
+	var out []string
+
+	if env := strings.TrimSpace(os.Getenv("NUCLEI_TEMPLATES")); env != "" {
+		out = append(out, env)
+	}
+
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		out = append(out,
+			filepath.Join(home, "nuclei-templates"),
+			filepath.Join(home, ".local", "nuclei-templates"),
+			filepath.Join(home, ".config", "nuclei", "templates"),
+		)
+	}
+
+	if cwd, err := os.Getwd(); err == nil && strings.TrimSpace(cwd) != "" {
+		out = append(out,
+			filepath.Join(cwd, "nuclei-templates"),
+			filepath.Join(cwd, "templates", "nuclei"),
+		)
+	}
+
+	return out
+}
+
+func validateNucleiTemplatesPath(input string) (string, error) {
+	resolved := strings.TrimSpace(input)
+	if resolved == "" {
+		return "", fmt.Errorf("empty nuclei templates path")
+	}
+
+	abs, err := filepath.Abs(resolved)
+	if err == nil {
+		resolved = abs
+	}
+
+	fi, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("nuclei templates path not found: %s", resolved)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("nuclei templates path is not a directory: %s", resolved)
+	}
+
+	return resolved, nil
 }
 
 func nucleiFallbackPaths() []string {

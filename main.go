@@ -17,119 +17,20 @@ import (
 	"golandproject/yscan/internal/domain"
 	"golandproject/yscan/internal/identify"
 	"golandproject/yscan/internal/model"
+	"golandproject/yscan/internal/pipeline"
+	"golandproject/yscan/internal/report"
 	"golandproject/yscan/internal/scan"
 	"golandproject/yscan/internal/storage"
 	"golandproject/yscan/internal/vuln"
+	"golandproject/yscan/internal/workflow"
 )
 
 var errTaskCanceled = errors.New("task canceled")
 
-func aggregateSubdomains(results []domain.CollectResult) map[string]*domain.CollectResult {
-	res := make(map[string]*domain.CollectResult)
-
-	for _, r := range results {
-		key := r.Subdomain
-		agg, ok := res[key]
-		if !ok {
-			agg = &domain.CollectResult{
-				Subdomain: r.Subdomain,
-				IPs:       r.IPs,
-				FirstSeen: r.FirstSeen,
-				Sources:   r.Sources,
-			}
-			res[key] = agg
-			continue
-		}
-
-		if agg.FirstSeen.IsZero() || (!r.FirstSeen.IsZero() && r.FirstSeen.Before(agg.FirstSeen)) {
-			agg.FirstSeen = r.FirstSeen
-		}
-
-		ipSet := make(map[string]bool)
-		for _, ip := range agg.IPs {
-			ipSet[ip.String()] = true
-		}
-		for _, ip := range r.IPs {
-			s := ip.String()
-			if !ipSet[s] {
-				ipSet[s] = true
-				agg.IPs = append(agg.IPs, ip)
-			}
-		}
-
-		sourceSet := make(map[string]bool)
-		for _, s := range agg.Sources {
-			sourceSet[s] = true
-		}
-		for _, s := range r.Sources {
-			if !sourceSet[s] {
-				sourceSet[s] = true
-				agg.Sources = append(agg.Sources, s)
-			}
-		}
-	}
-	return res
-}
-
-func collectSubdomains(db *sql.DB, domainName string) []string {
-	domainName = strings.TrimSpace(domainName)
-	if domainName == "" {
-		log.Print("域名不能为空")
-		return nil
-	}
-
-	var results []domain.CollectResult
-
-	if crtResults, err := (&domain.CRTshCollector{}).Collect(domainName, 30*time.Second); err == nil {
-		results = append(results, crtResults...)
-	}
-
-	if searchResults, err := domain.NewSearchEngineCollector().Collect(domainName, 30*time.Second); err == nil {
-		fmt.Printf("[DEBUG] 搜索引擎结果数量: %d\n", len(searchResults))
-		results = append(results, searchResults...)
-	} else {
-		log.Printf("搜索引擎收集错误: %v", err)
-	}
-
-	uniqueIPs := make(map[string]bool)
-	var ipsToScan []string
-
-	aggregated := aggregateSubdomains(results)
-
-	for _, res := range aggregated {
-		fmt.Printf("[%s] %s (IPs: %v)\n",
-			res.FirstSeen.Format("2006-01-02"),
-			res.Subdomain,
-			res.IPs)
-
-		domainID, err := storage.SaveDomainInfo(db, domainName, res.Subdomain,
-			strings.HasPrefix(res.Subdomain, "*."),
-			"",
-			strings.Join(res.Sources, ","),
-		)
-		if err != nil {
-			log.Printf("保存子域名失败 %s: %v", res.Subdomain, err)
-			continue
-		}
-
-		for _, ip := range res.IPs {
-			ipStr := ip.String()
-			if ip.To4() == nil {
-				continue
-			}
-
-			if err := storage.SaveDomainIP(db, domainID, ipStr, res.Subdomain, nil); err != nil {
-				log.Printf("保存IP关联失败 %s: %v", ipStr, err)
-			}
-
-			if !uniqueIPs[ipStr] {
-				uniqueIPs[ipStr] = true
-				ipsToScan = append(ipsToScan, ipStr)
-			}
-		}
-	}
-
-	return ipsToScan
+type cliConfig struct {
+	Templates      string
+	DNSResolveMode string
+	DNSDenyCIDRs   []string
 }
 
 func runTask(db *sql.DB, baseTask model.Scanner, taskType, target string) {
@@ -171,12 +72,21 @@ func processTaskExecution(db *sql.DB, taskID int64, baseTask model.Scanner, task
 		return
 	}
 
+	reportPath, err := report.GenerateTaskReport(db, taskID, report.DefaultDirectory)
+	if err != nil {
+		if upErr := storage.UpdateTaskStatus(db, taskID, model.TaskStatusFailed, "generate report: "+err.Error()); upErr != nil {
+			log.Printf("任务报告失败状态更新失败: %v", upErr)
+		}
+		fmt.Printf("Task %d failed to generate report: %v\n", taskID, err)
+		return
+	}
+
 	if err := storage.UpdateTaskStatus(db, taskID, model.TaskStatusSuccess, ""); err != nil {
 		log.Printf("任务完成状态更新失败: %v", err)
 		return
 	}
 
-	fmt.Printf("Task %d finished: success\n", taskID)
+	fmt.Printf("Task %d finished: success (report: %s)\n", taskID, reportPath)
 }
 
 func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, target string) error {
@@ -213,7 +123,7 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 		}
 
 		scanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		findings, err := vuln.RunNucleiForOpenPorts(scanCtx, baseTask.IP, openPorts)
+		findings, err := vuln.RunNucleiForOpenPorts(scanCtx, baseTask.IP, openPorts, baseTask.NucleiTemplates)
 		cancel()
 		if err != nil {
 			return err
@@ -223,6 +133,12 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 		}
 		_ = storage.UpdateTaskProgress(db, taskID, 100)
 		return nil
+
+	case model.TaskTypeScanSubnet:
+		return runSubnetTask(db, taskID, baseTask, target, false)
+
+	case model.TaskTypeScanSubnetVuln:
+		return runSubnetTask(db, taskID, baseTask, target, true)
 
 	case model.TaskTypeVulnIP:
 		_ = storage.UpdateTaskProgress(db, taskID, 20)
@@ -238,7 +154,7 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 		}
 
 		scanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		findings, err := vuln.RunNucleiForOpenPorts(scanCtx, ip, openPorts)
+		findings, err := vuln.RunNucleiForOpenPorts(scanCtx, ip, openPorts, baseTask.NucleiTemplates)
 		cancel()
 		if err != nil {
 			return err
@@ -251,13 +167,23 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 
 	case model.TaskTypeCollectDomain:
 		_ = storage.UpdateTaskProgress(db, taskID, 20)
-		_ = collectSubdomains(db, target)
+		_ = pipeline.CollectSubdomains(db, target, pipeline.DomainCollectionOptions{
+			ResolvePolicy: domain.ResolvePolicy{
+				Mode:      baseTask.DNSResolveMode,
+				DenyCIDRs: baseTask.DNSDenyCIDRs,
+			},
+		})
 		_ = storage.UpdateTaskProgress(db, taskID, 100)
 		return nil
 
 	case model.TaskTypeCollectAndScan:
 		_ = storage.UpdateTaskProgress(db, taskID, 20)
-		ips := collectSubdomains(db, target)
+		ips := pipeline.CollectSubdomains(db, target, pipeline.DomainCollectionOptions{
+			ResolvePolicy: domain.ResolvePolicy{
+				Mode:      baseTask.DNSResolveMode,
+				DenyCIDRs: baseTask.DNSDenyCIDRs,
+			},
+		})
 		if len(ips) == 0 {
 			_ = storage.UpdateTaskProgress(db, taskID, 100)
 			return nil
@@ -284,7 +210,12 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 
 	case model.TaskTypeCollectScanVuln:
 		_ = storage.UpdateTaskProgress(db, taskID, 20)
-		ips := collectSubdomains(db, target)
+		ips := pipeline.CollectSubdomains(db, target, pipeline.DomainCollectionOptions{
+			ResolvePolicy: domain.ResolvePolicy{
+				Mode:      baseTask.DNSResolveMode,
+				DenyCIDRs: baseTask.DNSDenyCIDRs,
+			},
+		})
 		if len(ips) == 0 {
 			_ = storage.UpdateTaskProgress(db, taskID, 100)
 			return nil
@@ -306,7 +237,7 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 			}
 
 			scanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			findings, err := vuln.RunNucleiForOpenPorts(scanCtx, baseTask.IP, openPorts)
+			findings, err := vuln.RunNucleiForOpenPorts(scanCtx, baseTask.IP, openPorts, baseTask.NucleiTemplates)
 			cancel()
 			if err != nil {
 				return err
@@ -401,6 +332,27 @@ func warnIfNucleiMissing() {
 	}
 }
 
+func warnIfNucleiTemplatesMissing(templatesPath string) {
+	if resolved, err := vuln.ResolveNucleiTemplatesPath(templatesPath); err != nil {
+		log.Printf("[WARN] %v", err)
+		log.Print("[WARN] 可通过 --templates <dir> 或 NUCLEI_TEMPLATES 环境变量指定模板目录。")
+	} else {
+		log.Printf("[INFO] nuclei templates: %s", resolved)
+	}
+}
+
+func warnIfExternalDNSPolicy(task model.Scanner) {
+	mode := strings.ToLower(strings.TrimSpace(task.DNSResolveMode))
+	if mode != domain.DNSModeExternal {
+		return
+	}
+	effective := domain.NormalizeResolvePolicy(domain.ResolvePolicy{
+		Mode:      task.DNSResolveMode,
+		DenyCIDRs: task.DNSDenyCIDRs,
+	})
+	log.Printf("[INFO] external DNS filter enabled, deny CIDRs: %s", strings.Join(effective.DenyCIDRs, ","))
+}
+
 func hasFlag(args []string, flag string) bool {
 	for _, a := range args {
 		if strings.EqualFold(strings.TrimSpace(a), flag) {
@@ -408,6 +360,45 @@ func hasFlag(args []string, flag string) bool {
 		}
 	}
 	return false
+}
+
+func parseCLIConfig(args []string) ([]string, cliConfig) {
+	cfg := cliConfig{DNSResolveMode: domain.DNSModeHybrid}
+	if len(args) == 0 {
+		return args, cfg
+	}
+
+	filtered := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		current := strings.TrimSpace(args[i])
+		switch {
+		case current == "--templates":
+			if i+1 < len(args) {
+				cfg.Templates = strings.TrimSpace(args[i+1])
+				i++
+			}
+		case strings.HasPrefix(current, "--templates="):
+			cfg.Templates = strings.TrimSpace(strings.TrimPrefix(current, "--templates="))
+		case current == "--dns-mode":
+			if i+1 < len(args) {
+				cfg.DNSResolveMode = strings.TrimSpace(strings.ToLower(args[i+1]))
+				i++
+			}
+		case strings.HasPrefix(current, "--dns-mode="):
+			cfg.DNSResolveMode = strings.TrimSpace(strings.ToLower(strings.TrimPrefix(current, "--dns-mode=")))
+		case current == "--dns-deny-cidr":
+			if i+1 < len(args) {
+				cfg.DNSDenyCIDRs = append(cfg.DNSDenyCIDRs, strings.TrimSpace(args[i+1]))
+				i++
+			}
+		case strings.HasPrefix(current, "--dns-deny-cidr="):
+			cfg.DNSDenyCIDRs = append(cfg.DNSDenyCIDRs, strings.TrimSpace(strings.TrimPrefix(current, "--dns-deny-cidr=")))
+		default:
+			filtered = append(filtered, args[i])
+		}
+	}
+
+	return filtered, cfg
 }
 
 func resolveVulnTargetPorts(db *sql.DB, target string) (string, []int, error) {
@@ -499,16 +490,46 @@ func persistOpenPorts(db *sql.DB, openPorts []model.ScanResult) {
 		if !result.Open {
 			continue
 		}
-		if result.Service == "unknown" {
-			log.Printf("跳过未识别服务 %s", result.Address)
-			continue
-		}
 		if err := storage.SaveResult(db, result); err != nil {
 			log.Printf("存储失败 %s: %v", result.Address, err)
 		} else {
 			log.Printf("成功储存 %s (%s)", result.Address, result.Service)
 		}
 	}
+}
+
+func runSubnetTask(db *sql.DB, taskID int64, task model.Scanner, cidr string, withVuln bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	summary, err := workflow.RunSubnet(ctx, workflow.SubnetRunOptions{
+		DB:                    db,
+		TaskID:                taskID,
+		CIDR:                  cidr,
+		Network:               task.Network,
+		TemplatesPath:         task.NucleiTemplates,
+		EnableVulnerabilities: withVuln,
+		CheckCanceled: func() (bool, error) {
+			return storage.IsTaskCanceled(db, taskID)
+		},
+		UpdateProgress: func(progress int) error {
+			return storage.UpdateTaskProgress(db, taskID, progress)
+		},
+	})
+	if errors.Is(err, workflow.ErrCanceled) || errors.Is(err, context.Canceled) {
+		return errTaskCanceled
+	}
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("[CHANGE] hosts +%d -%d | ports +%d -%d\n",
+		len(summary.HostChanges.NewHosts),
+		len(summary.HostChanges.InactiveHosts),
+		len(summary.PortChanges.Opened),
+		len(summary.PortChanges.Closed),
+	)
+	return nil
 }
 
 func main() {
@@ -524,7 +545,10 @@ func main() {
 
 	task := model.Scanner{Network: "tcp"}
 
-	args := os.Args[1:]
+	args, cfg := parseCLIConfig(os.Args[1:])
+	task.NucleiTemplates = cfg.Templates
+	task.DNSResolveMode = cfg.DNSResolveMode
+	task.DNSDenyCIDRs = cfg.DNSDenyCIDRs
 	if len(args) > 0 {
 		runByArgs(args, task, db)
 		return
@@ -538,34 +562,54 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) {
 	switch command {
 	case "scan":
 		if len(args) < 2 {
-			fmt.Println("usage: yscan scan <ip> [--vuln]")
+			fmt.Println("usage: yscan [--templates <dir>] [--dns-mode internal|external|hybrid] scan <ip|cidr> [--vuln]")
 			return
 		}
 		target := strings.TrimSpace(args[1])
-		if hasFlag(args[2:], "--vuln") {
+		withVuln := hasFlag(args[2:], "--vuln")
+		if withVuln {
 			warnIfNucleiMissing()
-			runTask(db, task, model.TaskTypeScanIPVuln, target)
+			warnIfNucleiTemplatesMissing(task.NucleiTemplates)
+		}
+		runTask(db, task, taskTypeForScan(target, withVuln), target)
+
+	case "subnet":
+		if len(args) < 2 {
+			fmt.Println("usage: yscan [--templates <dir>] subnet <cidr> [--vuln]")
 			return
 		}
-		runTask(db, task, model.TaskTypeScanIP, target)
+		target := strings.TrimSpace(args[1])
+		if !pipeline.IsIPv4CIDR(target) {
+			fmt.Printf("invalid cidr: %s\n", target)
+			return
+		}
+		withVuln := hasFlag(args[2:], "--vuln")
+		if withVuln {
+			warnIfNucleiMissing()
+			warnIfNucleiTemplatesMissing(task.NucleiTemplates)
+		}
+		runTask(db, task, taskTypeForSubnet(withVuln), target)
 
 	case "vuln":
 		if len(args) < 2 {
-			fmt.Println("usage: yscan vuln <ip|ip:port>")
+			fmt.Println("usage: yscan [--templates <dir>] [--dns-mode internal|external|hybrid] vuln <ip|ip:port>")
 			return
 		}
 		warnIfNucleiMissing()
+		warnIfNucleiTemplatesMissing(task.NucleiTemplates)
 		runTask(db, task, model.TaskTypeVulnIP, strings.TrimSpace(args[1]))
 
 	case "domain":
 		if len(args) < 2 {
-			fmt.Println("usage: yscan domain <domain> [--scan] [--vuln]")
+			fmt.Println("usage: yscan [--templates <dir>] [--dns-mode internal|external|hybrid] [--dns-deny-cidr <cidr>] domain <domain> [--scan] [--vuln]")
 			return
 		}
 		domainName := strings.TrimSpace(args[1])
+		warnIfExternalDNSPolicy(task)
 		if hasFlag(args[2:], "--scan") {
 			if hasFlag(args[2:], "--vuln") {
 				warnIfNucleiMissing()
+				warnIfNucleiTemplatesMissing(task.NucleiTemplates)
 				runTask(db, task, model.TaskTypeCollectScanVuln, domainName)
 				return
 			}
@@ -639,21 +683,21 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) {
 
 func runInteractive(task model.Scanner, db *sql.DB) {
 	var command string
-	fmt.Print("Please enter a command(domain/scan/vuln/status/cancel/list/findings): ")
+	fmt.Print("Please enter a command(domain/scan/subnet/vuln/status/cancel/list/findings): ")
 	fmt.Scan(&command)
 
 	if command == "scan" {
-		fmt.Print("Please enter your ip:")
+		fmt.Print("Please enter your ip or cidr:")
 		fmt.Scan(&task.IP)
 		var vulnFlag string
 		fmt.Print("Enable vuln scan? (y/N):")
 		fmt.Scan(&vulnFlag)
-		if strings.EqualFold(strings.TrimSpace(vulnFlag), "y") {
+		withVuln := strings.EqualFold(strings.TrimSpace(vulnFlag), "y")
+		if withVuln {
 			warnIfNucleiMissing()
-			runTask(db, task, model.TaskTypeScanIPVuln, task.IP)
-			return
+			warnIfNucleiTemplatesMissing(task.NucleiTemplates)
 		}
-		runTask(db, task, model.TaskTypeScanIP, task.IP)
+		runTask(db, task, taskTypeForScan(task.IP, withVuln), task.IP)
 		return
 	}
 
@@ -662,6 +706,26 @@ func runInteractive(task model.Scanner, db *sql.DB) {
 		fmt.Scan(&task.IP)
 		warnIfNucleiMissing()
 		runTask(db, task, model.TaskTypeVulnIP, task.IP)
+		return
+	}
+
+	if command == "subnet" {
+		var cidr string
+		fmt.Print("Please enter your cidr:")
+		fmt.Scan(&cidr)
+		if !pipeline.IsIPv4CIDR(cidr) {
+			fmt.Printf("invalid cidr: %s\n", cidr)
+			return
+		}
+		var vulnFlag string
+		fmt.Print("Enable vuln scan? (y/N):")
+		fmt.Scan(&vulnFlag)
+		withVuln := strings.EqualFold(strings.TrimSpace(vulnFlag), "y")
+		if withVuln {
+			warnIfNucleiMissing()
+			warnIfNucleiTemplatesMissing(task.NucleiTemplates)
+		}
+		runTask(db, task, taskTypeForSubnet(withVuln), cidr)
 		return
 	}
 
@@ -744,4 +808,21 @@ func runInteractive(task model.Scanner, db *sql.DB) {
 	}
 
 	fmt.Println("please enter a true command.")
+}
+
+func taskTypeForScan(target string, withVuln bool) string {
+	if pipeline.IsIPv4CIDR(target) {
+		return taskTypeForSubnet(withVuln)
+	}
+	if withVuln {
+		return model.TaskTypeScanIPVuln
+	}
+	return model.TaskTypeScanIP
+}
+
+func taskTypeForSubnet(withVuln bool) string {
+	if withVuln {
+		return model.TaskTypeScanSubnetVuln
+	}
+	return model.TaskTypeScanSubnet
 }

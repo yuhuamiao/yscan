@@ -1,6 +1,7 @@
 package assist
 
 import (
+	"context"
 	"fmt"
 	"github.com/PuerkitoBio/goquery"
 	"log"
@@ -14,6 +15,8 @@ import (
 
 	"golandproject/yscan/internal/model"
 )
+
+var internalTCPProbePorts = []int{80, 22, 443, 445, 135, 139, 3389, 5985}
 
 func ValidateInput(network string, address string) error {
 	switch network {
@@ -29,15 +32,22 @@ func ValidateInput(network string, address string) error {
 }
 
 func IsHostAlive(ip string) bool {
+	return IsHostAliveContext(context.Background(), ip)
+}
+
+func IsHostAliveContext(ctx context.Context, ip string) bool {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("ping", "-n", "2", "-w", "2000", ip)
+		cmd = exec.CommandContext(ctx, "ping", "-n", "2", "-w", "2000", ip)
 	default:
-		cmd = exec.Command("ping", "-c", "2", "-W", "2", ip)
+		cmd = exec.CommandContext(ctx, "ping", "-c", "2", "-W", "2", ip)
 	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() != nil {
+			return false
+		}
 		log.Printf("ping %s failed: %v \noutput: %s", ip, err, string(output))
 		return false
 	}
@@ -45,9 +55,16 @@ func IsHostAlive(ip string) bool {
 }
 
 func IsHostAliveTCP(ip string) bool {
-	ports := []int{80, 22, 443}
-	for _, port := range ports {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 3*time.Second)
+	return IsHostAliveTCPContext(context.Background(), ip)
+}
+
+func IsHostAliveTCPContext(ctx context.Context, ip string) bool {
+	dialer := net.Dialer{Timeout: 3 * time.Second}
+	for _, port := range internalTCPProbePorts {
+		if ctx.Err() != nil {
+			return false
+		}
+		conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", ip, port))
 		if err == nil {
 			conn.Close()
 			return true

@@ -3,14 +3,20 @@ package api
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 
 	"golandproject/yscan/internal/model"
+	"golandproject/yscan/internal/pipeline"
+	"golandproject/yscan/internal/report"
 	"golandproject/yscan/internal/storage"
+	"golandproject/yscan/internal/web"
 )
 
 type TaskRunner func(taskType, target string) (int64, error)
@@ -26,8 +32,18 @@ type createTaskResponse struct {
 }
 
 func StartServer(db *sql.DB, addr string, runTask TaskRunner) error {
+	handler, err := newHandler(db, runTask)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("API server listening on %s", addr)
+	return http.ListenAndServe(addr, handler)
+}
+
+func newHandler(db *sql.DB, runTask TaskRunner) (http.Handler, error) {
 	if runTask == nil {
-		return fmt.Errorf("task runner is required")
+		return nil, fmt.Errorf("task runner is required")
 	}
 
 	mux := http.NewServeMux()
@@ -56,12 +72,21 @@ func StartServer(db *sql.DB, addr string, runTask TaskRunner) error {
 			}
 
 			supported := map[string]bool{
-				model.TaskTypeScanIP:         true,
-				model.TaskTypeCollectDomain:  true,
-				model.TaskTypeCollectAndScan: true,
+				model.TaskTypeScanIP:          true,
+				model.TaskTypeScanIPVuln:      true,
+				model.TaskTypeScanSubnet:      true,
+				model.TaskTypeScanSubnetVuln:  true,
+				model.TaskTypeVulnIP:          true,
+				model.TaskTypeCollectDomain:   true,
+				model.TaskTypeCollectAndScan:  true,
+				model.TaskTypeCollectScanVuln: true,
 			}
 			if !supported[req.Type] {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported task type"})
+				return
+			}
+			if (req.Type == model.TaskTypeScanSubnet || req.Type == model.TaskTypeScanSubnetVuln) && !pipeline.IsIPv4CIDR(req.Target) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "subnet task target must be an IPv4 CIDR"})
 				return
 			}
 
@@ -101,20 +126,120 @@ func StartServer(db *sql.DB, addr string, runTask TaskRunner) error {
 			return
 		}
 
-		if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
-			if err := storage.CancelTask(db, taskID); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		if len(parts) == 2 {
+			switch parts[1] {
+			case "cancel":
+				if r.Method != http.MethodPost {
+					writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+					return
+				}
+				if err := storage.CancelTask(db, taskID); err != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]interface{}{"task_id": taskID, "status": model.TaskStatusCanceled})
+				return
+			case "findings":
+				if r.Method != http.MethodGet {
+					writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+					return
+				}
+				findings, err := storage.ListVulnerabilitiesByTask(db, taskID)
+				if err != nil {
+					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					return
+				}
+				writeJSON(w, http.StatusOK, findings)
+				return
+			case "changes":
+				if r.Method != http.MethodGet {
+					writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+					return
+				}
+				summary, err := storage.GetTaskChangeSummary(db, taskID)
+				if err != nil {
+					if errors.Is(err, sql.ErrNoRows) {
+						writeJSON(w, http.StatusNotFound, map[string]string{"error": "task change summary not found"})
+					} else {
+						writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					}
+					return
+				}
+				writeJSON(w, http.StatusOK, summary)
+				return
+			case "report":
+				if r.Method != http.MethodGet {
+					writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+					return
+				}
+				content, err := report.ReadTaskReport(report.DefaultDirectory, taskID)
+				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						writeJSON(w, http.StatusNotFound, map[string]string{"error": "task report not found"})
+					} else {
+						writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					}
+					return
+				}
+				w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+				_, _ = w.Write(content)
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]interface{}{"task_id": taskID, "status": model.TaskStatusCanceled})
-			return
 		}
 
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	})
 
-	log.Printf("API server listening on %s", addr)
-	return http.ListenAndServe(addr, mux)
+	mux.HandleFunc("/api/assets", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+
+		query := storage.HostInventoryQuery{Source: r.URL.Query().Get("source")}
+		if rawActive := strings.TrimSpace(r.URL.Query().Get("active")); rawActive != "" {
+			active, err := strconv.ParseBool(rawActive)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "active must be true or false"})
+				return
+			}
+			query.IsActive = &active
+		}
+
+		assets, err := storage.ListHostInventory(db, query)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, assets)
+	})
+
+	mux.HandleFunc("/api/assets/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		rawIP := strings.TrimPrefix(r.URL.Path, "/api/assets/")
+		ip, err := url.PathUnescape(rawIP)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid asset identifier"})
+			return
+		}
+		detail, err := storage.GetAssetDetail(db, ip)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "asset not found"})
+			} else {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, detail)
+	})
+
+	mux.Handle("/", web.Handler())
+
+	return mux, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

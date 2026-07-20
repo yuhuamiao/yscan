@@ -23,13 +23,6 @@ type CertRecord struct { //证书记录结构
 	IsWildcard  bool     //非API字段，标记是否为通配符证书（根据CommonName或NameValue）
 }
 
-type CollectResult struct {
-	Subdomain string
-	IPs       []net.IP
-	FirstSeen time.Time
-	Sources   []string
-}
-
 type CRTshCollector struct{}
 
 func (c *CRTshCollector) Collect(domain string, timeout time.Duration) ([]CollectResult, error) {
@@ -152,96 +145,13 @@ func processRecord(rec CertRecord, baseDomain string) []CollectResult {
 			}
 		}
 
-		// 最终再过滤一次，避免任何遗漏
-		var clean []net.IP
-		for _, ip := range ips {
-			if isReservedIP(ip) {
-				log.Printf("[filter] drop reserved ip for %s: %s", subdomain, ip)
-				continue
-			}
-			clean = append(clean, ip)
-		}
-
 		results = append(results, CollectResult{
 			Subdomain: subdomain,
-			IPs:       clean,
+			IPs:       ips,
 			FirstSeen: firstSeen,
 			Sources:   []string{"crt.sh"},
 		})
 	}
 
 	return results
-}
-
-// isValidSubdomain 验证子域名
-func isValidSubdomain(name, baseDomain string) bool {
-	name = strings.TrimSuffix(name, ".")
-	baseDomain = strings.TrimSuffix(baseDomain, ".")
-	return name == baseDomain || strings.HasSuffix(name, "."+baseDomain)
-}
-
-// 全局自定义解析器与保留网段过滤
-func dnsResolver(server string) *net.Resolver {
-	return &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 2 * time.Second}
-			return d.DialContext(ctx, "udp", server)
-		},
-	}
-}
-
-var resolverChain = []*net.Resolver{
-	dnsResolver("223.5.5.5:53"),    // AliDNS
-	dnsResolver("119.29.29.29:53"), // DNSPod
-	dnsResolver("1.1.1.1:53"),
-	net.DefaultResolver,
-}
-
-func isReservedIP(ip net.IP) bool {
-	privateBlocks := []string{
-		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-		"127.0.0.0/8", "169.254.0.0/16", "198.18.0.0/15",
-	}
-	for _, cidr := range privateBlocks {
-		_, n, _ := net.ParseCIDR(cidr)
-		if n.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-func resolveA(ctx context.Context, name string) []net.IP {
-	seen := make(map[string]struct{})
-	var out []net.IP
-
-	for _, r := range resolverChain {
-		lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		ips, err := r.LookupIP(lookupCtx, "ip4", name)
-		cancel()
-
-		if err != nil || len(ips) == 0 {
-			lookupCtx2, cancel2 := context.WithTimeout(ctx, 2*time.Second)
-			ips, err = r.LookupIP(lookupCtx2, "ip", name)
-			cancel2()
-			if err != nil || len(ips) == 0 {
-				continue
-			}
-		}
-
-		for _, ip := range ips {
-			key := ip.String()
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			if ip.To4() != nil && isReservedIP(ip) {
-				continue
-			}
-			seen[key] = struct{}{}
-			out = append(out, ip)
-		}
-	}
-
-	return out
 }

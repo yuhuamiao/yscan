@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"runtime"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -13,18 +14,18 @@ import (
 	"golandproject/yscan/internal/model"
 )
 
-// 定义重要端口列表（根据实际需求调整）
-var importantPorts = []int{
-	// 常用服务
-	21, 22, 23, 25, 53, 80, 110, 143,
-	443, 465, 587, 993, 995, 3306, 3389,
-	5432, 5900, 6379, 8080, 8443, 8888,
+var internalBaselinePorts = []int{
+	21, 22, 23, 25, 53, 80, 88, 110, 111, 135, 139, 143, 161,
+	389, 443, 445, 464, 465, 500, 587, 636, 873, 902, 912, 993, 995,
+	1433, 1521, 2049, 2181, 2375, 2376, 3306, 3389, 4369, 5432, 5601,
+	5672, 5900, 5984, 5985, 5986, 6379, 6443, 7001, 8080, 8443, 8888,
+	9090, 9200, 9300, 11211, 27017,
+}
 
-	// 安全相关
-	161, 389, 636, 5985, 5986,
-
-	// 数据库
-	27017, 1521, 1433,
+// InternalBaselinePorts returns the bounded port profile used for internal
+// network host profiling.
+func InternalBaselinePorts() []int {
+	return append([]int(nil), internalBaselinePorts...)
 }
 
 func probePort(ip string, network string, port int, timeout time.Duration) model.ScanResult {
@@ -40,6 +41,9 @@ func probePort(ip string, network string, port int, timeout time.Duration) model
 		result.Open = true
 		result.Banner = identify.ReadBanner(conn)
 		result.Service = identify.IdentifyService(result.Banner, port)
+		fp := identify.IdentifyFingerprint(result.Banner, port)
+		result.Product = fp.Product
+		result.FingerprintSource = fp.Source
 		conn.Close()
 	}
 	return result
@@ -52,14 +56,15 @@ func ScanWorker(id int, ip string, scanner <-chan model.Scanner, results chan<- 
 	}
 }
 
-func scanImportantPorts(ip, network string) []model.ScanResult {
+// ScanPorts concurrently scans the supplied TCP or UDP port list on one host.
+func ScanPorts(ip, network string, ports []int) []model.ScanResult {
 	var openPorts []model.ScanResult
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
 	concurrentLimit := make(chan struct{}, runtime.NumCPU()*10)
 
-	for _, port := range importantPorts {
+	for _, port := range normalizePorts(ports) {
 		wg.Add(1)
 		go func(port int) {
 			defer wg.Done()
@@ -70,21 +75,57 @@ func scanImportantPorts(ip, network string) []model.ScanResult {
 			if result.Open {
 				mu.Lock()
 				openPorts = append(openPorts, result)
-				fmt.Printf("[+] 重要端口 %s 开放 (%s)\n", result.Address, result.Service)
 				mu.Unlock()
 			}
 		}(port)
 	}
 	wg.Wait()
-	close(concurrentLimit)
+	sort.Slice(openPorts, func(i, j int) bool {
+		_, left, _ := net.SplitHostPort(openPorts[i].Address)
+		_, right, _ := net.SplitHostPort(openPorts[j].Address)
+		leftPort, _ := strconv.Atoi(left)
+		rightPort, _ := strconv.Atoi(right)
+		return leftPort < rightPort
+	})
 	return openPorts
+}
+
+func scanImportantPorts(ip, network string) []model.ScanResult {
+	openPorts := ScanPorts(ip, network, InternalBaselinePorts())
+	for _, result := range openPorts {
+		fmt.Printf("[+] 重要端口 %s 开放 (%s)\n", result.Address, result.Service)
+	}
+	return openPorts
+}
+
+func RunQuick(ip string, network string) []model.ScanResult {
+	openPorts := ScanPorts(ip, network, InternalBaselinePorts())
+	printOpenPorts(openPorts)
+	return openPorts
+}
+
+func normalizePorts(ports []int) []int {
+	seen := make(map[int]struct{}, len(ports))
+	uniquePorts := make([]int, 0, len(ports))
+	for _, port := range ports {
+		if port < 1 || port > 65535 {
+			continue
+		}
+		if _, ok := seen[port]; ok {
+			continue
+		}
+		seen[port] = struct{}{}
+		uniquePorts = append(uniquePorts, port)
+	}
+	return uniquePorts
 }
 
 func Run(ip string, network string) []model.ScanResult {
 	important := scanImportantPorts(ip, network)
 
-	skipPorts := make(map[int]bool, len(importantPorts))
-	for _, p := range importantPorts {
+	baselinePorts := InternalBaselinePorts()
+	skipPorts := make(map[int]bool, len(baselinePorts))
+	for _, p := range baselinePorts {
 		skipPorts[p] = true
 	}
 
@@ -156,7 +197,7 @@ func printProgress(current, total int, start time.Time) {
 
 func printOpenPorts(results []model.ScanResult) {
 	fmt.Println("\n=== 开放端口详情 ===")
-	fmt.Printf("%-20s\t%-25s\t%-30s\n", "地址", "服务类型", "Banner信息")
+	fmt.Printf("%-20s\t%-18s\t%-18s\t%-30s\n", "地址", "服务类型", "产品指纹", "Banner信息")
 	for _, r := range results {
 		banner := r.Banner
 		if banner == "" {
@@ -164,7 +205,11 @@ func printOpenPorts(results []model.ScanResult) {
 		} else if len(banner) > 50 {
 			banner = banner[:50] + "..."
 		}
-		fmt.Printf("%-20s\t%-25s\t%-30s\n", r.Address, r.Service, banner)
+		product := r.Product
+		if product == "" {
+			product = "-"
+		}
+		fmt.Printf("%-20s\t%-18s\t%-18s\t%-30s\n", r.Address, r.Service, product, banner)
 	}
 	fmt.Println("\n=== ---------- ===")
 }
