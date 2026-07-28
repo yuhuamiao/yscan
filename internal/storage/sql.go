@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -57,7 +58,7 @@ func InitDB() (*sql.DB, error) {
 }
 
 func resetSequencesIfEmpty(db *sql.DB) error {
-	tables := []string{"banner", "scan_results", "domain_info", "domain_ips", "host_inventory", "tasks", "pocs", "vulnerabilities"}
+	tables := []string{"banner", "scan_results", "domain_info", "domain_ips", "host_inventory", "tasks", "scan_tasks", "scan_task_runs", "pocs", "vulnerabilities"}
 	for _, tbl := range tables {
 		var cnt int
 		if err := db.QueryRow(fmt.Sprintf("SELECT COUNT(1) FROM %s", tbl)).Scan(&cnt); err != nil {
@@ -83,12 +84,114 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 			last_scan DATETIME,
 			is_active INTEGER NOT NULL DEFAULT 1
 		)`,
+		`CREATE TABLE IF NOT EXISTS host_inventory_scopes (
+			scope TEXT NOT NULL,
+			ip TEXT NOT NULL,
+			first_seen DATETIME NOT NULL DEFAULT (datetime('now')),
+			last_seen DATETIME NOT NULL DEFAULT (datetime('now')),
+			last_checked DATETIME NOT NULL DEFAULT (datetime('now')),
+			is_active INTEGER NOT NULL DEFAULT 1,
+			PRIMARY KEY (scope, ip)
+		)`,
+		`CREATE TABLE IF NOT EXISTS host_inventory_scope_ports (
+			scope TEXT NOT NULL,
+			ip TEXT NOT NULL,
+			port INTEGER NOT NULL,
+			service_type TEXT NOT NULL,
+			first_seen DATETIME NOT NULL DEFAULT (datetime('now')),
+			last_seen DATETIME NOT NULL DEFAULT (datetime('now')),
+			last_checked DATETIME NOT NULL DEFAULT (datetime('now')),
+			is_active INTEGER NOT NULL DEFAULT 1,
+			PRIMARY KEY (scope, ip, port)
+		)`,
 		`CREATE TABLE IF NOT EXISTS task_change_summaries (
 			task_id INTEGER PRIMARY KEY,
 			target TEXT NOT NULL,
 			summary_json TEXT NOT NULL,
 			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
 			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE IF NOT EXISTS scan_tasks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			target TEXT NOT NULL,
+			scan_type TEXT NOT NULL CHECK (scan_type IN ('ip', 'subnet')),
+			mode TEXT NOT NULL CHECK (mode IN ('once', 'scheduled')),
+			status TEXT NOT NULL CHECK (status IN ('enabled', 'paused', 'archived')),
+			cron TEXT,
+			timezone TEXT,
+			config_json TEXT NOT NULL DEFAULT '{}',
+			config_hash TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			archived_at DATETIME
+		)`,
+		`CREATE TABLE IF NOT EXISTS scan_task_runs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			scan_task_id INTEGER NOT NULL REFERENCES scan_tasks(id),
+			sequence INTEGER NOT NULL,
+			scheduled_for DATETIME NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'cancel_requested', 'success', 'failed', 'canceled', 'skipped_overlap', 'skipped_misfire')),
+			target TEXT NOT NULL,
+			scan_type TEXT NOT NULL CHECK (scan_type IN ('ip', 'subnet')),
+			config_json TEXT NOT NULL DEFAULT '{}',
+			config_hash TEXT NOT NULL DEFAULT '',
+			error_message TEXT,
+			report_path TEXT,
+			started_at DATETIME,
+			finished_at DATETIME,
+			snapshot_written_at DATETIME,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(scan_task_id, sequence),
+			UNIQUE(scan_task_id, scheduled_for)
+		)`,
+		`CREATE TABLE IF NOT EXISTS scan_task_run_hosts (
+			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
+			ip TEXT NOT NULL,
+			is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+			PRIMARY KEY (scan_task_run_id, ip)
+		)`,
+		`CREATE TABLE IF NOT EXISTS scan_task_run_ports (
+			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
+			ip TEXT NOT NULL,
+			port INTEGER NOT NULL,
+			service_type TEXT NOT NULL,
+			product TEXT,
+			banner TEXT,
+			PRIMARY KEY (scan_task_run_id, ip, port)
+		)`,
+		`CREATE TABLE IF NOT EXISTS scan_task_run_vulnerabilities (
+			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
+			finding_key TEXT NOT NULL,
+			template_id TEXT,
+			name TEXT,
+			severity TEXT,
+			target TEXT NOT NULL,
+			target_ip TEXT,
+			target_port INTEGER,
+			matched_at TEXT,
+			evidence TEXT,
+			PRIMARY KEY (scan_task_run_id, finding_key)
+		)`,
+		`CREATE TABLE IF NOT EXISTS asset_fingerprints (
+			ip TEXT NOT NULL,
+			port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+			protocol TEXT NOT NULL CHECK (protocol IN ('http', 'https', 'tcp', 'tls')),
+			rule_id TEXT NOT NULL,
+			source_id TEXT NOT NULL,
+			vendor TEXT,
+			product TEXT NOT NULL,
+			version TEXT,
+			cpe TEXT,
+			confidence INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+			evidence_json TEXT NOT NULL,
+			first_seen DATETIME NOT NULL DEFAULT (datetime('now')),
+			last_seen DATETIME NOT NULL DEFAULT (datetime('now')),
+			PRIMARY KEY (ip, port, protocol, rule_id, source_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS scan_task_run_template_candidates (
+			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id), template_id TEXT NOT NULL, path TEXT NOT NULL, source TEXT NOT NULL, reason TEXT NOT NULL,
+			PRIMARY KEY (scan_task_run_id, template_id, path)
 		)`,
 		`ALTER TABLE banner ADD COLUMN match_type TEXT NOT NULL DEFAULT 'contains'`,
 		`ALTER TABLE banner ADD COLUMN protocol TEXT`,
@@ -98,6 +201,9 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 		`ALTER TABLE domain_ips ADD COLUMN first_seen DATETIME`,
 		`ALTER TABLE domain_ips ADD COLUMN last_seen DATETIME`,
 		`ALTER TABLE domain_ips ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE tasks ADD COLUMN report_error TEXT`,
+		`ALTER TABLE scan_task_runs ADD COLUMN report_error TEXT`,
+		`ALTER TABLE scan_task_runs ADD COLUMN snapshot_written_at DATETIME`,
 		`UPDATE domain_info SET last_seen = COALESCE(last_seen, first_seen, datetime('now'))`,
 		`UPDATE domain_info SET is_active = COALESCE(is_active, 1)`,
 		`UPDATE domain_ips SET first_seen = COALESCE(first_seen, datetime('now'))`,
@@ -108,7 +214,19 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_domain_ips_ip_active ON domain_ips(ip, is_active)`,
 		`CREATE INDEX IF NOT EXISTS idx_host_inventory_ip_active ON host_inventory(ip, is_active)`,
 		`CREATE INDEX IF NOT EXISTS idx_host_inventory_source_active ON host_inventory(source, is_active)`,
+		`CREATE INDEX IF NOT EXISTS idx_host_inventory_scopes_scope_active ON host_inventory_scopes(scope, is_active)`,
+		`CREATE INDEX IF NOT EXISTS idx_host_inventory_scopes_ip_active ON host_inventory_scopes(ip, is_active)`,
+		`CREATE INDEX IF NOT EXISTS idx_host_inventory_scope_ports_scope_ip_active ON host_inventory_scope_ports(scope, ip, is_active)`,
+		`CREATE INDEX IF NOT EXISTS idx_host_inventory_scope_ports_ip_port_active ON host_inventory_scope_ports(ip, port, is_active)`,
 		`CREATE INDEX IF NOT EXISTS idx_task_change_summaries_target ON task_change_summaries(target)`,
+		`CREATE INDEX IF NOT EXISTS idx_scan_tasks_status ON scan_tasks(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_scan_task_runs_task_sequence ON scan_task_runs(scan_task_id, sequence)`,
+		`CREATE INDEX IF NOT EXISTS idx_scan_task_runs_status_scheduled_for ON scan_task_runs(status, scheduled_for)`,
+		`CREATE INDEX IF NOT EXISTS idx_scan_task_run_hosts_run ON scan_task_run_hosts(scan_task_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_scan_task_run_ports_run ON scan_task_run_ports(scan_task_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_scan_task_run_vulnerabilities_run ON scan_task_run_vulnerabilities(scan_task_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_asset_fingerprints_ip_port ON asset_fingerprints(ip, port)`,
+		`CREATE INDEX IF NOT EXISTS idx_asset_fingerprints_product ON asset_fingerprints(product)`,
 	}
 
 	for _, stmt := range statements {
@@ -116,6 +234,30 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 			return err
 		}
 	}
+	return backfillLegacyHostInventoryScopes(db)
+}
+
+// backfillLegacyHostInventoryScopes preserves the scope meaning of historical
+// subnet scans before source became a compatibility-only field. Legacy port
+// results have no scan-scope provenance, so the migration intentionally does
+// not turn them into scope-port baselines.
+func backfillLegacyHostInventoryScopes(db *sql.DB) error {
+	if _, err := db.Exec(`
+		INSERT INTO host_inventory_scopes
+			(scope, ip, first_seen, last_seen, last_checked, is_active)
+		SELECT
+			TRIM(source),
+			ip,
+			COALESCE(first_seen, datetime('now')),
+			COALESCE(last_seen, first_seen, datetime('now')),
+			COALESCE(last_scan, last_seen, first_seen, datetime('now')),
+			COALESCE(is_active, 1)
+		FROM host_inventory
+		WHERE source IS NOT NULL AND TRIM(source) LIKE 'subnet:%'
+		ON CONFLICT(scope, ip) DO NOTHING`); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -129,6 +271,10 @@ func isIgnorableSQLiteMigrationError(err error) bool {
 }
 
 func initSQLiteSchema(db *sql.DB) error {
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		return err
+	}
+
 	schema := `
 CREATE TABLE IF NOT EXISTS banner (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,12 +332,125 @@ CREATE TABLE IF NOT EXISTS host_inventory (
     is_active  INTEGER NOT NULL DEFAULT 1
 );
 
+CREATE TABLE IF NOT EXISTS host_inventory_scopes (
+    scope        TEXT    NOT NULL,
+    ip           TEXT    NOT NULL,
+    first_seen   DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_seen    DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_checked DATETIME NOT NULL DEFAULT (datetime('now')),
+    is_active    INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (scope, ip)
+);
+
+CREATE TABLE IF NOT EXISTS host_inventory_scope_ports (
+    scope        TEXT    NOT NULL,
+    ip           TEXT    NOT NULL,
+    port         INTEGER NOT NULL,
+    service_type TEXT    NOT NULL,
+    first_seen   DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_seen    DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_checked DATETIME NOT NULL DEFAULT (datetime('now')),
+    is_active    INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (scope, ip, port)
+);
+
 CREATE TABLE IF NOT EXISTS task_change_summaries (
     task_id      INTEGER PRIMARY KEY,
     target       TEXT NOT NULL,
     summary_json TEXT NOT NULL,
     created_at   DATETIME NOT NULL DEFAULT (datetime('now')),
     updated_at   DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS scan_tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target      TEXT NOT NULL,
+    scan_type   TEXT NOT NULL CHECK (scan_type IN ('ip', 'subnet')),
+    mode        TEXT NOT NULL CHECK (mode IN ('once', 'scheduled')),
+    status      TEXT NOT NULL CHECK (status IN ('enabled', 'paused', 'archived')),
+    cron        TEXT,
+    timezone    TEXT,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    config_hash TEXT NOT NULL DEFAULT '',
+    created_at  DATETIME NOT NULL DEFAULT (datetime('now')),
+    updated_at  DATETIME NOT NULL DEFAULT (datetime('now')),
+    archived_at DATETIME
+);
+
+CREATE TABLE IF NOT EXISTS scan_task_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_task_id  INTEGER NOT NULL REFERENCES scan_tasks(id),
+    sequence      INTEGER NOT NULL,
+    scheduled_for DATETIME NOT NULL,
+    status        TEXT NOT NULL CHECK (status IN ('queued', 'running', 'cancel_requested', 'success', 'failed', 'canceled', 'skipped_overlap', 'skipped_misfire')),
+    target        TEXT NOT NULL,
+    scan_type     TEXT NOT NULL CHECK (scan_type IN ('ip', 'subnet')),
+    config_json   TEXT NOT NULL DEFAULT '{}',
+	config_hash   TEXT NOT NULL DEFAULT '',
+	error_message TEXT,
+	report_path   TEXT,
+	report_error  TEXT,
+	started_at    DATETIME,
+    finished_at   DATETIME,
+    snapshot_written_at DATETIME,
+    created_at    DATETIME NOT NULL DEFAULT (datetime('now')),
+    updated_at    DATETIME NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(scan_task_id, sequence),
+    UNIQUE(scan_task_id, scheduled_for)
+);
+
+CREATE TABLE IF NOT EXISTS scan_task_run_hosts (
+    scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
+    ip               TEXT NOT NULL,
+    is_active        INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    PRIMARY KEY (scan_task_run_id, ip)
+);
+
+CREATE TABLE IF NOT EXISTS scan_task_run_ports (
+    scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
+    ip               TEXT NOT NULL,
+    port             INTEGER NOT NULL,
+    service_type     TEXT NOT NULL,
+    product          TEXT,
+    banner           TEXT,
+    PRIMARY KEY (scan_task_run_id, ip, port)
+);
+
+CREATE TABLE IF NOT EXISTS scan_task_run_vulnerabilities (
+    scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
+    finding_key      TEXT NOT NULL,
+    template_id      TEXT,
+    name             TEXT,
+    severity         TEXT,
+    target           TEXT NOT NULL,
+    target_ip        TEXT,
+    target_port      INTEGER,
+    matched_at       TEXT,
+    evidence         TEXT,
+    PRIMARY KEY (scan_task_run_id, finding_key)
+);
+
+CREATE TABLE IF NOT EXISTS scan_task_run_template_candidates (
+    scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
+    template_id TEXT NOT NULL, path TEXT NOT NULL, source TEXT NOT NULL, reason TEXT NOT NULL,
+    PRIMARY KEY (scan_task_run_id, template_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS asset_fingerprints (
+    ip            TEXT NOT NULL,
+    port          INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+    protocol      TEXT NOT NULL CHECK (protocol IN ('http', 'https', 'tcp', 'tls')),
+    rule_id       TEXT NOT NULL,
+    source_id     TEXT NOT NULL,
+    vendor        TEXT,
+    product       TEXT NOT NULL,
+    version       TEXT,
+    cpe           TEXT,
+    confidence    INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    evidence_json TEXT NOT NULL,
+    first_seen    DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_seen     DATETIME NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (ip, port, protocol, rule_id, source_id)
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -201,6 +460,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     status      TEXT    NOT NULL,
     progress    INTEGER NOT NULL DEFAULT 0,
     error_msg   TEXT,
+    report_error TEXT,
     started_at  DATETIME,
     finished_at DATETIME,
     created_at  DATETIME NOT NULL DEFAULT (datetime('now')),
@@ -240,7 +500,19 @@ CREATE INDEX IF NOT EXISTS idx_vuln_scan_result_id ON vulnerabilities(scan_resul
 CREATE UNIQUE INDEX IF NOT EXISTS idx_banner_service_pattern ON banner(service_name, banner_pattern);
 CREATE INDEX IF NOT EXISTS idx_host_inventory_ip_active ON host_inventory(ip, is_active);
 CREATE INDEX IF NOT EXISTS idx_host_inventory_source_active ON host_inventory(source, is_active);
+CREATE INDEX IF NOT EXISTS idx_host_inventory_scopes_scope_active ON host_inventory_scopes(scope, is_active);
+CREATE INDEX IF NOT EXISTS idx_host_inventory_scopes_ip_active ON host_inventory_scopes(ip, is_active);
+CREATE INDEX IF NOT EXISTS idx_host_inventory_scope_ports_scope_ip_active ON host_inventory_scope_ports(scope, ip, is_active);
+CREATE INDEX IF NOT EXISTS idx_host_inventory_scope_ports_ip_port_active ON host_inventory_scope_ports(ip, port, is_active);
 CREATE INDEX IF NOT EXISTS idx_task_change_summaries_target ON task_change_summaries(target);
+CREATE INDEX IF NOT EXISTS idx_scan_tasks_status ON scan_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_scan_task_runs_task_sequence ON scan_task_runs(scan_task_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_scan_task_runs_status_scheduled_for ON scan_task_runs(status, scheduled_for);
+CREATE INDEX IF NOT EXISTS idx_scan_task_run_hosts_run ON scan_task_run_hosts(scan_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_scan_task_run_ports_run ON scan_task_run_ports(scan_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_scan_task_run_vulnerabilities_run ON scan_task_run_vulnerabilities(scan_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_asset_fingerprints_ip_port ON asset_fingerprints(ip, port);
+CREATE INDEX IF NOT EXISTS idx_asset_fingerprints_product ON asset_fingerprints(product);
 `
 	_, err := db.Exec(schema)
 	if err != nil {
@@ -455,10 +727,10 @@ func GetTaskStatus(db *sql.DB, taskID int64) (string, error) {
 
 func GetTaskByID(db *sql.DB, taskID int64) (model.Task, error) {
 	var t model.Task
-	var startedAt, finishedAt, errorMsg, updatedAt sql.NullString
+	var startedAt, finishedAt, errorMsg, reportError, updatedAt sql.NullString
 
 	err := db.QueryRow(`
-		SELECT id, task_type, target, status, progress, error_msg, started_at, finished_at, created_at, updated_at
+		SELECT id, task_type, target, status, progress, error_msg, report_error, started_at, finished_at, created_at, updated_at
 		FROM tasks
 		WHERE id = ?`, taskID).Scan(
 		&t.ID,
@@ -467,6 +739,7 @@ func GetTaskByID(db *sql.DB, taskID int64) (model.Task, error) {
 		&t.Status,
 		&t.Progress,
 		&errorMsg,
+		&reportError,
 		&startedAt,
 		&finishedAt,
 		&t.CreatedAt,
@@ -476,14 +749,14 @@ func GetTaskByID(db *sql.DB, taskID int64) (model.Task, error) {
 		return model.Task{}, err
 	}
 
-	applyNullableTaskFields(&t, errorMsg, startedAt, finishedAt, updatedAt)
+	applyNullableTaskFields(&t, errorMsg, reportError, startedAt, finishedAt, updatedAt)
 
 	return t, nil
 }
 
 func ListTasks(db *sql.DB) ([]model.Task, error) {
 	rows, err := db.Query(`
-		SELECT id, task_type, target, status, progress, error_msg, started_at, finished_at, created_at, updated_at
+		SELECT id, task_type, target, status, progress, error_msg, report_error, started_at, finished_at, created_at, updated_at
 		FROM tasks
 		ORDER BY id DESC`)
 	if err != nil {
@@ -494,7 +767,7 @@ func ListTasks(db *sql.DB) ([]model.Task, error) {
 	tasks := make([]model.Task, 0)
 	for rows.Next() {
 		var t model.Task
-		var startedAt, finishedAt, errorMsg, updatedAt sql.NullString
+		var startedAt, finishedAt, errorMsg, reportError, updatedAt sql.NullString
 		if err := rows.Scan(
 			&t.ID,
 			&t.TaskType,
@@ -502,6 +775,7 @@ func ListTasks(db *sql.DB) ([]model.Task, error) {
 			&t.Status,
 			&t.Progress,
 			&errorMsg,
+			&reportError,
 			&startedAt,
 			&finishedAt,
 			&t.CreatedAt,
@@ -509,7 +783,7 @@ func ListTasks(db *sql.DB) ([]model.Task, error) {
 		); err != nil {
 			return nil, err
 		}
-		applyNullableTaskFields(&t, errorMsg, startedAt, finishedAt, updatedAt)
+		applyNullableTaskFields(&t, errorMsg, reportError, startedAt, finishedAt, updatedAt)
 		tasks = append(tasks, t)
 	}
 
@@ -520,9 +794,71 @@ func ListTasks(db *sql.DB) ([]model.Task, error) {
 	return tasks, nil
 }
 
-func applyNullableTaskFields(t *model.Task, errorMsg, startedAt, finishedAt, updatedAt sql.NullString) {
+// ListLegacyTaskSummaries returns v1 executions as read-only historical data.
+// M10 Diff queries must only read ScanTaskRun snapshots, never this list.
+func ListLegacyTaskSummaries(db *sql.DB) ([]model.LegacyTaskSummary, error) {
+	rows, err := db.Query(`
+		SELECT id, task_type, target, status, started_at, finished_at, created_at
+		FROM tasks
+		ORDER BY id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	summaries := make([]model.LegacyTaskSummary, 0)
+	for rows.Next() {
+		summary, err := scanLegacyTaskSummary(rows)
+		if err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return summaries, nil
+}
+
+func GetLegacyTaskSummary(db *sql.DB, legacyTaskID int64) (model.LegacyTaskSummary, error) {
+	row := db.QueryRow(`
+		SELECT id, task_type, target, status, started_at, finished_at, created_at
+		FROM tasks
+		WHERE id = ?`, legacyTaskID)
+	return scanLegacyTaskSummary(row)
+}
+
+type legacyTaskSummaryScanner interface {
+	Scan(dest ...interface{}) error
+}
+
+func scanLegacyTaskSummary(scanner legacyTaskSummaryScanner) (model.LegacyTaskSummary, error) {
+	var summary model.LegacyTaskSummary
+	var startedAt, finishedAt sql.NullString
+	if err := scanner.Scan(
+		&summary.LegacyTaskID,
+		&summary.TaskType,
+		&summary.Target,
+		&summary.Status,
+		&startedAt,
+		&finishedAt,
+		&summary.CreatedAt,
+	); err != nil {
+		return model.LegacyTaskSummary{}, err
+	}
+	summary.StartedAt = startedAt.String
+	summary.FinishedAt = finishedAt.String
+	summary.IsHistorical = true
+	summary.ExactDiffAvailable = false
+	return summary, nil
+}
+
+func applyNullableTaskFields(t *model.Task, errorMsg, reportError, startedAt, finishedAt, updatedAt sql.NullString) {
 	if errorMsg.Valid {
 		t.ErrorMsg = errorMsg.String
+	}
+	if reportError.Valid {
+		t.ReportError = reportError.String
 	}
 	if startedAt.Valid {
 		t.StartedAt = startedAt.String
@@ -533,6 +869,25 @@ func applyNullableTaskFields(t *model.Task, errorMsg, startedAt, finishedAt, upd
 	if updatedAt.Valid {
 		t.UpdatedAt = updatedAt.String
 	}
+}
+
+// UpdateTaskReportError records a report-generation diagnostic without changing
+// the task's terminal scan state or its collected results.
+func UpdateTaskReportError(db *sql.DB, taskID int64, reportError string) error {
+	reportError = strings.TrimSpace(reportError)
+	if reportError == "" {
+		_, err := db.Exec(`
+			UPDATE tasks
+			SET report_error = NULL, updated_at = datetime('now')
+			WHERE id = ?`, taskID)
+		return err
+	}
+
+	_, err := db.Exec(`
+		UPDATE tasks
+		SET report_error = ?, updated_at = datetime('now')
+		WHERE id = ?`, reportError, taskID)
+	return err
 }
 
 func UpdateTaskStatus(db *sql.DB, taskID int64, toStatus string, errorMsg string) error {
@@ -610,7 +965,35 @@ func UpdateTaskProgress(db *sql.DB, taskID int64, progress int) error {
 }
 
 func CancelTask(db *sql.DB, taskID int64) error {
-	return UpdateTaskStatus(db, taskID, model.TaskStatusCanceled, "")
+	result, err := db.Exec(`
+		UPDATE tasks
+		SET status = ?, updated_at = datetime('now')
+		WHERE id = ? AND status IN (?, ?)`,
+		model.TaskStatusCancelRequested,
+		taskID,
+		model.TaskStatusQueued,
+		model.TaskStatusRunning,
+	)
+	if err != nil {
+		return err
+	}
+
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated > 0 {
+		return nil
+	}
+
+	status, err := GetTaskStatus(db, taskID)
+	if err != nil {
+		return err
+	}
+	if status == model.TaskStatusCancelRequested {
+		return nil
+	}
+	return fmt.Errorf("task %d cannot be canceled in status %s", taskID, status)
 }
 
 func IsTaskCanceled(db *sql.DB, taskID int64) (bool, error) {
@@ -618,7 +1001,79 @@ func IsTaskCanceled(db *sql.DB, taskID int64) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return status == model.TaskStatusCanceled, nil
+	return status == model.TaskStatusCancelRequested || status == model.TaskStatusCanceled, nil
+}
+
+// FinalizeTask is the only transition from an executing task to a terminal state.
+// Its conditional update is the linearization point between a completed scan and
+// a concurrent cancellation request.
+func FinalizeTask(db *sql.DB, taskID int64, executionErr error) (string, error) {
+	finalStatus := model.TaskStatusSuccess
+	if executionErr != nil {
+		finalStatus = model.TaskStatusFailed
+	}
+
+	result, err := updateTaskTerminalStatus(db, taskID, finalStatus, executionErr)
+	if err != nil {
+		return "", err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if updated > 0 {
+		return finalStatus, nil
+	}
+
+	result, err = db.Exec(`
+		UPDATE tasks
+		SET status = ?, finished_at = datetime('now'), error_msg = NULL, updated_at = datetime('now')
+		WHERE id = ? AND status = ?`,
+		model.TaskStatusCanceled,
+		taskID,
+		model.TaskStatusCancelRequested,
+	)
+	if err != nil {
+		return "", err
+	}
+	updated, err = result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if updated > 0 {
+		return model.TaskStatusCanceled, nil
+	}
+
+	status, err := GetTaskStatus(db, taskID)
+	if err != nil {
+		return "", err
+	}
+	return "", fmt.Errorf("task %d is already terminal or cannot be finalized from status %s", taskID, status)
+}
+
+func updateTaskTerminalStatus(db *sql.DB, taskID int64, finalStatus string, executionErr error) (sql.Result, error) {
+	if finalStatus == model.TaskStatusSuccess {
+		return db.Exec(`
+			UPDATE tasks
+			SET status = ?, progress = 100, finished_at = datetime('now'), error_msg = NULL, updated_at = datetime('now')
+			WHERE id = ? AND status IN (?, ?)`,
+			finalStatus,
+			taskID,
+			model.TaskStatusQueued,
+			model.TaskStatusRunning,
+		)
+	}
+
+	return db.Exec(`
+		UPDATE tasks
+		SET status = ?, finished_at = datetime('now'), error_msg = ?, updated_at = datetime('now')
+		WHERE id = ? AND status IN (?, ?)`,
+		finalStatus,
+		executionErr.Error(),
+		taskID,
+		model.TaskStatusQueued,
+		model.TaskStatusRunning,
+	)
 }
 
 func isValidTaskTransition(fromStatus, toStatus string) bool {
@@ -628,12 +1083,13 @@ func isValidTaskTransition(fromStatus, toStatus string) bool {
 
 	allowed := map[string]map[string]bool{
 		model.TaskStatusQueued: {
-			model.TaskStatusRunning:  true,
-			model.TaskStatusCanceled: true,
+			model.TaskStatusRunning:         true,
+			model.TaskStatusCancelRequested: true,
 		},
 		model.TaskStatusRunning: {
-			model.TaskStatusSuccess:  true,
-			model.TaskStatusFailed:   true,
+			model.TaskStatusCancelRequested: true,
+		},
+		model.TaskStatusCancelRequested: {
 			model.TaskStatusCanceled: true,
 		},
 		model.TaskStatusSuccess:  {},
@@ -864,6 +1320,140 @@ func SyncOpenPorts(db *sql.DB, ip string, results []model.ScanResult) error {
 	return nil
 }
 
+// SyncScopeOpenPorts updates one host's port membership inside one scan scope.
+// It intentionally does not alter another scope's port rows or the global
+// scan_results cache used for latest service profiling.
+func SyncScopeOpenPorts(db *sql.DB, scope, ip string, results []model.ScanResult) error {
+	scope = strings.TrimSpace(scope)
+	ip = strings.TrimSpace(ip)
+	if scope == "" {
+		return errors.New("scan scope is required")
+	}
+	if net.ParseIP(ip) == nil {
+		return fmt.Errorf("invalid host IP: %s", ip)
+	}
+
+	recordsByPort := make(map[int]scanResultRecord)
+	for _, result := range results {
+		if !result.Open {
+			continue
+		}
+		record, err := normalizeScanResult(db, result)
+		if err != nil {
+			return err
+		}
+		if record.ip != ip {
+			return fmt.Errorf("scan result IP %s does not match host %s", record.ip, ip)
+		}
+		recordsByPort[record.port] = record
+	}
+
+	ports := make([]int, 0, len(recordsByPort))
+	for port := range recordsByPort {
+		ports = append(ports, port)
+	}
+	sort.Ints(ports)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, port := range ports {
+		record := recordsByPort[port]
+		if _, err := tx.Exec(`
+			INSERT INTO host_inventory_scope_ports
+				(scope, ip, port, service_type, first_seen, last_seen, last_checked, is_active)
+			VALUES (?, ?, ?, ?, datetime('now'), datetime('now'), datetime('now'), 1)
+			ON CONFLICT(scope, ip, port) DO UPDATE SET
+				service_type = excluded.service_type,
+				last_seen = datetime('now'),
+				last_checked = datetime('now'),
+				is_active = 1`,
+			scope,
+			ip,
+			record.port,
+			record.serviceType,
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+
+	statement := `
+		UPDATE host_inventory_scope_ports
+		SET is_active = 0, last_checked = datetime('now')
+		WHERE scope = ? AND ip = ?`
+	args := []interface{}{scope, ip}
+	if len(ports) > 0 {
+		statement += ` AND port NOT IN (` + sqlPlaceholders(len(ports)) + `)`
+		for _, port := range ports {
+			args = append(args, port)
+		}
+	}
+	if _, err := tx.Exec(statement, args...); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// DeactivateScopePortsForInactiveHosts keeps scope port membership consistent
+// with the scope's host membership after a discovery run marks hosts inactive.
+func DeactivateScopePortsForInactiveHosts(db *sql.DB, scope string) error {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return errors.New("scan scope is required")
+	}
+	_, err := db.Exec(`
+		UPDATE host_inventory_scope_ports AS scope_ports
+		SET is_active = 0, last_checked = datetime('now')
+		WHERE scope_ports.scope = ?
+			AND scope_ports.is_active = 1
+			AND EXISTS (
+				SELECT 1
+				FROM host_inventory_scopes AS scope_hosts
+				WHERE scope_hosts.scope = scope_ports.scope
+					AND scope_hosts.ip = scope_ports.ip
+					AND scope_hosts.is_active = 0
+			)`, scope)
+	return err
+}
+
+// ListScopeActivePorts returns the active port snapshot for exactly one scope.
+func ListScopeActivePorts(db *sql.DB, scope string) (map[string][]int, error) {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return nil, errors.New("scan scope is required")
+	}
+
+	rows, err := db.Query(`
+		SELECT ip, port
+		FROM host_inventory_scope_ports
+		WHERE scope = ? AND is_active = 1
+		ORDER BY ip ASC, port ASC`, scope)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshot := make(map[string][]int)
+	for rows.Next() {
+		var ip string
+		var port int
+		if err := rows.Scan(&ip, &port); err != nil {
+			return nil, err
+		}
+		snapshot[ip] = append(snapshot[ip], port)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
 func MatchFingerprint(db *sql.DB, banner string) string {
 	return MatchFingerprintWithHint(db, banner, "", 0)
 }
@@ -1019,9 +1609,13 @@ func SaveDomainScanResult(db *sql.DB, ip string, openPorts []model.ScanResult) e
 	return nil
 }
 
-func SyncHostInventory(db *sql.DB, source string, aliveIPs []string) error {
-	source = strings.TrimSpace(source)
-	if source == "" {
+// SyncHostInventory synchronizes a scan scope and then derives the IP-level
+// inventory aggregate from all of that IP's scope memberships. The legacy
+// source column is preserved as a compatibility hint only; it never decides
+// which scope membership should become inactive.
+func SyncHostInventory(db *sql.DB, scope string, aliveIPs []string) error {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
 		return nil
 	}
 
@@ -1029,60 +1623,221 @@ func SyncHostInventory(db *sql.DB, source string, aliveIPs []string) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
+	affectedIPs, err := syncHostScopeInventoryTx(tx, scope, aliveIPs)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, ip := range affectedIPs {
+		if err := refreshHostInventoryAggregateTx(tx, ip, scope); err != nil {
 			_ = tx.Rollback()
-		}
-	}()
-
-	seen := make(map[string]struct{}, len(aliveIPs))
-	uniqueIPs := make([]string, 0, len(aliveIPs))
-	for _, ip := range aliveIPs {
-		ip = strings.TrimSpace(ip)
-		if net.ParseIP(ip) == nil {
-			continue
-		}
-		if _, ok := seen[ip]; ok {
-			continue
-		}
-		seen[ip] = struct{}{}
-		uniqueIPs = append(uniqueIPs, ip)
-		if _, err = tx.Exec(`
-			INSERT INTO host_inventory (ip, source, first_seen, last_seen, last_scan, is_active)
-			VALUES (?, ?, datetime('now'), datetime('now'), datetime('now'), 1)
-			ON CONFLICT(ip) DO UPDATE SET
-				source = excluded.source,
-				last_seen = datetime('now'),
-				last_scan = datetime('now'),
-				is_active = 1`,
-			ip, source,
-		); err != nil {
 			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// SyncHostScopeInventory updates one scope without modifying the IP-level
+// aggregate. It remains available for callers that only need to maintain the
+// explicit membership relation.
+func SyncHostScopeInventory(db *sql.DB, scope string, aliveIPs []string) error {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := syncHostScopeInventoryTx(tx, scope, aliveIPs); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func syncHostScopeInventoryTx(tx *sql.Tx, scope string, aliveIPs []string) ([]string, error) {
+	existingIPs, err := listScopeIPsTx(tx, scope)
+	if err != nil {
+		return nil, err
+	}
+	uniqueIPs := normalizedHostIPs(scope, aliveIPs)
+	affected := make(map[string]struct{}, len(existingIPs)+len(uniqueIPs))
+	for _, ip := range existingIPs {
+		affected[ip] = struct{}{}
+	}
+	for _, ip := range uniqueIPs {
+		affected[ip] = struct{}{}
+		if _, err := tx.Exec(`
+			INSERT INTO host_inventory_scopes (scope, ip, first_seen, last_seen, last_checked, is_active)
+			VALUES (?, ?, datetime('now'), datetime('now'), datetime('now'), 1)
+			ON CONFLICT(scope, ip) DO UPDATE SET
+				last_seen = datetime('now'),
+				last_checked = datetime('now'),
+				is_active = 1`,
+			scope,
+			ip,
+		); err != nil {
+			return nil, err
 		}
 	}
 
 	query := `
-		UPDATE host_inventory
-		SET is_active = 0, last_scan = datetime('now')
-		WHERE source = ?`
-	args := []interface{}{source}
+		UPDATE host_inventory_scopes
+		SET is_active = 0, last_checked = datetime('now')
+		WHERE scope = ?`
+	args := []interface{}{scope}
 	if len(uniqueIPs) > 0 {
 		query += ` AND ip NOT IN (` + sqlPlaceholders(len(uniqueIPs)) + `)`
 		for _, ip := range uniqueIPs {
 			args = append(args, ip)
 		}
 	}
-	if _, err = tx.Exec(query, args...); err != nil {
+	if _, err := tx.Exec(query, args...); err != nil {
+		return nil, err
+	}
+
+	result := make([]string, 0, len(affected))
+	for ip := range affected {
+		result = append(result, ip)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func listScopeIPsTx(tx *sql.Tx, scope string) ([]string, error) {
+	rows, err := tx.Query(`SELECT ip FROM host_inventory_scopes WHERE scope = ?`, scope)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ips := make([]string, 0)
+	for rows.Next() {
+		var ip string
+		if err := rows.Scan(&ip); err != nil {
+			return nil, err
+		}
+		ips = append(ips, ip)
+	}
+	return ips, rows.Err()
+}
+
+func normalizedHostIPs(scope string, aliveIPs []string) []string {
+	seen := make(map[string]struct{}, len(aliveIPs))
+	uniqueIPs := make([]string, 0, len(aliveIPs))
+	for _, ip := range aliveIPs {
+		member := model.HostScopeMembership{Scope: scope, IP: strings.TrimSpace(ip)}
+		if !member.Valid() {
+			continue
+		}
+		if _, ok := seen[member.IP]; ok {
+			continue
+		}
+		seen[member.IP] = struct{}{}
+		uniqueIPs = append(uniqueIPs, member.IP)
+	}
+	sort.Strings(uniqueIPs)
+	return uniqueIPs
+}
+
+func refreshHostInventoryAggregateTx(tx *sql.Tx, ip, fallbackSource string) error {
+	var firstSeen, lastSeen, lastChecked string
+	var isActive int
+	if err := tx.QueryRow(`
+		SELECT MIN(first_seen), MAX(last_seen), MAX(last_checked), MAX(is_active)
+		FROM host_inventory_scopes
+		WHERE ip = ?`, ip).Scan(&firstSeen, &lastSeen, &lastChecked, &isActive); err != nil {
 		return err
 	}
 
-	if err = tx.Commit(); err != nil {
-		return err
+	_, err := tx.Exec(`
+		INSERT INTO host_inventory (ip, source, first_seen, last_seen, last_scan, is_active)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(ip) DO UPDATE SET
+			first_seen = CASE
+				WHEN host_inventory.first_seen <= excluded.first_seen THEN host_inventory.first_seen
+				ELSE excluded.first_seen
+			END,
+			last_seen = excluded.last_seen,
+			last_scan = excluded.last_scan,
+			is_active = excluded.is_active`,
+		ip,
+		fallbackSource,
+		firstSeen,
+		lastSeen,
+		lastChecked,
+		isActive,
+	)
+	return err
+}
+
+type HostScopeMembershipQuery struct {
+	Scope    string
+	IP       string
+	IsActive *bool
+}
+
+func ListHostScopeMemberships(db *sql.DB, query HostScopeMembershipQuery) ([]model.HostScopeMembership, error) {
+	clauses := make([]string, 0, 3)
+	args := make([]interface{}, 0, 3)
+	if scope := strings.TrimSpace(query.Scope); scope != "" {
+		clauses = append(clauses, "scope = ?")
+		args = append(args, scope)
 	}
-	return nil
+	if ip := strings.TrimSpace(query.IP); ip != "" {
+		clauses = append(clauses, "ip = ?")
+		args = append(args, ip)
+	}
+	if query.IsActive != nil {
+		clauses = append(clauses, "is_active = ?")
+		args = append(args, *query.IsActive)
+	}
+
+	statement := `
+		SELECT scope, ip, first_seen, last_seen, last_checked, is_active
+		FROM host_inventory_scopes`
+	if len(clauses) > 0 {
+		statement += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	statement += " ORDER BY scope ASC, ip ASC"
+
+	rows, err := db.Query(statement, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	memberships := make([]model.HostScopeMembership, 0)
+	for rows.Next() {
+		var membership model.HostScopeMembership
+		if err := rows.Scan(
+			&membership.Scope,
+			&membership.IP,
+			&membership.FirstSeen,
+			&membership.LastSeen,
+			&membership.LastChecked,
+			&membership.IsActive,
+		); err != nil {
+			return nil, err
+		}
+		memberships = append(memberships, membership)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return memberships, nil
 }
 
 type HostInventoryQuery struct {
+	Scope    string
 	Source   string
 	IsActive *bool
 }
@@ -1091,12 +1846,21 @@ func ListHostInventory(db *sql.DB, query HostInventoryQuery) ([]model.HostInvent
 	clauses := make([]string, 0, 2)
 	args := make([]interface{}, 0, 2)
 
-	if source := strings.TrimSpace(query.Source); source != "" {
-		clauses = append(clauses, "source = ?")
-		args = append(args, source)
+	scope := strings.TrimSpace(query.Scope)
+	if scope == "" {
+		// source remains a one-version compatibility alias for scope.
+		scope = strings.TrimSpace(query.Source)
+	}
+	if scope != "" {
+		clauses = append(clauses, `EXISTS (
+			SELECT 1
+			FROM host_inventory_scopes AS scope_filter
+			WHERE scope_filter.ip = host_inventory.ip AND scope_filter.scope = ?
+		)`)
+		args = append(args, scope)
 	}
 	if query.IsActive != nil {
-		clauses = append(clauses, "is_active = ?")
+		clauses = append(clauses, "host_inventory.is_active = ?")
 		if *query.IsActive {
 			args = append(args, 1)
 		} else {
@@ -1105,12 +1869,22 @@ func ListHostInventory(db *sql.DB, query HostInventoryQuery) ([]model.HostInvent
 	}
 
 	statement := `
-		SELECT id, ip, source, first_seen, last_seen, last_scan, is_active
-		FROM host_inventory`
+		SELECT host_inventory.id,
+			host_inventory.ip,
+			host_inventory.source,
+			host_inventory.first_seen,
+			host_inventory.last_seen,
+			host_inventory.last_scan,
+			host_inventory.is_active,
+			COUNT(scope_members.scope) AS scope_count
+		FROM host_inventory
+		LEFT JOIN host_inventory_scopes AS scope_members ON scope_members.ip = host_inventory.ip`
 	if len(clauses) > 0 {
 		statement += " WHERE " + strings.Join(clauses, " AND ")
 	}
-	statement += " ORDER BY ip ASC"
+	statement += `
+		GROUP BY host_inventory.id
+		ORDER BY host_inventory.ip ASC`
 
 	rows, err := db.Query(statement, args...)
 	if err != nil {
@@ -1121,19 +1895,21 @@ func ListHostInventory(db *sql.DB, query HostInventoryQuery) ([]model.HostInvent
 	hosts := make([]model.HostInventory, 0)
 	for rows.Next() {
 		var host model.HostInventory
-		var lastScan sql.NullString
+		var source, lastScan sql.NullString
 		var isActive int
 		if err := rows.Scan(
 			&host.ID,
 			&host.IP,
-			&host.Source,
+			&source,
 			&host.FirstSeen,
 			&host.LastSeen,
 			&lastScan,
 			&isActive,
+			&host.ScopeCount,
 		); err != nil {
 			return nil, err
 		}
+		host.Source = source.String
 		host.LastScan = lastScan.String
 		host.IsActive = isActive != 0
 		hosts = append(hosts, host)
@@ -1152,25 +1928,40 @@ func GetAssetDetail(db *sql.DB, ip string) (model.AssetDetail, error) {
 	}
 
 	var detail model.AssetDetail
-	var lastScan sql.NullString
+	var source, lastScan sql.NullString
 	var isActive int
 	err := db.QueryRow(`
-		SELECT id, ip, source, first_seen, last_seen, last_scan, is_active
+		SELECT host_inventory.id,
+			host_inventory.ip,
+			host_inventory.source,
+			host_inventory.first_seen,
+			host_inventory.last_seen,
+			host_inventory.last_scan,
+			host_inventory.is_active,
+			COUNT(scope_members.scope) AS scope_count
 		FROM host_inventory
-		WHERE ip = ?`, ip).Scan(
+		LEFT JOIN host_inventory_scopes AS scope_members ON scope_members.ip = host_inventory.ip
+		WHERE host_inventory.ip = ?
+		GROUP BY host_inventory.id`, ip).Scan(
 		&detail.Host.ID,
 		&detail.Host.IP,
-		&detail.Host.Source,
+		&source,
 		&detail.Host.FirstSeen,
 		&detail.Host.LastSeen,
 		&lastScan,
 		&isActive,
+		&detail.Host.ScopeCount,
 	)
 	if err != nil {
 		return model.AssetDetail{}, err
 	}
+	detail.Host.Source = source.String
 	detail.Host.LastScan = lastScan.String
 	detail.Host.IsActive = isActive != 0
+	detail.Scopes, err = ListHostScopeMemberships(db, HostScopeMembershipQuery{IP: ip})
+	if err != nil {
+		return model.AssetDetail{}, err
+	}
 
 	rows, err := db.Query(`
 		SELECT port, service_type, scan_time

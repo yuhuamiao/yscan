@@ -1,0 +1,56 @@
+# Audited local snapshot derived from the exact FingerprintHub files listed in
+# ../SOURCES.md. The YAML documents below are preserved as source rules and are
+# consumed locally only; no runtime code downloads the upstream repository.
+---
+id: thinkphp
+info:
+  name: thinkphp
+  author: cn-kali-team
+  tags: detect,tech,thinkphp
+  severity: info
+  metadata:
+    product: thinkphp
+    vendor: thinkphp
+    verified: true
+http:
+- method: GET
+  path:
+  - '{{BaseURL}}/'
+  matchers:
+  - type: favicon
+    hash:
+    - f49c4a4bde1eec6c0b80c2277c76e3db
+  - type: word
+    words:
+    - href="http://www.thinkphp.cn">thinkphp</a>
+    - thinkphp_show_page_trace
+    case-insensitive: true
+  - type: word
+    words:
+    - 'x-powered-by: thinkphp'
+    part: header
+    case-insensitive: true
+---
+id: redis
+info:
+  name: Redis key-value store
+  author: nmap,cn-kali-team
+  tags: detect,tech,redis,service
+  severity: info
+  metadata:
+    product: redis
+    rarity: 8
+    vendor: redislabs
+    verified: true
+tcp:
+- name: redis-server
+  inputs:
+  - data: '*1\r\n$4\r\ninfo\r\n'
+  host:
+  - '{{Hostname}}'
+  port: 6379,6380,16379
+  extractors:
+  - name: redis
+    type: regex
+    regex:
+    - ^-ERR operation not permitted\r\n

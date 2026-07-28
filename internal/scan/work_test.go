@@ -1,6 +1,8 @@
 package scan
 
 import (
+	"context"
+	"errors"
 	"net"
 	"strconv"
 	"testing"
@@ -25,7 +27,10 @@ func TestScanPortsFindsSpecifiedOpenPort(t *testing.T) {
 	}()
 
 	port := listener.Addr().(*net.TCPAddr).Port
-	results := ScanPorts("127.0.0.1", "tcp", []int{0, -1, port, port, 65536})
+	results, err := ScanPorts(context.Background(), "127.0.0.1", "tcp", []int{0, -1, port, port, 65536})
+	if err != nil {
+		t.Fatalf("scan ports: %v", err)
+	}
 	if len(results) != 1 {
 		t.Fatalf("open results = %d, want 1", len(results))
 	}
@@ -33,6 +38,19 @@ func TestScanPortsFindsSpecifiedOpenPort(t *testing.T) {
 		t.Fatalf("address = %s", results[0].Address)
 	}
 	<-accepted
+}
+
+func TestScanPortsReturnsCanceledContextWithoutStartingProbes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	results, err := ScanPorts(ctx, "127.0.0.1", "tcp", []int{1, 2, 3})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("results = %v, want no probes", results)
+	}
 }
 
 func TestInternalBaselinePortsCoverInternalServices(t *testing.T) {

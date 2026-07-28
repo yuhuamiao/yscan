@@ -1,6 +1,7 @@
 package scan
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"runtime"
@@ -28,36 +29,76 @@ func InternalBaselinePorts() []int {
 	return append([]int(nil), internalBaselinePorts...)
 }
 
-func probePort(ip string, network string, port int, timeout time.Duration) model.ScanResult {
+func probePort(ctx context.Context, ip string, network string, port int, timeout time.Duration) model.ScanResult {
 	result := model.ScanResult{}
 	result.Address = net.JoinHostPort(ip, strconv.Itoa(port))
+	if err := ctx.Err(); err != nil {
+		result.Err = err
+		result.ErrType = assist.ErrType(model.ScanResult{Err: err})
+		return result
+	}
 
-	conn, err := net.DialTimeout(network, result.Address, timeout)
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, network, result.Address)
 	if err != nil {
 		result.Open = false
 		result.Err = err
 		result.ErrType = assist.ErrType(model.ScanResult{Err: err})
 	} else {
-		result.Open = true
+		defer conn.Close()
+		readDone := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = conn.Close()
+			case <-readDone:
+			}
+		}()
+
 		result.Banner = identify.ReadBanner(conn)
+		close(readDone)
+		if err := ctx.Err(); err != nil {
+			result.Err = err
+			result.ErrType = assist.ErrType(model.ScanResult{Err: err})
+			return result
+		}
+
+		result.Open = true
 		result.Service = identify.IdentifyService(result.Banner, port)
 		fp := identify.IdentifyFingerprint(result.Banner, port)
 		result.Product = fp.Product
 		result.FingerprintSource = fp.Source
-		conn.Close()
 	}
 	return result
 }
 
-func ScanWorker(id int, ip string, scanner <-chan model.Scanner, results chan<- model.ScanResult, timeout time.Duration) {
-	for scan := range scanner {
-		result := probePort(ip, scan.Network, scan.Port, timeout)
-		results <- result
+func ScanWorker(ctx context.Context, id int, ip string, scanner <-chan model.Scanner, results chan<- model.ScanResult, timeout time.Duration) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task, ok := <-scanner:
+			if !ok {
+				return
+			}
+			result := probePort(ctx, ip, task.Network, task.Port, timeout)
+			select {
+			case results <- result:
+			case <-ctx.Done():
+				return
+			}
+		}
 	}
 }
 
 // ScanPorts concurrently scans the supplied TCP or UDP port list on one host.
-func ScanPorts(ip, network string, ports []int) []model.ScanResult {
+func ScanPorts(ctx context.Context, ip, network string, ports []int) ([]model.ScanResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	var openPorts []model.ScanResult
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -65,13 +106,20 @@ func ScanPorts(ip, network string, ports []int) []model.ScanResult {
 	concurrentLimit := make(chan struct{}, runtime.NumCPU()*10)
 
 	for _, port := range normalizePorts(ports) {
+		if err := ctx.Err(); err != nil {
+			break
+		}
 		wg.Add(1)
 		go func(port int) {
 			defer wg.Done()
-			concurrentLimit <- struct{}{}
+			select {
+			case concurrentLimit <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-concurrentLimit }()
 
-			result := probePort(ip, network, port, 2*time.Second)
+			result := probePort(ctx, ip, network, port, 2*time.Second)
 			if result.Open {
 				mu.Lock()
 				openPorts = append(openPorts, result)
@@ -80,6 +128,14 @@ func ScanPorts(ip, network string, ports []int) []model.ScanResult {
 		}(port)
 	}
 	wg.Wait()
+	sortOpenPorts(openPorts)
+	if err := ctx.Err(); err != nil {
+		return openPorts, err
+	}
+	return openPorts, nil
+}
+
+func sortOpenPorts(openPorts []model.ScanResult) {
 	sort.Slice(openPorts, func(i, j int) bool {
 		_, left, _ := net.SplitHostPort(openPorts[i].Address)
 		_, right, _ := net.SplitHostPort(openPorts[j].Address)
@@ -87,21 +143,26 @@ func ScanPorts(ip, network string, ports []int) []model.ScanResult {
 		rightPort, _ := strconv.Atoi(right)
 		return leftPort < rightPort
 	})
-	return openPorts
 }
 
-func scanImportantPorts(ip, network string) []model.ScanResult {
-	openPorts := ScanPorts(ip, network, InternalBaselinePorts())
+func scanImportantPorts(ctx context.Context, ip, network string) ([]model.ScanResult, error) {
+	openPorts, err := ScanPorts(ctx, ip, network, InternalBaselinePorts())
+	if err != nil {
+		return openPorts, err
+	}
 	for _, result := range openPorts {
 		fmt.Printf("[+] 重要端口 %s 开放 (%s)\n", result.Address, result.Service)
 	}
-	return openPorts
+	return openPorts, nil
 }
 
-func RunQuick(ip string, network string) []model.ScanResult {
-	openPorts := ScanPorts(ip, network, InternalBaselinePorts())
+func RunQuick(ctx context.Context, ip, network string) ([]model.ScanResult, error) {
+	openPorts, err := ScanPorts(ctx, ip, network, InternalBaselinePorts())
+	if err != nil {
+		return openPorts, err
+	}
 	printOpenPorts(openPorts)
-	return openPorts
+	return openPorts, nil
 }
 
 func normalizePorts(ports []int) []int {
@@ -120,8 +181,11 @@ func normalizePorts(ports []int) []int {
 	return uniquePorts
 }
 
-func Run(ip string, network string) []model.ScanResult {
-	important := scanImportantPorts(ip, network)
+func Run(ctx context.Context, ip, network string) ([]model.ScanResult, error) {
+	important, err := scanImportantPorts(ctx, ip, network)
+	if err != nil {
+		return important, err
+	}
 
 	baselinePorts := InternalBaselinePorts()
 	skipPorts := make(map[int]bool, len(baselinePorts))
@@ -149,17 +213,21 @@ func Run(ip string, network string) []model.ScanResult {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			ScanWorker(id, ip, tasks, results, 2*time.Second)
+			ScanWorker(ctx, id, ip, tasks, results, 2*time.Second)
 		}(i)
 	}
 
 	go func() { //添加工作
+		defer close(tasks)
 		for i := 1; i < 65536; i++ {
 			if !skipPorts[i] { //跳过重要端口
-				tasks <- model.Scanner{Network: network, IP: ip, Port: i, Conn: nil}
+				select {
+				case tasks <- model.Scanner{Network: network, IP: ip, Port: i, Conn: nil}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
-		close(tasks)
 	}()
 
 	go func() { //等待所有任务结束后关闭 worker 池
@@ -184,9 +252,12 @@ func Run(ip string, network string) []model.ScanResult {
 	}
 
 	openPorts = append(openPorts, important...)
+	if err := ctx.Err(); err != nil {
+		return openPorts, err
+	}
 	fmt.Println()
 	printOpenPorts(openPorts)
-	return openPorts
+	return openPorts, nil
 }
 
 func printProgress(current, total int, start time.Time) {

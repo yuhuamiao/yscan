@@ -2,6 +2,7 @@ package vuln
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,7 +20,10 @@ import (
 	"time"
 
 	"golandproject/yscan/internal/model"
+	"golandproject/yscan/internal/planner"
 )
+
+const maxNucleiStderrBytes = 32 * 1024
 
 type nucleiJSONLine struct {
 	TemplateID string `json:"template-id"`
@@ -35,6 +39,12 @@ type nucleiJSONLine struct {
 	} `json:"info"`
 }
 
+var (
+	detectNucleiBinary     = DetectNucleiBinary
+	resolveNucleiTemplates = ResolveNucleiTemplatesPath
+	newNucleiCommand       = exec.CommandContext
+)
+
 func RunNucleiForOpenPorts(ctx context.Context, ip string, openPorts []model.ScanResult, templatesPath string) ([]model.NucleiFinding, error) {
 	return RunNucleiForOpenPortsWithTags(ctx, ip, openPorts, templatesPath, nil)
 }
@@ -42,12 +52,22 @@ func RunNucleiForOpenPorts(ctx context.Context, ip string, openPorts []model.Sca
 // RunNucleiForOpenPortsWithTags restricts Nuclei to a set of template tags
 // when tags are supplied. An empty tag set keeps the legacy full-template mode.
 func RunNucleiForOpenPortsWithTags(ctx context.Context, ip string, openPorts []model.ScanResult, templatesPath string, tags []string) ([]model.NucleiFinding, error) {
-	nucleiPath, err := DetectNucleiBinary()
+	return runNucleiForOpenPorts(ctx, ip, openPorts, templatesPath, tags, nil)
+}
+
+// RunNucleiForOpenPortsWithTemplatePaths runs only reviewed relative template
+// paths under the configured root.
+func RunNucleiForOpenPortsWithTemplatePaths(ctx context.Context, ip string, openPorts []model.ScanResult, templatesPath string, paths []string) ([]model.NucleiFinding, error) {
+	return runNucleiForOpenPorts(ctx, ip, openPorts, templatesPath, nil, paths)
+}
+
+func runNucleiForOpenPorts(ctx context.Context, ip string, openPorts []model.ScanResult, templatesPath string, tags, paths []string) ([]model.NucleiFinding, error) {
+	nucleiPath, err := detectNucleiBinary()
 	if err != nil {
 		return nil, err
 	}
 
-	resolvedTemplates, err := ResolveNucleiTemplatesPath(templatesPath)
+	resolvedTemplates, err := resolveNucleiTemplates(templatesPath)
 	if err != nil {
 		return nil, err
 	}
@@ -75,8 +95,14 @@ func RunNucleiForOpenPortsWithTags(ctx context.Context, ip string, openPorts []m
 	}
 
 	args := buildNucleiArgs(tmp.Name(), resolvedTemplates, tags)
+	if len(paths) > 0 {
+		args = []string{"-jsonl", "-silent", "-l", tmp.Name(), "-exclude-tags", strings.Join(planner.DefaultExcludedTemplateTags(), ",")}
+		for _, path := range paths {
+			args = append(args, "-t", filepath.Join(resolvedTemplates, path))
+		}
+	}
 
-	cmd := exec.CommandContext(ctx, nucleiPath, args...)
+	cmd := newNucleiCommand(ctx, nucleiPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -87,11 +113,59 @@ func RunNucleiForOpenPortsWithTags(ctx context.Context, ip string, openPorts []m
 	}
 
 	if err := cmd.Start(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
 	}
 
-	var findings []model.NucleiFinding
-	scanner := bufio.NewScanner(stdout)
+	stdoutDone := make(chan nucleiStdoutResult, 1)
+	go func() {
+		findings, err := parseNucleiJSONL(stdout, ip)
+		stdoutDone <- nucleiStdoutResult{findings: findings, err: err}
+	}()
+
+	stderrOutput := &boundedOutput{limit: maxNucleiStderrBytes}
+	stderrDone := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(stderrOutput, stderr)
+		stderrDone <- err
+	}()
+
+	stdoutResult := <-stdoutDone
+	stderrErr := <-stderrDone
+	waitErr := cmd.Wait()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if stdoutResult.err != nil {
+		return nil, stdoutResult.err
+	}
+	if stderrErr != nil {
+		return nil, stderrErr
+	}
+	if waitErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		msg := strings.TrimSpace(stderrOutput.String())
+		if msg == "" {
+			msg = waitErr.Error()
+		}
+		return nil, fmt.Errorf("nuclei execution failed: %s", msg)
+	}
+
+	return stdoutResult.findings, nil
+}
+
+type nucleiStdoutResult struct {
+	findings []model.NucleiFinding
+	err      error
+}
+
+func parseNucleiJSONL(reader io.Reader, ip string) ([]model.NucleiFinding, error) {
+	findings := make([]model.NucleiFinding, 0)
+	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.TrimSpace(line) == "" {
@@ -130,25 +204,42 @@ func RunNucleiForOpenPortsWithTags(ctx context.Context, ip string, openPorts []m
 			Tags:        tags,
 		})
 	}
-
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-
-	stderrBytes, _ := io.ReadAll(io.LimitReader(stderr, 32768))
-	if err := cmd.Wait(); err != nil {
-		msg := strings.TrimSpace(string(stderrBytes))
-		if msg == "" {
-			msg = err.Error()
-		}
-		return nil, fmt.Errorf("nuclei execution failed: %s", msg)
-	}
-
 	return findings, nil
 }
 
+type boundedOutput struct {
+	buffer    bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (output *boundedOutput) Write(data []byte) (int, error) {
+	remaining := output.limit - output.buffer.Len()
+	if remaining <= 0 {
+		output.truncated = true
+		return len(data), nil
+	}
+	if len(data) > remaining {
+		_, _ = output.buffer.Write(data[:remaining])
+		output.truncated = true
+		return len(data), nil
+	}
+	_, _ = output.buffer.Write(data)
+	return len(data), nil
+}
+
+func (output *boundedOutput) String() string {
+	if !output.truncated {
+		return output.buffer.String()
+	}
+	return output.buffer.String() + "\n[stderr truncated]"
+}
+
 func buildNucleiArgs(targetFile, templatesPath string, tags []string) []string {
-	args := []string{"-jsonl", "-silent", "-l", targetFile}
+	args := []string{"-jsonl", "-silent", "-l", targetFile, "-exclude-tags", strings.Join(planner.DefaultExcludedTemplateTags(), ",")}
 	if templatesPath != "" {
 		args = append(args, "-t", templatesPath)
 	}

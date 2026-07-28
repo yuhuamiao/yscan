@@ -8,7 +8,7 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
-// Handler serves the lightweight CAASM console for its three page boundaries.
+// Handler serves the lightweight CAASM console page boundaries.
 func Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -16,7 +16,7 @@ func Handler() http.Handler {
 			return
 		}
 		switch r.URL.Path {
-		case "/", "/tasks", "/assets", "/reports":
+		case "/", "/tasks", "/executions", "/assets", "/reports":
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-store")
 			_, _ = w.Write(indexHTML)

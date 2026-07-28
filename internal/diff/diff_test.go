@@ -29,6 +29,26 @@ func TestCompareHosts(t *testing.T) {
 	}
 }
 
+func TestCompareScopeMembers(t *testing.T) {
+	before := []model.HostScopeMembership{
+		{Scope: "subnet:192.168.1.0/24", IP: "192.168.1.1", IsActive: true},
+		{Scope: "subnet:192.168.1.0/24", IP: "192.168.1.2", IsActive: true},
+	}
+	after := []model.HostScopeMembership{
+		{Scope: "subnet:192.168.1.0/24", IP: "192.168.1.1", IsActive: true},
+		{Scope: "subnet:192.168.1.0/24", IP: "192.168.1.2", IsActive: false},
+		{Scope: "subnet:192.168.1.0/24", IP: "192.168.1.3", IsActive: true},
+	}
+
+	changes := CompareScopeMembers(before, after)
+	if want := []string{"192.168.1.3"}; !reflect.DeepEqual(changes.NewHosts, want) {
+		t.Fatalf("new hosts = %v, want %v", changes.NewHosts, want)
+	}
+	if want := []string{"192.168.1.2"}; !reflect.DeepEqual(changes.InactiveHosts, want) {
+		t.Fatalf("inactive hosts = %v, want %v", changes.InactiveHosts, want)
+	}
+}
+
 func TestComparePorts(t *testing.T) {
 	changes := ComparePorts(
 		map[string][]int{"192.168.1.1": {80, 443}, "192.168.1.2": {22}},

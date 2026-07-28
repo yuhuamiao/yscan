@@ -30,6 +30,21 @@ var serviceAliases = map[string]string{
 	"k8s":          "kubernetes-api",
 }
 
+var excludedTemplateTagSet = func() map[string]struct{} {
+	tags := DefaultTemplateSafetyPolicy().ExcludedTags
+	set := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		set[tag] = struct{}{}
+	}
+	return set
+}()
+
+// DefaultExcludedTemplateTags returns the Nuclei tags that are excluded from
+// every validation run unless an explicit future policy changes this default.
+func DefaultExcludedTemplateTags() []string {
+	return DefaultTemplateSafetyPolicy().ExcludedTags
+}
+
 // TemplateGroupsForService returns a copy of the static Nuclei template tags
 // suitable for a recognized service.
 func TemplateGroupsForService(service string) []string {
@@ -39,7 +54,13 @@ func TemplateGroupsForService(service string) []string {
 	}
 
 	groups := serviceTemplateGroups[service]
-	return append([]string(nil), groups...)
+	safeGroups := make([]string, 0, len(groups))
+	for _, group := range groups {
+		if _, excluded := excludedTemplateTagSet[group]; !excluded {
+			safeGroups = append(safeGroups, group)
+		}
+	}
+	return safeGroups
 }
 
 // TemplateGroupsForScanResults merges template tags for the services found on

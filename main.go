@@ -20,12 +20,21 @@ import (
 	"golandproject/yscan/internal/pipeline"
 	"golandproject/yscan/internal/report"
 	"golandproject/yscan/internal/scan"
+	"golandproject/yscan/internal/schedule"
 	"golandproject/yscan/internal/storage"
 	"golandproject/yscan/internal/vuln"
 	"golandproject/yscan/internal/workflow"
 )
 
 var errTaskCanceled = errors.New("task canceled")
+
+var (
+	executeTaskForTaskExecution = executeTask
+	generateTaskReport          = report.GenerateTaskReport
+	runTargetTaskRun            = workflow.RunTargetTaskRun
+	runSubnetTaskRun            = workflow.RunSubnetTaskRun
+	generateScanTaskRunReport   = report.GenerateScanTaskRunReport
+)
 
 type cliConfig struct {
 	Templates      string
@@ -55,41 +64,51 @@ func runTaskAsync(db *sql.DB, baseTask model.Scanner, taskType, target string) (
 }
 
 func processTaskExecution(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, target string) {
-	err := executeTask(db, taskID, baseTask, taskType, target)
+	taskCtx, stopTaskContext := taskExecutionContext(db, taskID)
+	defer stopTaskContext()
+
+	executionErr := executeTaskForTaskExecution(taskCtx, db, taskID, baseTask, taskType, target)
+	finalStatus, err := storage.FinalizeTask(db, taskID, executionErr)
 	if err != nil {
-		if errors.Is(err, errTaskCanceled) {
-			if upErr := storage.UpdateTaskStatus(db, taskID, model.TaskStatusCanceled, ""); upErr != nil {
-				log.Printf("任务取消状态更新失败: %v", upErr)
-			}
-			fmt.Printf("Task %d canceled\n", taskID)
+		log.Printf("任务最终状态更新失败: %v", err)
+		return
+	}
+
+	reportPath, reportErr := generateTaskReport(db, taskID, report.DefaultDirectory)
+	if reportErr != nil {
+		if err := storage.UpdateTaskReportError(db, taskID, reportErr.Error()); err != nil {
+			log.Printf("任务报告错误写入失败: %v", err)
+		}
+	} else if err := storage.UpdateTaskReportError(db, taskID, ""); err != nil {
+		log.Printf("任务报告错误清理失败: %v", err)
+	}
+
+	switch finalStatus {
+	case model.TaskStatusCanceled:
+		if reportErr != nil {
+			fmt.Printf("Task %d canceled (report failed: %v)\n", taskID, reportErr)
 			return
 		}
-
-		if upErr := storage.UpdateTaskStatus(db, taskID, model.TaskStatusFailed, err.Error()); upErr != nil {
-			log.Printf("任务失败状态更新失败: %v", upErr)
+		fmt.Printf("Task %d canceled (report: %s)\n", taskID, reportPath)
+	case model.TaskStatusFailed:
+		if reportErr != nil {
+			fmt.Printf("Task %d failed: %v (report failed: %v)\n", taskID, executionErr, reportErr)
+			return
 		}
-		fmt.Printf("Task %d failed: %v\n", taskID, err)
-		return
-	}
-
-	reportPath, err := report.GenerateTaskReport(db, taskID, report.DefaultDirectory)
-	if err != nil {
-		if upErr := storage.UpdateTaskStatus(db, taskID, model.TaskStatusFailed, "generate report: "+err.Error()); upErr != nil {
-			log.Printf("任务报告失败状态更新失败: %v", upErr)
+		fmt.Printf("Task %d failed: %v (report: %s)\n", taskID, executionErr, reportPath)
+	case model.TaskStatusSuccess:
+		if reportErr != nil {
+			fmt.Printf("Task %d finished: success (report failed: %v)\n", taskID, reportErr)
+			return
 		}
-		fmt.Printf("Task %d failed to generate report: %v\n", taskID, err)
-		return
+		fmt.Printf("Task %d finished: success (report: %s)\n", taskID, reportPath)
 	}
-
-	if err := storage.UpdateTaskStatus(db, taskID, model.TaskStatusSuccess, ""); err != nil {
-		log.Printf("任务完成状态更新失败: %v", err)
-		return
-	}
-
-	fmt.Printf("Task %d finished: success (report: %s)\n", taskID, reportPath)
 }
 
-func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, target string) error {
+func executeTask(ctx context.Context, db *sql.DB, taskID int64, baseTask model.Scanner, taskType, target string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := storage.UpdateTaskStatus(db, taskID, model.TaskStatusRunning, ""); err != nil {
 		return err
 	}
@@ -103,7 +122,7 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 	case model.TaskTypeScanIP:
 		_ = storage.UpdateTaskProgress(db, taskID, 20)
 		baseTask.IP = target
-		if _, err := portScan(baseTask, db); err != nil {
+		if _, err := portScan(ctx, baseTask, db); err != nil {
 			return err
 		}
 		_ = storage.UpdateTaskProgress(db, taskID, 100)
@@ -112,7 +131,7 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 	case model.TaskTypeScanIPVuln:
 		_ = storage.UpdateTaskProgress(db, taskID, 20)
 		baseTask.IP = target
-		openPorts, err := portScan(baseTask, db)
+		openPorts, err := portScan(ctx, baseTask, db)
 		if err != nil {
 			return err
 		}
@@ -122,7 +141,7 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 			return errTaskCanceled
 		}
 
-		scanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		scanCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		findings, err := vuln.RunNucleiForOpenPorts(scanCtx, baseTask.IP, openPorts, baseTask.NucleiTemplates)
 		cancel()
 		if err != nil {
@@ -135,10 +154,10 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 		return nil
 
 	case model.TaskTypeScanSubnet:
-		return runSubnetTask(db, taskID, baseTask, target, false)
+		return runSubnetTask(ctx, db, taskID, baseTask, target, false)
 
 	case model.TaskTypeScanSubnetVuln:
-		return runSubnetTask(db, taskID, baseTask, target, true)
+		return runSubnetTask(ctx, db, taskID, baseTask, target, true)
 
 	case model.TaskTypeVulnIP:
 		_ = storage.UpdateTaskProgress(db, taskID, 20)
@@ -153,7 +172,7 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 			return errTaskCanceled
 		}
 
-		scanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		scanCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		findings, err := vuln.RunNucleiForOpenPorts(scanCtx, ip, openPorts, baseTask.NucleiTemplates)
 		cancel()
 		if err != nil {
@@ -166,6 +185,9 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 		return nil
 
 	case model.TaskTypeCollectDomain:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		_ = storage.UpdateTaskProgress(db, taskID, 20)
 		_ = pipeline.CollectSubdomains(db, target, pipeline.DomainCollectionOptions{
 			ResolvePolicy: domain.ResolvePolicy{
@@ -173,10 +195,16 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 				DenyCIDRs: baseTask.DNSDenyCIDRs,
 			},
 		})
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		_ = storage.UpdateTaskProgress(db, taskID, 100)
 		return nil
 
 	case model.TaskTypeCollectAndScan:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		_ = storage.UpdateTaskProgress(db, taskID, 20)
 		ips := pipeline.CollectSubdomains(db, target, pipeline.DomainCollectionOptions{
 			ResolvePolicy: domain.ResolvePolicy{
@@ -184,22 +212,21 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 				DenyCIDRs: baseTask.DNSDenyCIDRs,
 			},
 		})
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if len(ips) == 0 {
 			_ = storage.UpdateTaskProgress(db, taskID, 100)
 			return nil
 		}
 
 		for i, ip := range ips {
-			canceled, err := storage.IsTaskCanceled(db, taskID)
-			if err != nil {
+			if err := ctx.Err(); err != nil {
 				return err
-			}
-			if canceled {
-				return errTaskCanceled
 			}
 
 			baseTask.IP = ip
-			if _, err := domainScan(baseTask, db); err != nil {
+			if _, err := domainScan(ctx, baseTask, db); err != nil {
 				return err
 			}
 
@@ -209,6 +236,9 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 		return nil
 
 	case model.TaskTypeCollectScanVuln:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		_ = storage.UpdateTaskProgress(db, taskID, 20)
 		ips := pipeline.CollectSubdomains(db, target, pipeline.DomainCollectionOptions{
 			ResolvePolicy: domain.ResolvePolicy{
@@ -216,27 +246,26 @@ func executeTask(db *sql.DB, taskID int64, baseTask model.Scanner, taskType, tar
 				DenyCIDRs: baseTask.DNSDenyCIDRs,
 			},
 		})
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if len(ips) == 0 {
 			_ = storage.UpdateTaskProgress(db, taskID, 100)
 			return nil
 		}
 
 		for i, ip := range ips {
-			canceled, err := storage.IsTaskCanceled(db, taskID)
-			if err != nil {
+			if err := ctx.Err(); err != nil {
 				return err
-			}
-			if canceled {
-				return errTaskCanceled
 			}
 
 			baseTask.IP = ip
-			openPorts, err := domainScan(baseTask, db)
+			openPorts, err := domainScan(ctx, baseTask, db)
 			if err != nil {
 				return err
 			}
 
-			scanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			scanCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 			findings, err := vuln.RunNucleiForOpenPorts(scanCtx, baseTask.IP, openPorts, baseTask.NucleiTemplates)
 			cancel()
 			if err != nil {
@@ -444,11 +473,14 @@ func buildOpenPortResults(ip string, ports []int) []model.ScanResult {
 	return results
 }
 
-func domainScan(task model.Scanner, db *sql.DB) ([]model.ScanResult, error) {
+func domainScan(ctx context.Context, task model.Scanner, db *sql.DB) ([]model.ScanResult, error) {
 	fmt.Printf("\n=== 开始域名扫描 %s ===\n", task.IP)
 
-	if assist.IsHostAlive(task.IP) {
-		openPorts := scan.Run(task.IP, task.Network)
+	if assist.IsHostAliveContext(ctx, task.IP) {
+		openPorts, err := scan.Run(ctx, task.IP, task.Network)
+		if err != nil {
+			return openPorts, err
+		}
 		if err := storage.SaveDomainScanResult(db, task.IP, openPorts); err != nil {
 			log.Printf("保存扫描结果失败: %v", err)
 			return openPorts, err
@@ -458,8 +490,11 @@ func domainScan(task model.Scanner, db *sql.DB) ([]model.ScanResult, error) {
 	}
 
 	fmt.Println("Can't ping")
-	if assist.IsHostAliveTCP(task.IP) {
-		openPorts := scan.Run(task.IP, task.Network)
+	if assist.IsHostAliveTCPContext(ctx, task.IP) {
+		openPorts, err := scan.Run(ctx, task.IP, task.Network)
+		if err != nil {
+			return openPorts, err
+		}
 		if err := storage.SaveDomainScanResult(db, task.IP, openPorts); err != nil {
 			log.Printf("保存扫描结果失败: %v", err)
 			return openPorts, err
@@ -470,18 +505,27 @@ func domainScan(task model.Scanner, db *sql.DB) ([]model.ScanResult, error) {
 
 	log.Print("没有进入TCP连接")
 	fmt.Printf("%s is not alive\n", task.IP)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return nil, fmt.Errorf("%s is not alive", task.IP)
 }
 
-func portScan(task model.Scanner, db *sql.DB) ([]model.ScanResult, error) {
-	if assist.IsHostAlive(task.IP) || assist.IsHostAliveTCP(task.IP) {
-		openPorts := scan.Run(task.IP, task.Network)
+func portScan(ctx context.Context, task model.Scanner, db *sql.DB) ([]model.ScanResult, error) {
+	if assist.IsHostAliveContext(ctx, task.IP) || assist.IsHostAliveTCPContext(ctx, task.IP) {
+		openPorts, err := scan.Run(ctx, task.IP, task.Network)
+		if err != nil {
+			return openPorts, err
+		}
 		persistOpenPorts(db, openPorts)
 		return openPorts, nil
 	}
 
 	log.Print("没有进入TCP连接")
 	fmt.Printf("%s is not alive\n", task.IP)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return nil, fmt.Errorf("%s is not alive", task.IP)
 }
 
@@ -498,8 +542,8 @@ func persistOpenPorts(db *sql.DB, openPorts []model.ScanResult) {
 	}
 }
 
-func runSubnetTask(db *sql.DB, taskID int64, task model.Scanner, cidr string, withVuln bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+func runSubnetTask(ctx context.Context, db *sql.DB, taskID int64, task model.Scanner, cidr string, withVuln bool) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 
 	summary, err := workflow.RunSubnet(ctx, workflow.SubnetRunOptions{
@@ -530,6 +574,98 @@ func runSubnetTask(db *sql.DB, taskID int64, task model.Scanner, cidr string, wi
 		len(summary.PortChanges.Closed),
 	)
 	return nil
+}
+
+type logicalScanTaskRunExecutor struct {
+	db       *sql.DB
+	baseTask model.Scanner
+}
+
+func (executor logicalScanTaskRunExecutor) Execute(ctx context.Context, run model.ScanTaskRun) (model.ScanTaskRunSnapshot, error) {
+	switch run.ScanType {
+	case model.ScanTypeIP:
+		return runTargetTaskRun(ctx, workflow.TargetTaskRunOptions{
+			DB:      executor.db,
+			Run:     run,
+			Network: executor.baseTask.Network,
+		})
+	case model.ScanTypeSubnet:
+		return runSubnetTaskRun(ctx, workflow.SubnetTaskRunOptions{
+			DB:      executor.db,
+			Run:     run,
+			Network: executor.baseTask.Network,
+		})
+	default:
+		return model.ScanTaskRunSnapshot{}, fmt.Errorf("unsupported scan task run type: %s", run.ScanType)
+	}
+}
+
+func executeLogicalScanTaskRun(ctx context.Context, db *sql.DB, baseTask model.Scanner, run model.ScanTaskRun) error {
+	scanCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+
+	executor := schedule.NewExecutor(db, logicalScanTaskRunExecutor{db: db, baseTask: baseTask})
+	var executionErr error
+	if run.Status == model.ScanTaskRunStatusRunning {
+		executionErr = executor.ExecuteClaimedRun(scanCtx, run.ID)
+	} else {
+		executionErr = executor.ExecuteRun(scanCtx, run.ID)
+	}
+	completed, err := storage.GetScanTaskRun(db, run.ID)
+	if err != nil {
+		if executionErr != nil {
+			return fmt.Errorf("execute run: %w; read final run: %v", executionErr, err)
+		}
+		return err
+	}
+	if !isTerminalScanTaskRunStatus(completed.Status) {
+		return executionErr
+	}
+	if _, err := generateScanTaskRunReport(db, completed.ScanTaskID, completed.ID, report.DefaultDirectory); err != nil {
+		log.Printf("scan task run %d report failed: %v", completed.ID, err)
+		if persistErr := storage.UpdateScanTaskRunReportError(db, completed.ID, err.Error()); persistErr != nil {
+			log.Printf("scan task run %d report diagnostic persistence failed: %v", completed.ID, persistErr)
+		}
+	}
+	return executionErr
+}
+
+func isTerminalScanTaskRunStatus(status string) bool {
+	switch status {
+	case model.ScanTaskRunStatusSuccess, model.ScanTaskRunStatusFailed, model.ScanTaskRunStatusCanceled:
+		return true
+	default:
+		return false
+	}
+}
+
+func taskExecutionContext(db *sql.DB, taskID int64) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			canceled, err := storage.IsTaskCanceled(db, taskID)
+			if err == nil && canceled {
+				cancel()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+
+	return ctx, func() {
+		cancel()
+		<-stopped
+	}
 }
 
 func main() {
@@ -632,7 +768,7 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) {
 			log.Printf("取消任务失败: %v", err)
 			return
 		}
-		fmt.Printf("Task %d canceled\n", taskID)
+		fmt.Printf("Task %d cancellation requested\n", taskID)
 
 	case "status":
 		if len(args) < 2 {
@@ -651,11 +787,35 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) {
 		if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
 			addr = strings.TrimSpace(args[1])
 		}
-		if err := api.StartServer(db, addr, func(taskType, target string) (int64, error) {
+		schedulerContext, stopScheduler := context.WithCancel(context.Background())
+		defer stopScheduler()
+		runner := schedule.NewRunner(db, nil)
+		runner.OnClaim = func(ctx context.Context, run model.ScanTaskRun) {
+			if err := executeLogicalScanTaskRun(ctx, db, task, run); err != nil {
+				log.Printf("scheduled ScanTask run %d failed: %v", run.ID, err)
+			}
+		}
+		go func() {
+			if err := runner.Run(schedulerContext); err != nil {
+				log.Printf("schedule runner stopped: %v", err)
+			}
+		}()
+		service := schedule.NewTaskService(db, nil)
+		if err := api.StartServerWithScanTasks(db, addr, func(taskType, target string) (int64, error) {
 			return runTaskAsync(db, task, taskType, target)
+		}, service, func(ctx context.Context, run model.ScanTaskRun) {
+			if err := executeLogicalScanTaskRun(ctx, db, task, run); err != nil {
+				if errors.Is(err, schedule.ErrGlobalConcurrencyUnavailable) {
+					return
+				}
+				log.Printf("one-time ScanTask run %d failed: %v", run.ID, err)
+			}
 		}); err != nil {
 			log.Printf("API server stopped: %v", err)
 		}
+
+	case "schedule":
+		runScheduleCommand(args[1:], task, db)
 
 	case "findings":
 		if len(args) < 2 {
@@ -678,6 +838,22 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) {
 
 	default:
 		fmt.Println("please enter a true command.")
+	}
+}
+
+func runScheduleCommand(args []string, baseTask model.Scanner, db *sql.DB) {
+	if err := schedule.RunCLI(context.Background(), db, args, schedule.CLIConfig{
+		NucleiTemplates: baseTask.NucleiTemplates,
+		DNSResolveMode:  baseTask.DNSResolveMode,
+		DNSDenyCIDRs:    baseTask.DNSDenyCIDRs,
+	}, func(ctx context.Context, run model.ScanTaskRun) error {
+		if run.Config.VulnerabilityOn {
+			warnIfNucleiMissing()
+			warnIfNucleiTemplatesMissing(run.Config.NucleiTemplates)
+		}
+		return executeLogicalScanTaskRun(ctx, db, baseTask, run)
+	}, os.Stdout); err != nil {
+		log.Printf("schedule command failed: %v", err)
 	}
 }
 
@@ -779,7 +955,7 @@ func runInteractive(task model.Scanner, db *sql.DB) {
 			log.Printf("取消任务失败: %v", err)
 			return
 		}
-		fmt.Printf("Task %d canceled\n", taskID)
+		fmt.Printf("Task %d cancellation requested\n", taskID)
 		return
 	}
 

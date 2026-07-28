@@ -7,6 +7,8 @@ require (
 	github.com/gocolly/colly/v2 v2.3.0
 	github.com/mattn/go-sqlite3 v1.14.41
 	github.com/playwright-community/playwright-go v0.5700.1
+	github.com/robfig/cron/v3 v3.0.1
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
