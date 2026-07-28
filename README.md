@@ -4,7 +4,7 @@
 
 `yscan` 是一个以 Go 实现、面向企业内网的资产持续发现与风险验证工具。它以单机部署和 SQLite 状态模型为基础，把网段发现、端口与服务画像、增量变化跟踪、定向漏洞验证和轻 Web 控制台连接为一条可持续运行的闭环。
 
-> 当前 v1 聚焦经授权的企业内网环境。域名收集能力保留用于授权测试与资产核验，但本项目不提供互联网测绘、未授权扫描或重型安全运营平台能力。
+> 当前版本聚焦经授权的企业内网环境。域名收集能力保留用于授权测试与资产核验，但本项目不提供互联网测绘、未授权扫描或重型安全运营平台能力。
 
 ## 为什么是 yscan
 
@@ -23,13 +23,13 @@
 
 | 能力 | 当前实现 | 说明 |
 | --- | --- | --- |
-| 内网资产发现 | IPv4 CIDR 展开、ICMP/TCP 存活探测 | 网段任务有主机数量上限，并支持任务取消与进度更新 |
+| 内网资产发现 | IPv4 CIDR 展开、ICMP/TCP 存活探测 | 网段任务有主机数量上限，取消先进入 `cancel_requested`，执行器退出后再进入最终状态 |
 | 服务画像 | 内网基线端口、Banner 读取、基础规则匹配 | 覆盖 SMB、RDP、LDAP、WinRM、常见数据库、Docker、Kubernetes、Elasticsearch 等常见暴露面 |
-| 资产状态管理 | SQLite 主机与端口库存 | 记录 `first_seen`、`last_seen`、`is_active`，并生成主机/端口增量变化 |
-| 漏洞验证 | 本地 [Nuclei](https://github.com/projectdiscovery/nuclei) 调用与 JSONL 解析 | 使用本地 templates，网段任务按 v1 静态服务标签选择模板 tags |
+| 资产状态管理 | SQLite IP 聚合库存与范围主机/端口成员关系 | 记录全局和范围级 `first_seen`、`last_seen`、`is_active`，重叠 CIDR 的主机和端口变化互不覆盖 |
+| 漏洞验证 | 本地 [Nuclei](https://github.com/projectdiscovery/nuclei) 调用与 JSONL 解析 | 使用本地 templates，服务标签只缩小候选范围，默认排除 `intrusive`、`dos`、`auth` |
 | 域名资产收集 | crt.sh、搜索引擎、DNS 字典爆破、DNS 活性验证 | 支持 `internal`、`external`、`hybrid` DNS 策略，以及泛解析/CNAME 聚合干扰处理 |
-| 报告 | Markdown 任务报告 | 每个成功任务生成 `reports/task-<id>.md` |
-| 接口与控制台 | HTTP API + 轻 Web 控制台 | 支持任务创建、取消、资产详情、变化、漏洞和报告查看 |
+| 报告 | Markdown 运行报告 | 每轮 `ScanTaskRun` 终态后生成 `reports/scan-task-<taskId>-run-<runId>.md` |
+| 接口与控制台 | HTTP API + 轻 Web 控制台 | 支持逻辑任务、运行历史、变化、漏洞与运行级报告查看 |
 
 ## 架构
 
@@ -63,7 +63,7 @@ SQLite inventory -> change diff -> Markdown report
 | [`internal/scan`](internal/scan) | 并发端口扫描与内网快速画像 |
 | [`internal/identify`](internal/identify) | Banner 读取、基础服务与产品识别 |
 | [`internal/domain`](internal/domain) | crt.sh/搜索引擎/字典收集、DNS 策略和泛解析处理 |
-| [`internal/planner`](internal/planner) | 服务到 Nuclei 模板 tags 的 v1 定向规划 |
+| [`internal/planner`](internal/planner) | 服务到 Nuclei 模板 tags 的定向候选规划 |
 | [`internal/vuln`](internal/vuln) | Nuclei 二进制、模板目录发现和 JSONL 结果解析 |
 | [`internal/storage`](internal/storage) | SQLite 初始化、迁移、库存、任务、漏洞和变化持久化 |
 | [`internal/api`](internal/api) | HTTP API 与控制台路由挂载 |
@@ -109,6 +109,8 @@ go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 ```
 
 模板目录也可以通过 `NUCLEI_TEMPLATES` 指定。未传入 `--templates` 时，程序会依次探测环境变量、用户目录和当前目录下的常见 templates 路径。
+
+所有 Nuclei 调用默认传入 `-exclude-tags intrusive,dos,auth`。服务标签只用于缩小模板候选范围，不代表模板一定无副作用；生产环境仍应审查实际模板内容并先在受控资产上验证。
 
 ### 单目标扫描与直接验证
 
@@ -168,43 +170,56 @@ API 与 CLI 使用同一个 SQLite 数据库。启动 API 时也可以传入全�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/tasks` | 查询任务列表 |
-| `POST` | `/api/tasks` | 创建异步任务 |
-| `GET` | `/api/tasks/{id}` | 查询任务详情 |
-| `POST` | `/api/tasks/{id}/cancel` | 取消任务 |
-| `GET` | `/api/tasks/{id}/changes` | 查询主机和端口变化 |
-| `GET` | `/api/tasks/{id}/findings` | 查询漏洞结果 |
-| `GET` | `/api/tasks/{id}/report` | 读取 Markdown 报告 |
-| `GET` | `/api/assets?active=true` | 查询资产库存 |
-| `GET` | `/api/assets/{ip}` | 查询资产及端口详情 |
+| `GET` | `/api/scan-tasks` | 查询 v2 逻辑任务列表 |
+| `POST` | `/api/scan-tasks` | 创建一次性或定期逻辑任务 |
+| `GET` | `/api/scan-tasks/{taskId}` | 查询逻辑任务配置与状态 |
+| `PUT` | `/api/scan-tasks/{taskId}` | 更新后续运行的目标、计划和配置；已有运行保持原配置快照 |
+| `GET` | `/api/scan-tasks/{taskId}/runs` | 查询该逻辑任务的运行历史 |
+| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}` | 查询不可变运行快照元数据、状态与 `report_error` |
+| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/changes` | 查询本轮与同任务成功基线的变化 |
+| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/report` | 读取该运行的 Markdown 报告 |
+| `POST` | `/api/scan-tasks/{taskId}/runs/{runId}/cancel` | 请求取消当前运行；终态运行不可取消 |
+| `POST` | `/api/scan-tasks/{taskId}/pause` | 暂停逻辑任务，暂停后不再创建新运行 |
+| `POST` | `/api/scan-tasks/{taskId}/resume` | 恢复已暂停的任务 |
+| `POST` | `/api/scan-tasks/{taskId}/archive` | 归档逻辑任务，归档后不可恢复 |
+| `GET` | `/api/assets?active=true&scope=subnet:192.168.10.0/24` | 查询 IP 聚合库存，可按扫描范围精确过滤 |
+| `GET` | `/api/assets/{ip}` | 查询资产聚合状态、全部范围成员及端口详情 |
 
-创建网段任务示例：
+创建每天执行的网段逻辑任务示例：
 
 ```bash
-curl -X POST http://127.0.0.1:8080/api/tasks \
+curl -X POST http://127.0.0.1:8080/api/scan-tasks \
   -H 'Content-Type: application/json' \
-  -d '{"type":"scan_subnet","target":"192.168.10.0/24"}'
+  -d '{"target":"192.168.10.0/24","scan_type":"subnet","mode":"scheduled","cron":"0 2 * * *","timezone":"Asia/Shanghai"}'
 ```
 
-支持的任务类型：`scan_ip`、`scan_ip_vuln`、`scan_subnet`、`scan_subnet_vuln`、`vuln_ip`、`collect_domain`、`collect_and_scan`、`collect_scan_vuln`。
+`POST` 与 `PUT /api/scan-tasks` 使用同一请求模型：`scan_type` 只能是 `ip` 或 `subnet`；`mode` 为 `once` 或 `scheduled`；`scheduled` 模式必须提供 5 段 `cron` 和 IANA `timezone`；通过 `config.vulnerability_on: true` 启用定向漏洞验证。v1 的 `scan_ip`、`collect_domain` 等 `task_type` 仅用于历史兼容接口，不适用于 v2 ScanTask API。
+
+### 任务取消与报告
+
+取消不是立即伪装成已停止：运行中或排队中的任务先变为 `cancel_requested`，端口扫描、网段工作流和 Nuclei 子进程会收到同一取消上下文；执行器实际退出后，任务才进入 `canceled`。取消前已经保存的结果会保留，但不会被视为成功运行。
+
+每轮 ScanTaskRun 完成时先持久化最终状态、完成时间及已收集结果，再生成 Markdown 报告。成功、失败和取消运行都会尝试生成报告；若报告写入失败，运行状态不会被改写，错误会记录在该运行的 `report_error` 字段中，并可通过运行详情 API 查询。
 
 ## 数据与持续巡检
 
-`yscan` 将状态写入当前目录的 SQLite 数据库，并在任务完成时生成报告：
+`yscan` 将状态写入当前目录的 SQLite 数据库，并在任务进入最终状态后生成报告：
 
 | 数据 | 位置 | 作用 |
 | --- | --- | --- |
-| SQLite 数据库 | `asm.db` | 任务、主机库存、端口、漏洞、变化摘要和服务规则 |
-| Markdown 报告 | `reports/task-<id>.md` | 任务摘要、资产变化、端口变化和漏洞结果 |
+| SQLite 数据库 | `asm.db` | 逻辑任务、运行快照、IP 聚合库存、范围主机/端口成员、漏洞、变化摘要和服务规则 |
+| Markdown 报告 | `reports/scan-task-<taskId>-run-<runId>.md` | 每轮成功、失败或取消运行的最终摘要、任务内变化、端口变化和漏洞结果 |
 
-持续巡检的关键不是重复扫描，而是比较两次结果：
+持续巡检的关键不是重复扫描，而是在同一扫描范围内比较两次结果：
 
 - 新资产：新的存活主机进入库存。
 - 失活资产：本轮未发现的历史主机标记为非活跃。
 - 新开放端口：本轮出现而上轮没有的端口。
 - 关闭端口：上轮存在而本轮未发现的端口。
 
-建议以系统定时任务或 CI 调度器按周期运行相同 CIDR，并从控制台或 `reports/` 读取增量结果。
+范围主机与端口成员关系独立于 IP 聚合库存。一个 IP 同时属于 `/16` 和其中 `/24` 时，两次巡检不会覆盖对方的主机、端口成员状态或变化摘要；全局 IP 状态只要存在一个活跃范围成员就保持活跃，`first_seen` 取最早发现时间，`last_seen` 取所有成员最新的成功发现时间。资产 API 返回 `scope_count`，详情返回每个范围成员；旧 `source` 查询参数仅保留一版兼容别名，不能再用作资产唯一归属。
+
+使用 `yscan schedule create --mode scheduled` 为 CIDR 创建内置定期任务。API 服务进程负责按 Cron 与任务时区创建运行记录、保留运行快照并计算同任务 Diff；控制台“漏洞与报告”页可选择逻辑任务与具体运行查看报告。外部 Cron 或 CI 不应重复触发同一巡检任务。
 
 ## CLI 参考
 
@@ -218,6 +233,12 @@ curl -X POST http://127.0.0.1:8080/api/tasks \
 | `status <task_id>` | 查看任务状态 |
 | `cancel <task_id>` | 取消任务 |
 | `findings <task_id> [severity]` | 查看漏洞结果 |
+| `schedule create --target <ip-or-cidr> --scan-type ip\|subnet --mode once\|scheduled ...` | 创建 v2 逻辑任务；scheduled 模式由 API 服务内置调度 |
+| `schedule update <scan_task_id> ...` | 更新逻辑任务后续运行的目标、计划与配置；已有运行保留原快照 |
+| `schedule list` | 列出全部 v2 逻辑任务 |
+| `schedule show <scan_task_id>` | 查看逻辑任务的配置、状态和计划 |
+| `schedule runs <scan_task_id>` | 查看任务的运行历史和报告路径 |
+| `schedule pause\|resume\|archive <scan_task_id>` | 暂停、恢复或归档逻辑任务 |
 | `api [addr]` | 启动 API 和 Web 控制台 |
 
 全局参数：
@@ -232,7 +253,7 @@ curl -X POST http://127.0.0.1:8080/api/tasks \
 
 - 仅对你拥有或已获得明确授权的资产、网段和域名执行扫描。
 - Nuclei templates 的内容、影响范围和许可证由操作者负责审查；生产环境应先使用受控模板集验证。
-- `yscan` v1 不是漏洞修复、工单、资产归属、RBAC、多租户或互联网全量测绘平台。
+- `yscan` 不是漏洞修复、工单、资产归属、RBAC、多租户或互联网全量测绘平台。
 - 数据库与报告可能包含内部 IP、服务和漏洞信息；提交 Issue、日志或截图前应完成脱敏。
 
 ## v2 路线
@@ -245,7 +266,7 @@ v2 不追求无边界堆功能，优先补足“服务识别结果是否可靠�
 4. 解析本地 Nuclei 模板元数据，建立安全策略和基于产品/CPE/版本的候选规划。
 5. 用高置信度指纹逐步替换 v1 静态服务 tags，同时保留可解释的回退路径。
 
-完整任务拆分、文件边界和验收标准见 [技术设计方案.md](技术设计方案.md)。产品定位与国内 CAASM 产品调研见 [产品调研.md](产品调研.md)。仓库内 AI 开发约束见 [AGENTS.md](AGENTS.md)。
+完整任务拆分、文件边界和验收标准见 [技术设计方案-v2.md](技术设计方案-v2.md)。产品定位与国内 CAASM 产品调研见 [产品调研.md](产品调研.md)。仓库内 AI 开发约束见 [AGENTS.md](AGENTS.md)。
 
 ## 开发验证
 
