@@ -173,13 +173,21 @@ func TestRunUserReportLeadsWithValidationAndKeepsAuditDetailsOut(t *testing.T) {
 			TemplateCandidates: []model.ScanTaskRunTemplateCandidate{{TemplateID: "internal-only", Path: "private.yaml", Source: "fingerprint_mapping", Reason: "audit only"}},
 		},
 		FingerprintImports: []model.FingerprintImport{{ID: 11, ProjectionSHA256: "audit-sha"}},
+		FingerprintConclusions: []map[string]interface{}{
+			{"ip": "192.168.75.1", "port": 23333, "protocol": "http", "product_key": "nginx", "product_role": "web_server", "version": "1.24", "cpe": "cpe:2.3:a:nginx:nginx:1.24:*:*:*:*:*:*:*", "product_status": "corroborated"},
+			{"ip": "192.168.75.1", "port": 23333, "protocol": "http", "product_key": "php", "product_role": "runtime", "version": "8.1", "product_status": "matched"},
+		},
+		FingerprintMatches: []map[string]interface{}{
+			{"ip": "192.168.75.1", "port": 23333, "protocol": "http", "product_key": "nginx", "source_key": "wappalyzer", "source_rule_id": "nginx-header"},
+			{"ip": "192.168.75.1", "port": 23333, "protocol": "http", "product_key": "php", "source_key": "whatweb", "source_rule_id": "php-header"},
+		},
 	})
 	validationIndex := strings.Index(content, "## Vulnerability Validation")
-	serviceIndex := strings.Index(content, "## Port And Service Summary")
+	serviceIndex := strings.Index(content, "## Endpoint Profiles")
 	if validationIndex < 0 || serviceIndex < 0 || validationIndex > serviceIndex {
 		t.Fatalf("user report does not lead with validation:\n%s", content)
 	}
-	for _, expected := range []string{"success", "Test vulnerability", "Readable vulnerability description", "high", "HTTP 500 server=nginx response=2422 bytes"} {
+	for _, expected := range []string{"success", "Test vulnerability", "Readable vulnerability description", "high", "HTTP 500 server=nginx response=2422 bytes", "Web server", "Runtime / language", "nginx", "php", "1.24", "cpe:2.3:a:nginx:nginx:1.24", "wappalyzer", "whatweb"} {
 		if !strings.Contains(content, expected) {
 			t.Fatalf("user report missing %q:\n%s", expected, content)
 		}
@@ -188,6 +196,19 @@ func TestRunUserReportLeadsWithValidationAndKeepsAuditDetailsOut(t *testing.T) {
 		if strings.Contains(content, forbidden) {
 			t.Fatalf("user report exposed audit detail %q:\n%s", forbidden, content)
 		}
+	}
+}
+
+func TestEndpointReportMarksRunSuccessWithoutEndpointCandidatesAsUnmapped(t *testing.T) {
+	port := model.ScanTaskRunPort{IP: "192.168.75.2", Port: 22222, ServiceType: "ssh"}
+	snapshot := model.ScanTaskRunSnapshot{Validation: model.ScanTaskRunValidation{Status: model.ScanTaskRunValidationSuccess}}
+	conclusions := []map[string]interface{}{{"product_key": "dropbear"}}
+	if summary := endpointValidationSummary(snapshot, port, conclusions); !strings.Contains(summary, "no_candidates") || !strings.Contains(summary, "no template mapping") {
+		t.Fatalf("endpoint validation summary=%q", summary)
+	}
+	reasons := endpointUnresolvedReasons(snapshot, port, conclusions)
+	if !strings.Contains(strings.Join(reasons, "|"), "no template mapping for dropbear") {
+		t.Fatalf("endpoint unresolved reasons=%#v", reasons)
 	}
 }
 

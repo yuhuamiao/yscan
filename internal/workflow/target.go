@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"golandproject/yscan/internal/model"
+	"golandproject/yscan/internal/planner"
 	"golandproject/yscan/internal/scan"
 	"golandproject/yscan/internal/storage"
 	"golandproject/yscan/internal/vuln"
@@ -40,11 +41,13 @@ func (executor TargetTaskRunExecutor) Execute(ctx context.Context, run model.Sca
 }
 
 type targetDependencies struct {
-	scanHost            func(context.Context, string, string) (scan.PortScanOutcome, error)
-	scanSelected        func(context.Context, string, string, []int) (scan.PortScanOutcome, error)
-	collectFingerprints func(context.Context, *sql.DB, model.ScanTaskRun, string, []model.ScanResult) ([]model.ScanResult, []model.FingerprintRunMatch, error)
-	runNuclei           func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error)
-	executeNuclei       func(context.Context, string, []model.ScanResult, string, []string) vuln.NucleiExecutionResult
+	scanHost             func(context.Context, string, string) (scan.PortScanOutcome, error)
+	scanSelected         func(context.Context, string, string, []int) (scan.PortScanOutcome, error)
+	collectFingerprints  func(context.Context, *sql.DB, model.ScanTaskRun, string, []model.ScanResult) ([]model.ScanResult, []model.FingerprintRunMatch, error)
+	runNuclei            func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error)
+	executeNuclei        func(context.Context, string, []model.ScanResult, string, []string) vuln.NucleiExecutionResult
+	loadTemplateIndex    func(string) (string, *planner.NucleiTemplateIndex, error)
+	executeTemplatePaths func(context.Context, string, []model.ScanResult, []string) vuln.NucleiExecutionResult
 }
 
 // RunTargetTaskRun collects the observations for one IP run without reading
@@ -61,11 +64,13 @@ func RunTargetTaskRun(ctx context.Context, options TargetTaskRunOptions) (model.
 		return model.ScanTaskRunSnapshot{}, err
 	}
 	return runTargetTaskRun(ctx, options, targetDependencies{
-		scanHost:            scan.RunDiscoveryWithOutcome,
-		scanSelected:        scan.RunSelectedDiscoveryWithOutcome,
-		collectFingerprints: collector,
-		runNuclei:           vuln.RunNucleiForOpenPortsWithTags,
-		executeNuclei:       vuln.ExecuteNucleiForOpenPortsWithTags,
+		scanHost:             scan.RunDiscoveryWithOutcome,
+		scanSelected:         scan.RunSelectedDiscoveryWithOutcome,
+		collectFingerprints:  collector,
+		runNuclei:            vuln.RunNucleiForOpenPortsWithTags,
+		executeNuclei:        vuln.ExecuteNucleiForOpenPortsWithTags,
+		loadTemplateIndex:    loadNucleiTemplateIndex,
+		executeTemplatePaths: vuln.ExecuteNucleiForOpenPortsWithTemplatePaths,
 	})
 }
 
@@ -155,7 +160,16 @@ func runTargetTaskRun(ctx context.Context, options TargetTaskRunOptions, depende
 	}
 	if options.Run.Config.VulnerabilityOn {
 		validation := newRunValidationTracker()
-		mappingResult := runFingerprintMappingValidation(ctx, options.DB, options.Run, target, openPorts, fingerprintMatches, options.Run.Config.NucleiTemplates)
+		templateRoot := options.Run.Config.NucleiTemplates
+		var templateIndex *planner.NucleiTemplateIndex
+		if dependencies.loadTemplateIndex != nil {
+			templateRoot, templateIndex, err = dependencies.loadTemplateIndex(options.Run.Config.NucleiTemplates)
+			if err != nil {
+				validation.finish(&snapshot, err)
+				return snapshot, err
+			}
+		}
+		mappingResult := runFingerprintMappingValidation(ctx, options.DB, options.Run, target, openPorts, fingerprintMatches, templateRoot, templateIndex, dependencies.executeTemplatePaths)
 		validation.observe(mappingResult)
 		snapshot.Vulnerabilities = uniqueSnapshotVulnerabilities(snapshotVulnerabilities(mappingResult.findings))
 		snapshot.TemplateCandidates = uniqueTemplateCandidates(mappingResult.candidates)
@@ -163,7 +177,7 @@ func runTargetTaskRun(ctx context.Context, options TargetTaskRunOptions, depende
 			validation.finish(&snapshot, mappingResult.err)
 			return snapshot, mappingResult.err
 		}
-		fallbackResult := runServiceTagValidation(ctx, target, portsWithoutFingerprintMappings(openPorts, mappingResult.candidates), options.Run.Config.NucleiTemplates, nucleiExecutionDependency(dependencies.executeNuclei, dependencies.runNuclei))
+		fallbackResult := runServiceTagValidation(ctx, target, portsWithoutFingerprintMappings(openPorts, mappingResult.candidates, fingerprintMatches), templateRoot, nucleiExecutionDependency(dependencies.executeNuclei, dependencies.runNuclei))
 		validation.observe(fallbackResult)
 		allFindings := append(mappingResult.findings, fallbackResult.findings...)
 		allCandidates := append(mappingResult.candidates, fallbackResult.candidates...)

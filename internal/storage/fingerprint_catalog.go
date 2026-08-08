@@ -17,7 +17,7 @@ import (
 
 const legacyBannerSourceKey = "legacy-banner"
 
-const legacyBannerAdapterVersion = "legacy-banner-v2"
+const legacyBannerAdapterVersion = "legacy-banner-v3"
 
 type legacyBannerRule struct {
 	ID            int64  `json:"id"`
@@ -1570,12 +1570,13 @@ func MigrateLegacyBannerFingerprintRules(db *sql.DB) error {
 			unsupported++
 			continue
 		}
+		operator, pattern := legacyBannerMatcher(legacy)
 		projections = append(projections, model.FingerprintRuleProjection{
 			SourcePath: path, ContentSHA256: ruleSHA, SourceProduct: strings.TrimSpace(legacy.ServiceName),
 			Product:  model.FingerprintProduct{CanonicalName: strings.ToLower(strings.TrimSpace(legacy.ServiceName))},
 			Protocol: firstNonEmptyFingerprintProtocol(legacy.Protocol),
 			Root: model.FingerprintMatchGroupProjection{Operator: "all", Matchers: []model.FingerprintMatcher{{
-				EvidenceType: "tcp_banner", Target: "banner", Operator: strings.ToLower(strings.TrimSpace(legacy.MatchType)), Value: legacy.BannerPattern,
+				EvidenceType: "tcp_banner", Target: "banner", Operator: operator, Value: pattern,
 			}}},
 		})
 	}
@@ -1616,6 +1617,14 @@ func legacyBannerExecutionStatus(rule legacyBannerRule) (string, string) {
 	default:
 		return "unsupported", "unsupported legacy match operator"
 	}
+}
+
+func legacyBannerMatcher(rule legacyBannerRule) (string, string) {
+	if strings.EqualFold(strings.TrimSpace(rule.ServiceName), "openssh") &&
+		strings.EqualFold(strings.TrimSpace(rule.BannerPattern), "openssh") {
+		return "regex_ci", `^SSH-[0-9.]+-OpenSSH(?:[_/-]|$)`
+	}
+	return strings.ToLower(strings.TrimSpace(rule.MatchType)), rule.BannerPattern
 }
 
 func firstNonEmptyFingerprintProtocol(protocol string) string {

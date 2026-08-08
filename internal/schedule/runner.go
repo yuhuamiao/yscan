@@ -229,13 +229,18 @@ func (runner *Runner) taskScheduleAnchor(task model.ScanTask) (time.Time, error)
 }
 
 func (runner *Runner) claimDueTask(ctx context.Context, candidate dueCandidate) (model.ScanTaskRun, bool, error) {
-	result, err := runner.DB.ExecContext(ctx, `
+	tx, err := runner.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return model.ScanTaskRun{}, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `
 		INSERT INTO scan_task_runs
-			(scan_task_id, sequence, scheduled_for, status, target, scan_type, config_json, config_hash, created_at, updated_at)
+			(scan_task_id, sequence, scheduled_for, status, target, scan_type, config_json, config_hash, started_at, created_at, updated_at)
 		SELECT
 			scan_tasks.id,
 			COALESCE((SELECT MAX(sequence) FROM scan_task_runs WHERE scan_task_id = scan_tasks.id), 0) + 1,
-			?, ?, scan_tasks.target, scan_tasks.scan_type, scan_tasks.config_json, scan_tasks.config_hash, datetime('now'), datetime('now')
+			?, ?, scan_tasks.target, scan_tasks.scan_type, scan_tasks.config_json, scan_tasks.config_hash, datetime('now'), datetime('now'), datetime('now')
 		FROM scan_tasks
 		WHERE scan_tasks.id = ?
 			AND scan_tasks.mode = ?
@@ -265,6 +270,12 @@ func (runner *Runner) claimDueTask(ctx context.Context, candidate dueCandidate) 
 	}
 	runID, err := result.LastInsertId()
 	if err != nil {
+		return model.ScanTaskRun{}, false, err
+	}
+	if err := storage.FreezeActiveFingerprintImportsTx(tx, runID); err != nil {
+		return model.ScanTaskRun{}, false, fmt.Errorf("freeze scheduled run fingerprint imports: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
 		return model.ScanTaskRun{}, false, err
 	}
 	run, err := storage.GetScanTaskRun(runner.DB, runID)

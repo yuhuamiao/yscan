@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"golandproject/yscan/internal/model"
 )
@@ -474,9 +475,13 @@ func matchCompiledRule(rule *compiledRule, evidence Evidence) (Match, bool) {
 	}, true
 }
 
+var unknownEndpointProbePriority = []string{"redis-server", "Memcache", "GenericLines"}
+
 // NmapTCPProbesForEndpoint returns immutable, read-only active probes whose
-// upstream port policy includes this endpoint. Callers apply the per-endpoint
-// execution cap and total Context budget.
+// upstream port policy includes this endpoint. A silent, still-unknown service
+// also gets a bounded fallback set so non-standard Redis and Memcache ports are
+// not permanently invisible. Callers apply the per-endpoint execution cap and
+// total Context budget.
 func (engine *Engine) NmapTCPProbesForEndpoint(port int, service string) []NmapTCPProbe {
 	if engine == nil || port < 1 || port > 65535 {
 		return nil
@@ -486,6 +491,20 @@ func (engine *Engine) NmapTCPProbesForEndpoint(port int, service string) []NmapT
 		if probe, ok := projection.runtimeProbe(port, service); ok {
 			probes = append(probes, probe)
 		}
+	}
+	if len(probes) == 0 && unknownNmapService(service) {
+		for _, name := range unknownEndpointProbePriority {
+			projection, exists := engine.nmapProbes[name]
+			if !exists {
+				continue
+			}
+			probes = append(probes, NmapTCPProbe{
+				Name: projection.Name, Payload: append([]byte(nil), projection.Payload...), Timeout: time.Duration(projection.TimeoutMS) * time.Millisecond,
+				Ports: append([]int(nil), projection.Ports...), SSLPorts: append([]int(nil), projection.SSLPorts...), Rarity: projection.Rarity,
+				Fallback: append([]string(nil), projection.Fallback...), Order: projection.Order,
+			})
+		}
+		return probes
 	}
 	sort.Slice(probes, func(i, j int) bool {
 		if probes[i].Rarity != probes[j].Rarity {
@@ -497,6 +516,15 @@ func (engine *Engine) NmapTCPProbesForEndpoint(port int, service string) []NmapT
 		return probes[i].Name < probes[j].Name
 	})
 	return probes
+}
+
+func unknownNmapService(service string) bool {
+	switch strings.ToLower(strings.TrimSpace(service)) {
+	case "", "unknown", "none_unknown", "tcp", "tcp-unknown":
+		return true
+	default:
+		return false
+	}
 }
 
 func (engine *Engine) MatchNmapTCPProbeResponse(probeName string, response []byte) []Match {

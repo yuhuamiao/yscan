@@ -89,6 +89,34 @@ func TestNmapProbeParserPreservesExecutionPolicy(t *testing.T) {
 	}
 }
 
+func TestRedisInfoProbeIsReadOnlyAndMatchesRealResponse(t *testing.T) {
+	raw := []byte("Probe TCP redis-server q|*1\\r\\n$4\\r\\ninfo\\r\\n|\nrarity 8\nports 6379,6380,16379\nsslports 6380,16379\nmatch redis m|^\\$\\d+\\r\\n(?:#[^\\r\\n]*\\r\\n)*redis_version:([.\\d]+)\\r\\n|s p/Redis key-value store/ v/$1/ cpe:/a:redislabs:redis:$1/\n")
+	probes, err := ParseNmapTCPProbes(raw)
+	if err != nil || len(probes) != 1 || !isReadOnlyNmapProbe(probes[0]) {
+		t.Fatalf("redis probes=%#v err=%v", probes, err)
+	}
+	response := "$64\r\n# Server\r\nredis_version:6.0.16\r\nredis_mode:standalone\r\n"
+	matches := MatchNmapTCPProbe([]byte(response), probes[0].Matches)
+	if len(matches) != 1 || matches[0].Service != "redis" || matches[0].Version != "$1" {
+		t.Fatalf("redis matches=%#v", matches)
+	}
+}
+
+func TestUnknownNonStandardEndpointGetsBoundedReadOnlyFallbackProbes(t *testing.T) {
+	engine := &Engine{nmapProbes: map[string]nmapProbeProjection{
+		"redis-server": {Mode: "active", Name: "redis-server", Payload: []byte(readOnlyNmapProbePayloads["redis-server"]), Ports: []int{6379}, TimeoutMS: 4000, SideEffect: "read_only"},
+		"Memcache":     {Mode: "active", Name: "Memcache", Payload: []byte(readOnlyNmapProbePayloads["Memcache"]), Ports: []int{11211}, TimeoutMS: 4000, SideEffect: "read_only"},
+		"GetRequest":   {Mode: "active", Name: "GetRequest", Payload: []byte(readOnlyNmapProbePayloads["GetRequest"]), Ports: []int{80}, TimeoutMS: 4000, SideEffect: "read_only"},
+	}}
+	probes := engine.NmapTCPProbesForEndpoint(26379, "unknown")
+	if len(probes) != 2 || probes[0].Name != "redis-server" || probes[1].Name != "Memcache" {
+		t.Fatalf("unknown endpoint fallbacks=%#v", probes)
+	}
+	if probes := engine.NmapTCPProbesForEndpoint(26379, "ssh"); len(probes) != 0 {
+		t.Fatalf("known service received unrelated fallbacks: %#v", probes)
+	}
+}
+
 func TestFrozenEngineExecutesReadOnlyNmapProbeOnScopedPort(t *testing.T) {
 	db := openFingerprintTestDB(t)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

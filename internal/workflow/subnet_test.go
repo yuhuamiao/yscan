@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -11,7 +13,9 @@ import (
 
 	"golandproject/yscan/internal/model"
 	"golandproject/yscan/internal/pipeline"
+	"golandproject/yscan/internal/planner"
 	"golandproject/yscan/internal/storage"
+	"golandproject/yscan/internal/vuln"
 )
 
 func openWorkflowDB(t *testing.T) *sql.DB {
@@ -548,5 +552,67 @@ func TestTemplateCandidateCoverageUsesStructuredProtocolNotReason(t *testing.T) 
 	}
 	if unique := uniqueTemplateCandidates([]model.ScanTaskRunTemplateCandidate{tcpCandidate, httpsCandidate}); len(unique) != 2 {
 		t.Fatalf("same template on distinct protocols collapsed: %#v", unique)
+	}
+}
+
+func TestAutomaticTemplateIndexMapsExecutesAndReportsCoverage(t *testing.T) {
+	db, err := storage.InitDBAt(filepath.Join(t.TempDir(), "automatic-index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	root := t.TempDir()
+	templatePath := filepath.Join(root, "network", "exposed-redis.yaml")
+	if err := os.MkdirAll(filepath.Dir(templatePath), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(templatePath, []byte(`
+id: exposed-redis
+info:
+  name: Redis Exposure
+  severity: high
+  tags: network,redis,unauth,exposure,tcp,discovery
+tcp:
+  - inputs:
+      - data: "info\r\nquit\r\n"
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	index, err := planner.BuildNucleiTemplateIndex(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ip = "192.168.77.10"
+	port := model.ScanResult{Address: ip + ":6379", Open: true, Service: "redis", Product: "redis"}
+	match := model.FingerprintRunMatch{IP: ip, Port: 6379, Protocol: "tcp", Product: "redis", CPE: "cpe:2.3:a:redislabs:redis:*:*:*:*:*:*:*:*"}
+	executions := 0
+	result := runFingerprintMappingValidation(context.Background(), db, model.ScanTaskRun{ID: 77}, ip, []model.ScanResult{port}, []model.FingerprintRunMatch{match}, root, index,
+		func(_ context.Context, target string, ports []model.ScanResult, paths []string) vuln.NucleiExecutionResult {
+			executions++
+			if target != ip || len(ports) != 1 || len(paths) != 1 || paths[0] != templatePath {
+				t.Fatalf("automatic invocation target=%s ports=%#v paths=%#v", target, ports, paths)
+			}
+			return vuln.NucleiExecutionResult{Started: true, Executed: true, Findings: []model.NucleiFinding{{TemplateID: "exposed-redis", Name: "Redis Exposure", Target: ip + ":6379", TargetIP: ip, TargetPort: 6379}}}
+		})
+	if result.err != nil || executions != 1 || len(result.candidates) != 1 || result.candidates[0].Source != "automatic_template_index" || result.candidates[0].ProductKey != "redis" || result.candidates[0].TemplateSHA256 == "" || result.candidates[0].TemplateSetRevision != index.Revision {
+		t.Fatalf("automatic mapping result=%#v executions=%d", result, executions)
+	}
+	snapshot := model.ScanTaskRunSnapshot{Vulnerabilities: snapshotVulnerabilities(result.findings)}
+	tracker := newRunValidationTracker()
+	tracker.observe(result)
+	tracker.finish(&snapshot, result.err)
+	if snapshot.Validation.Status != model.ScanTaskRunValidationSuccess || snapshot.Validation.IdentifiedProductCount != 1 || snapshot.Validation.MappedProductCount != 1 || len(snapshot.Validation.UnmappedProducts) != 0 || snapshot.Validation.TemplateCount != 1 || snapshot.Validation.ExecutedTemplateCount != 1 || snapshot.Validation.FindingCount != 1 {
+		t.Fatalf("validation coverage=%#v", snapshot.Validation)
+	}
+}
+
+func TestValidationReportsIdentifiedProductWithoutTemplateAsUnmapped(t *testing.T) {
+	tracker := newRunValidationTracker()
+	identity := validationProductIdentity("192.168.77.11", 8080, "http", "fixture-app")
+	tracker.observe(validationExecutionResult{identifiedProducts: map[string]struct{}{identity: {}}})
+	snapshot := model.ScanTaskRunSnapshot{}
+	tracker.finish(&snapshot, nil)
+	if snapshot.Validation.Status != model.ScanTaskRunValidationNoCandidates || snapshot.Validation.IdentifiedProductCount != 1 || snapshot.Validation.MappedProductCount != 0 || !reflect.DeepEqual(snapshot.Validation.UnmappedProducts, []string{identity}) {
+		t.Fatalf("unmapped validation coverage=%#v", snapshot.Validation)
 	}
 }

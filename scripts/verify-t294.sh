@@ -30,7 +30,7 @@ test ! -e "$fresh_clone/技术设计方案-v2.md"
 ! rg -q '\]\((AGENTS|技术设计方案-v2|技术设计方案|产品调研)\.md\)' "$fresh_clone/README.md"
 rg -q 'fingerprint upgrade' "$fresh_clone/README.md"
 rg -q -- '--allow-cidr' "$fresh_clone/README.md"
-rg -q '28,509' "$fresh_clone/README.md"
+rg -q '28,512' "$fresh_clone/README.md"
 rg -q 'fingerprint cleanup' "$fresh_clone/README.md"
 
 (cd "$fresh_clone" && go build -trimpath -o yscan .)

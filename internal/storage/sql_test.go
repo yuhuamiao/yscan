@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -749,6 +750,114 @@ func TestGetAssetDetail(t *testing.T) {
 	ssh, web := detail.Ports[0], detail.Ports[1]
 	if ssh.Port != 22 || ssh.Protocol != "tcp" || ssh.ResponseLength != 28 || len(ssh.ProtocolEvidence) != 3 || ssh.ProtocolEvidence[0].EvidenceType != model.ProtocolEvidenceActiveProbe || web.Port != 443 || web.Protocol != "https" || web.StatusCode != 200 || web.Server != "nginx" || web.ResponseLength != 917 || len(web.ProtocolEvidence) != 1 {
 		t.Fatalf("asset protocol evidence ssh=%#v web=%#v", ssh, web)
+	}
+}
+
+func TestGetAssetDetailKeepsEndpointProfileWithinOneRun(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatalf("initSQLiteSchema: %v", err)
+	}
+	const ip = "192.168.10.12"
+	if err := SyncHostInventory(db, "ip:"+ip, []string{ip}); err != nil {
+		t.Fatalf("sync host: %v", err)
+	}
+	if err := SyncOpenPorts(db, ip, []model.ScanResult{{Address: ip + ":443", Open: true, Service: "https"}}); err != nil {
+		t.Fatalf("sync ports: %v", err)
+	}
+	task := createScheduledTaskForTest(t, db, ip)
+
+	oldRun := createRunningTaskRun(t, db, task.ID, "2026-08-07T02:00:00Z")
+	if err := SaveScanTaskRunSnapshot(db, model.ScanTaskRunSnapshot{
+		RunID: oldRun.ID,
+		Ports: []model.ScanTaskRunPort{{IP: ip, Port: 443, ServiceType: "https", Product: "nginx"}},
+		ProtocolEvidence: []model.ScanTaskRunProtocolEvidence{{
+			IP: ip, Port: 443, EvidenceType: model.ProtocolEvidenceWeb, Protocol: "https", Responded: true,
+			StatusCode: 200, Server: "old-nginx", Title: "Old console", BodyCapturedLength: 100,
+		}},
+		Validation:         model.ScanTaskRunValidation{Status: model.ScanTaskRunValidationSuccess, CandidateEndpointCount: 1, ExecutedEndpointCount: 1, TemplateCount: 1, FindingCount: 1},
+		TemplateCandidates: []model.ScanTaskRunTemplateCandidate{{TemplateID: "old-template", Path: "old.yaml", Source: "fixture", Reason: "old", IP: ip, Port: 443, Protocol: "https"}},
+		Vulnerabilities:    []model.ScanTaskRunVulnerability{{FindingKey: "old-finding", TemplateID: "old-template", Name: "Old finding", Severity: "low", Target: "https://" + ip + ":443", TargetIP: ip, TargetPort: 443}},
+	}); err != nil {
+		t.Fatalf("save old snapshot: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO asset_fingerprint_conclusions
+			(scan_task_run_id, ip, port, protocol, product_key, product_role, exclusive_group, version, tags_json,
+			 conclusion_status, product_status, product_source_count, version_status, version_source_count, cpe_status, cpe_source_count)
+		VALUES (?, ?, 443, 'https', 'nginx', 'web_server', 'web_server', '1.20', '[]',
+			'matched', 'matched', 1, 'matched', 1, 'unobserved', 0)`, oldRun.ID, ip); err != nil {
+		t.Fatalf("seed old conclusion: %v", err)
+	}
+
+	newRun := createRunningTaskRun(t, db, task.ID, "2026-08-08T02:00:00Z")
+	if err := SaveScanTaskRunSnapshot(db, model.ScanTaskRunSnapshot{
+		RunID: newRun.ID,
+		Ports: []model.ScanTaskRunPort{{IP: ip, Port: 443, ServiceType: "https", Product: "flask"}},
+		ProtocolEvidence: []model.ScanTaskRunProtocolEvidence{{
+			IP: ip, Port: 443, EvidenceType: model.ProtocolEvidenceWeb, Protocol: "https", Responded: true,
+			StatusCode: 201, Server: "Werkzeug", Title: "New console", BodyCapturedLength: 200,
+		}},
+		Validation:         model.ScanTaskRunValidation{Status: model.ScanTaskRunValidationSuccess, CandidateEndpointCount: 1, ExecutedEndpointCount: 1, TemplateCount: 1, FindingCount: 1},
+		TemplateCandidates: []model.ScanTaskRunTemplateCandidate{{TemplateID: "new-template", Path: "new.yaml", Source: "fixture", Reason: "new", IP: ip, Port: 443, Protocol: "https"}},
+		Vulnerabilities:    []model.ScanTaskRunVulnerability{{FindingKey: "new-finding", TemplateID: "new-template", Name: "New finding", Severity: "high", Target: "https://" + ip + ":443", TargetIP: ip, TargetPort: 443}},
+	}); err != nil {
+		t.Fatalf("save new snapshot: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO asset_fingerprint_conclusions
+			(scan_task_run_id, ip, port, protocol, product_key, product_role, exclusive_group, version, tags_json,
+			 conclusion_status, product_status, product_source_count, version_status, version_source_count, cpe_status, cpe_source_count)
+		VALUES (?, ?, 443, 'https', 'flask', 'framework', 'web_framework', '3.1.2', '["python"]',
+			'matched', 'matched', 1, 'matched', 1, 'unobserved', 0)`, newRun.ID, ip); err != nil {
+		t.Fatalf("seed new conclusion: %v", err)
+	}
+
+	detail, err := GetAssetDetail(db, ip)
+	if err != nil {
+		t.Fatalf("get asset detail: %v", err)
+	}
+	if len(detail.Ports) != 1 {
+		t.Fatalf("ports = %#v", detail.Ports)
+	}
+	port := detail.Ports[0]
+	if port.ObservationRunID != newRun.ID || port.Server != "Werkzeug" || port.StatusCode != 201 || port.Title != "New console" {
+		t.Fatalf("endpoint observation mixed runs: %#v", port)
+	}
+	if len(port.Technologies) != 1 || port.Technologies[0].ProductKey != "flask" || port.Technologies[0].Version != "3.1.2" {
+		t.Fatalf("endpoint technologies mixed runs: %#v", port.Technologies)
+	}
+	if port.Validation.CandidateTemplateCount != 1 || port.Validation.FindingCount != 1 || len(port.Validation.Findings) != 1 || port.Validation.Findings[0].FindingKey != "new-finding" {
+		t.Fatalf("endpoint validation mixed runs: %#v", port.Validation)
+	}
+	encoded, err := json.Marshal(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "old-") || strings.Contains(string(encoded), "nginx") {
+		t.Fatalf("old run leaked into endpoint profile: %s", encoded)
+	}
+}
+
+func TestAssetEndpointValidationDoesNotInheritRunSuccessWithoutCandidates(t *testing.T) {
+	ports := []model.AssetPort{{
+		ObservationRunID: 7,
+		ProtocolEvidence: []model.ScanTaskRunProtocolEvidence{{Responded: true}},
+		Technologies:     []model.AssetTechnology{{ProductKey: "dropbear"}},
+		Validation: model.AssetValidationSummary{
+			Enabled: true, Status: model.ScanTaskRunValidationSuccess, UnmappedProducts: []string{"dropbear"},
+		},
+	}}
+	finalizeAssetPortProfiles(ports)
+	if ports[0].Validation.Status != model.ScanTaskRunValidationNoCandidates || ports[0].Validation.Reason != "mapping_missing" {
+		t.Fatalf("endpoint validation=%#v", ports[0].Validation)
+	}
+	foundReason := false
+	for _, reason := range ports[0].UnresolvedReasons {
+		foundReason = foundReason || reason == "mapping_missing"
+	}
+	if !foundReason {
+		t.Fatalf("endpoint unresolved reasons=%#v", ports[0].UnresolvedReasons)
 	}
 }
 

@@ -206,6 +206,28 @@ func TestRunnerRecordsMisfireWithoutReplayingScan(t *testing.T) {
 	}
 }
 
+func TestRunnerClaimsRunObservedAfterCronMinute(t *testing.T) {
+	db := openRunnerTestDB(t)
+	if _, err := db.Exec(`INSERT INTO fingerprint_imports (id, is_active) VALUES (41, 1), (42, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.July, 24, 2, 0, 37, 250000000, time.UTC)
+	task := createRunnerTask(t, db, "192.168.10.0/24", "2026-07-24 00:00:00")
+	runner := NewRunner(db, ClockFunc(func() time.Time { return now }))
+
+	run, err := runner.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("claim run observed after cron minute: %v", err)
+	}
+	if run == nil || run.ScanTaskID != task.ID || run.Status != model.ScanTaskRunStatusRunning || run.ScheduledFor != "2026-07-24T02:00:00Z" || run.StartedAt == "" {
+		t.Fatalf("claimed run = %#v", run)
+	}
+	var frozenImportID int64
+	if err := db.QueryRow(`SELECT fingerprint_import_id FROM scan_task_run_fingerprint_imports WHERE scan_task_run_id = ?`, run.ID).Scan(&frozenImportID); err != nil || frozenImportID != 41 {
+		t.Fatalf("frozen import ID = %d, err = %v", frozenImportID, err)
+	}
+}
+
 func TestRunnerRecordsOverlapWithoutStartingAnotherScan(t *testing.T) {
 	db := openRunnerTestDB(t)
 	now := time.Date(2026, time.July, 24, 2, 0, 0, 0, time.UTC)
@@ -264,6 +286,8 @@ func openRunnerTestDB(t *testing.T) *sql.DB {
 	statements := []string{
 		`CREATE TABLE scan_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, scan_type TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, cron TEXT, timezone TEXT, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, archived_at DATETIME)`,
 		`CREATE TABLE scan_task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_task_id INTEGER NOT NULL, sequence INTEGER NOT NULL, scheduled_for DATETIME NOT NULL, status TEXT NOT NULL, target TEXT NOT NULL, scan_type TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', error_message TEXT, report_path TEXT, audit_report_path TEXT, report_error TEXT, started_at DATETIME, finished_at DATETIME, snapshot_written_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, UNIQUE(scan_task_id, sequence), UNIQUE(scan_task_id, scheduled_for))`,
+		`CREATE TABLE fingerprint_imports (id INTEGER PRIMARY KEY, is_active INTEGER NOT NULL)`,
+		`CREATE TABLE scan_task_run_fingerprint_imports (scan_task_run_id INTEGER NOT NULL, fingerprint_import_id INTEGER NOT NULL, PRIMARY KEY(scan_task_run_id, fingerprint_import_id))`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {

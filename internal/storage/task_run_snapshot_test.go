@@ -35,7 +35,7 @@ func TestScanTaskRunSnapshotIsWriteOnceAndIndependentOfGlobalInventory(t *testin
 			Server: "nginx", Title: "Admin", HeaderCapturedLength: 117, HeaderSHA256: strings.Repeat("a", 64),
 			BodyCapturedLength: 917, BodySHA256: strings.Repeat("b", 64),
 		}},
-		Validation: model.ScanTaskRunValidation{Status: model.ScanTaskRunValidationSuccess, CandidateEndpointCount: 1, ExecutedEndpointCount: 1, TemplateCount: 2, FindingCount: 1, StartedAt: "2026-07-24T02:00:01Z", FinishedAt: "2026-07-24T02:00:03Z"},
+		Validation: model.ScanTaskRunValidation{Status: model.ScanTaskRunValidationSuccess, IdentifiedProductCount: 2, MappedProductCount: 1, UnmappedProducts: []string{"192.168.10.10:443/https product=php"}, CandidateEndpointCount: 1, ExecutedEndpointCount: 1, TemplateCount: 2, ExecutedTemplateCount: 2, FindingCount: 1, StartedAt: "2026-07-24T02:00:01Z", FinishedAt: "2026-07-24T02:00:03Z"},
 		Vulnerabilities: []model.ScanTaskRunVulnerability{{
 			FindingKey: "CVE-2026-0001:https://192.168.10.10",
 			TemplateID: "CVE-2026-0001",
@@ -123,14 +123,14 @@ func TestSnapshotPersistsDistinctStructuredTemplateCandidateEndpoints(t *testing
 	task := createScheduledTaskForTest(t, db, "192.168.74.0/24")
 	run := createRunningTaskRun(t, db, task.ID, "2026-07-27T02:00:00Z")
 	snapshot := model.ScanTaskRunSnapshot{RunID: run.ID, TemplateCandidates: []model.ScanTaskRunTemplateCandidate{
-		{TemplateID: "fixture", Path: "fixture.yaml", Source: "fingerprint_mapping", Reason: "display text", IP: "192.168.74.1", Port: 443, Protocol: "https"},
-		{TemplateID: "fixture", Path: "fixture.yaml", Source: "fingerprint_mapping", Reason: "display text", IP: "192.168.74.1", Port: 443, Protocol: "tcp"},
+		{TemplateID: "fixture", Path: "fixture.yaml", ProductKey: "nginx", Source: "fingerprint_mapping", Reason: "display text", IP: "192.168.74.1", Port: 443, Protocol: "https"},
+		{TemplateID: "fixture", Path: "fixture.yaml", ProductKey: "openssh", Source: "fingerprint_mapping", Reason: "display text", IP: "192.168.74.1", Port: 443, Protocol: "tcp"},
 	}}
 	if err := SaveScanTaskRunSnapshot(db, snapshot); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := GetScanTaskRunSnapshot(db, run.ID)
-	if err != nil || len(loaded.TemplateCandidates) != 2 || loaded.TemplateCandidates[0].Protocol == loaded.TemplateCandidates[1].Protocol {
+	if err != nil || len(loaded.TemplateCandidates) != 2 || loaded.TemplateCandidates[0].Protocol == loaded.TemplateCandidates[1].Protocol || loaded.TemplateCandidates[0].ProductKey == loaded.TemplateCandidates[1].ProductKey {
 		t.Fatalf("loaded candidates=%#v err=%v", loaded.TemplateCandidates, err)
 	}
 }

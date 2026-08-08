@@ -63,6 +63,7 @@ var readOnlyNmapProbePayloads = map[string]string{
 	"VersionRequest":         "VERSION",
 	"LSCP":                   "GET SERVER INFO\r\n",
 	"rotctl":                 "get_info\n",
+	"redis-server":           "*1\r\n$4\r\ninfo\r\n",
 }
 
 type NmapProbeMatch struct {

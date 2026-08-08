@@ -64,13 +64,13 @@ func TestEmbeddedRealSourcesImportAllRulesAndRemainIdempotent(t *testing.T) {
 		WHERE source.source_key = 'nmap-service-probes'`).Scan(&total, &executable, &unsupported); err != nil {
 		t.Fatalf("read Nmap import stats: %v", err)
 	}
-	if total != 12171 || executable != 9409 || unsupported != 2762 {
+	if total != 12171 || executable != 9412 || unsupported != 2759 {
 		t.Fatalf("Nmap import stats = total=%d executable=%d unsupported=%d", total, executable, unsupported)
 	}
 	if err := db.QueryRow(`SELECT SUM(rule_total), SUM(executable_total), SUM(unsupported_total) FROM fingerprint_imports WHERE is_active = 1`).Scan(&total, &executable, &unsupported); err != nil {
 		t.Fatalf("read aggregate import stats: %v", err)
 	}
-	if total != 41192 || executable != 28509 || unsupported != 12683 {
+	if total != 41192 || executable != 28512 || unsupported != 12680 {
 		t.Fatalf("aggregate stats = total=%d executable=%d unsupported=%d", total, executable, unsupported)
 	}
 	projectedSources := map[string]struct {

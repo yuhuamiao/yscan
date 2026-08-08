@@ -80,6 +80,23 @@ func TestActiveProbeResponseEvidenceSurvivesWithoutRuleMatch(t *testing.T) {
 	}
 }
 
+func TestActiveProbeReadTimeoutLeavesMarginInsideEndpointBudget(t *testing.T) {
+	if nmapProbeReadBudget >= nmapProbeEndpointBudget {
+		t.Fatalf("probe read budget %s must be shorter than endpoint budget %s", nmapProbeReadBudget, nmapProbeEndpointBudget)
+	}
+}
+
+func TestEndpointServiceUnknownClassification(t *testing.T) {
+	for _, service := range []string{"", "unknown", "None_unknown", "tcp-unknown"} {
+		if !endpointServiceUnknown(service) {
+			t.Fatalf("service %q should be unknown", service)
+		}
+	}
+	if endpointServiceUnknown("redis") {
+		t.Fatal("identified Redis service must not be unknown")
+	}
+}
+
 func TestActiveProbeDiagnosticsCoverRefusalReadTimeoutAndZeroResponse(t *testing.T) {
 	refused, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

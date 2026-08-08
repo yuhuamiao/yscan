@@ -49,11 +49,12 @@ type fingerprintYAMLDocument struct {
 		Name     string `yaml:"name"`
 		Tags     string `yaml:"tags"`
 		Metadata struct {
-			Product string `yaml:"product"`
-			Vendor  string `yaml:"vendor"`
-			CPE     string `yaml:"cpe"`
-			Version string `yaml:"version"`
-			Rarity  int    `yaml:"rarity"`
+			Product   string   `yaml:"product"`
+			Vendor    string   `yaml:"vendor"`
+			CPE       string   `yaml:"cpe"`
+			Version   string   `yaml:"version"`
+			Rarity    int      `yaml:"rarity"`
+			FOFAQuery []string `yaml:"fofa-query"`
 		} `yaml:"metadata"`
 	} `yaml:"info"`
 	HTTP []fingerprintYAMLHTTP `yaml:"http"`
@@ -118,6 +119,9 @@ func projectFingerprintHubWebYAML(source model.FingerprintSourceRule) (model.Fin
 		}
 		requestGroup := model.FingerprintMatchGroupProjection{Operator: normalizedGroupOperator(request.MatchersCondition)}
 		for _, upstream := range request.Matchers {
+			if fofaQueryRequiresAllWords(document.Info.Metadata.FOFAQuery, upstream.Words) {
+				upstream.Condition = "and"
+			}
 			condition, err := projectYAMLMatcher(upstream, "http")
 			if err != nil {
 				return model.FingerprintRuleProjection{}, err

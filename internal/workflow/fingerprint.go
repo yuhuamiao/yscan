@@ -124,6 +124,11 @@ func collectRunFingerprintMatchesWithEngine(ctx context.Context, engine *fingerp
 			}
 		}
 		results[index].Product, results[index].FingerprintSource = resolvedHardProduct(hardProducts)
+		if endpointServiceUnknown(results[index].Service) {
+			if candidate, exists := hardProducts[results[index].Product]; exists && candidate.role == "network_service" {
+				results[index].Service = results[index].Product
+			}
+		}
 		if probeErr != nil {
 			return results, persisted, probeErr
 		}
@@ -134,9 +139,19 @@ func collectRunFingerprintMatchesWithEngine(ctx context.Context, engine *fingerp
 	return results, persisted, nil
 }
 
+func endpointServiceUnknown(service string) bool {
+	switch strings.ToLower(strings.TrimSpace(service)) {
+	case "", "unknown", "none_unknown", "tcp", "tcp-unknown":
+		return true
+	default:
+		return false
+	}
+}
+
 const (
 	maxNmapProbesPerEndpoint = 3
 	nmapProbeEndpointBudget  = 4 * time.Second
+	nmapProbeReadBudget      = 3 * time.Second
 )
 
 func collectNmapProbeMatches(ctx context.Context, engine *fingerprint.Engine, ip string, port int, service string) ([]endpointEvidenceMatches, []model.ScanTaskRunProtocolEvidence, error) {
@@ -147,6 +162,11 @@ func collectNmapProbeMatches(ctx context.Context, engine *fingerprint.Engine, ip
 	probeContext, cancel := context.WithTimeout(ctx, nmapProbeEndpointBudget)
 	defer cancel()
 	selected := probes[:minInt(len(probes), maxNmapProbesPerEndpoint)]
+	for index := range selected {
+		if selected[index].Timeout <= 0 || selected[index].Timeout > nmapProbeReadBudget {
+			selected[index].Timeout = nmapProbeReadBudget
+		}
+	}
 	completed := make(chan nmapProbeResult, len(selected))
 	for index, probe := range selected {
 		go func(index int, probe fingerprint.NmapTCPProbe) {

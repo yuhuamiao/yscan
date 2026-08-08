@@ -233,17 +233,21 @@ func FingerprintProductClassification(name string, tags []string) (string, strin
 	switch name {
 	case "nginx", "apache", "apache http server", "apache httpd", "httpd", "iis", "microsoft iis", "caddy", "lighttpd", "jetty", "openresty":
 		return "web_server", "web_server"
-	case "html5":
-		return "markup", ""
-	case "script":
-		return "web_primitive", ""
-	case "jquery", "bootstrap":
-		return "frontend_library", ""
+	case "html5", "jquery", "jquery migrate", "bootstrap", "script":
+		return "frontend", ""
 	case "open-graph-protocol":
 		return "metadata", ""
+	case "php", "python", "node.js", "nodejs", "ruby", "perl", "java":
+		return "runtime", ""
+	case "flask", "werkzeug", "thinkphp", "django", "laravel", "spring", "spring framework":
+		return "framework", ""
+	case "wordpress", "drupal", "joomla", "hexo":
+		return "cms_application", ""
+	case "ubuntu", "debian", "centos", "red hat enterprise linux", "windows", "linux":
+		return "operating_system", ""
 	case "http", "https", "ssh", "ftp", "tcp", "unknown", "none_unknown":
 		return "protocol", ""
-	case "mysql", "postgresql", "mongodb", "redis", "openssh", "pure-ftpd", "vsftpd", "elasticsearch", "docker-api", "kubernetes-api":
+	case "mysql", "postgresql", "mongodb", "redis", "openssh", "dropbear", "dropbear sshd", "dropbear ssh server", "dropbear_ssh_server", "pure-ftpd", "vsftpd", "elasticsearch", "docker-api", "kubernetes-api":
 		return "network_service", "network_service"
 	}
 	if strings.Contains(name, "宝塔") || strings.Contains(name, "bt.cn") || strings.Contains(name, "cpanel") || strings.Contains(name, "plesk") {
@@ -255,7 +259,7 @@ func FingerprintProductClassification(name string, tags []string) (string, strin
 	for _, tag := range tags {
 		switch strings.ToLower(strings.TrimSpace(tag)) {
 		case "cms":
-			return "cms", ""
+			return "cms_application", ""
 		case "framework":
 			return "framework", ""
 		case "nmap-service", "service", "ftp", "database":
@@ -422,20 +426,25 @@ type ScanTaskRunVulnerability struct {
 // ScanTaskRunValidation records what vulnerability verification actually did.
 // A successful scan run alone never implies that validation executed.
 type ScanTaskRunValidation struct {
-	Status                 string `json:"status"`
-	CandidateEndpointCount int    `json:"candidate_endpoint_count"`
-	ExecutedEndpointCount  int    `json:"executed_endpoint_count"`
-	TemplateCount          int    `json:"template_count"`
-	FindingCount           int    `json:"finding_count"`
-	StartedAt              string `json:"started_at,omitempty"`
-	FinishedAt             string `json:"finished_at,omitempty"`
-	Error                  string `json:"error,omitempty"`
+	Status                 string   `json:"status"`
+	IdentifiedProductCount int      `json:"identified_product_count"`
+	MappedProductCount     int      `json:"mapped_product_count"`
+	UnmappedProducts       []string `json:"unmapped_products"`
+	CandidateEndpointCount int      `json:"candidate_endpoint_count"`
+	ExecutedEndpointCount  int      `json:"executed_endpoint_count"`
+	TemplateCount          int      `json:"template_count"`
+	ExecutedTemplateCount  int      `json:"executed_template_count"`
+	FindingCount           int      `json:"finding_count"`
+	StartedAt              string   `json:"started_at,omitempty"`
+	FinishedAt             string   `json:"finished_at,omitempty"`
+	Error                  string   `json:"error,omitempty"`
 }
 
 // ScanTaskRunTemplateCandidate preserves why one reviewed template was chosen.
 type ScanTaskRunTemplateCandidate struct {
 	TemplateID          string `json:"template_id"`
 	Path                string `json:"path"`
+	ProductKey          string `json:"product_key,omitempty"`
 	Source              string `json:"source"`
 	Reason              string `json:"reason"`
 	TemplateSHA256      string `json:"template_sha256,omitempty"`
@@ -444,6 +453,7 @@ type ScanTaskRunTemplateCandidate struct {
 	IP                  string `json:"ip,omitempty"`
 	Port                int    `json:"port,omitempty"`
 	Protocol            string `json:"protocol,omitempty"`
+	Executed            bool   `json:"executed"`
 }
 
 type FingerprintMatchEvidence struct {
@@ -576,7 +586,11 @@ func (membership HostScopeMembership) Valid() bool {
 
 type AssetPort struct {
 	Port              int                           `json:"port"`
+	Transport         string                        `json:"transport"`
+	State             string                        `json:"state"`
 	Service           string                        `json:"service"`
+	ObservationRunID  int64                         `json:"observation_run_id,omitempty"`
+	ObservedAt        string                        `json:"observed_at,omitempty"`
 	Protocol          string                        `json:"protocol,omitempty"`
 	StatusCode        int                           `json:"status_code,omitempty"`
 	Server            string                        `json:"server,omitempty"`
@@ -585,7 +599,65 @@ type AssetPort struct {
 	ResponseSHA256    string                        `json:"response_sha256,omitempty"`
 	ResponseTruncated bool                          `json:"response_truncated,omitempty"`
 	ProtocolEvidence  []ScanTaskRunProtocolEvidence `json:"protocol_evidence"`
+	Technologies      []AssetTechnology             `json:"technologies"`
+	Validation        AssetValidationSummary        `json:"validation"`
+	UnresolvedReasons []string                      `json:"unresolved_reasons"`
 	LastSeenAt        string                        `json:"last_seen_at"`
+}
+
+type AssetTechnologySource struct {
+	SourceKey     string `json:"source_key"`
+	SourceRuleID  string `json:"source_rule_id,omitempty"`
+	SourceProduct string `json:"source_product,omitempty"`
+}
+
+// AssetTechnology is the user-facing projection of one normalized product.
+// It deliberately keeps source wording and protocols without exposing raw
+// matcher or response content.
+type AssetTechnology struct {
+	ProductKey         string                  `json:"product_key"`
+	DisplayName        string                  `json:"display_name"`
+	SourceProductNames []string                `json:"source_product_names"`
+	Role               string                  `json:"role"`
+	ExclusiveGroup     string                  `json:"exclusive_group,omitempty"`
+	Protocols          []string                `json:"protocols"`
+	Version            string                  `json:"version,omitempty"`
+	VersionCandidates  []string                `json:"version_candidates"`
+	CPE                string                  `json:"cpe,omitempty"`
+	CPECandidates      []string                `json:"cpe_candidates"`
+	ProductStatus      string                  `json:"product_status"`
+	ProductSourceCount int                     `json:"product_source_count"`
+	VersionStatus      string                  `json:"version_status"`
+	VersionSourceCount int                     `json:"version_source_count"`
+	CPEStatus          string                  `json:"cpe_status"`
+	CPESourceCount     int                     `json:"cpe_source_count"`
+	Tags               []string                `json:"tags"`
+	Sources            []AssetTechnologySource `json:"sources"`
+	EvidenceSummaries  []string                `json:"evidence_summaries"`
+	ConflictCandidates []string                `json:"conflict_candidates"`
+}
+
+type AssetValidationSummary struct {
+	Enabled                   bool                       `json:"enabled"`
+	Status                    string                     `json:"status"`
+	Reason                    string                     `json:"reason,omitempty"`
+	IdentifiedProductCount    int                        `json:"identified_product_count"`
+	MappedProductCount        int                        `json:"mapped_product_count,omitempty"`
+	UnmappedProducts          []string                   `json:"unmapped_products"`
+	CandidateTemplateCount    int                        `json:"candidate_template_count"`
+	ExecutedTemplateCount     int                        `json:"executed_template_count,omitempty"`
+	FindingCount              int                        `json:"finding_count"`
+	Findings                  []ScanTaskRunVulnerability `json:"findings"`
+	RunCandidateEndpointCount int                        `json:"run_candidate_endpoint_count"`
+	RunExecutedEndpointCount  int                        `json:"run_executed_endpoint_count"`
+	RunIdentifiedProductCount int                        `json:"run_identified_product_count"`
+	RunMappedProductCount     int                        `json:"run_mapped_product_count"`
+	RunTemplateCount          int                        `json:"run_template_count"`
+	RunExecutedTemplateCount  int                        `json:"run_executed_template_count"`
+	RunFindingCount           int                        `json:"run_finding_count"`
+	StartedAt                 string                     `json:"started_at,omitempty"`
+	FinishedAt                string                     `json:"finished_at,omitempty"`
+	Error                     string                     `json:"error,omitempty"`
 }
 
 type AssetDetail struct {

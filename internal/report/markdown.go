@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -471,7 +472,7 @@ func RenderScanTaskRunMarkdown(report ScanTaskRunReport) string {
 	fmt.Fprintf(&builder, "| Generated | %s |\n\n", generatedAt.Format(time.RFC3339))
 
 	writeRunValidation(&builder, report.Snapshot.Validation, report.Snapshot.Vulnerabilities)
-	writeRunServiceSummary(&builder, report.Snapshot)
+	writeRunEndpointProfiles(&builder, report)
 
 	builder.WriteString("## Asset Changes\n\n")
 	fmt.Fprintf(&builder, "Baseline run: %d. Configuration changed: %t.\n\n", report.Changes.BaselineRunID, report.Changes.ConfigChanged)
@@ -498,8 +499,11 @@ func writeRunValidation(builder *strings.Builder, validation model.ScanTaskRunVa
 		}
 		severityCounts[severity]++
 	}
-	builder.WriteString("| Status | Candidate endpoints | Executed endpoints | Templates | Findings |\n| --- | ---: | ---: | ---: | ---: |\n")
-	fmt.Fprintf(builder, "| %s | %d | %d | %d | %d |\n\n", markdownCell(status), validation.CandidateEndpointCount, validation.ExecutedEndpointCount, validation.TemplateCount, len(findings))
+	builder.WriteString("| Status | Identified products | Mapped products | Candidate endpoints | Executed endpoints | Candidate templates | Executed templates | Findings |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+	fmt.Fprintf(builder, "| %s | %d | %d | %d | %d | %d | %d | %d |\n\n", markdownCell(status), validation.IdentifiedProductCount, validation.MappedProductCount, validation.CandidateEndpointCount, validation.ExecutedEndpointCount, validation.TemplateCount, validation.ExecutedTemplateCount, len(findings))
+	if len(validation.UnmappedProducts) > 0 {
+		builder.WriteString("Unmapped products: " + markdownCell(strings.Join(validation.UnmappedProducts, ", ")) + ".\n\n")
+	}
 	switch status {
 	case model.ScanTaskRunValidationDisabled:
 		builder.WriteString("Vulnerability validation was not enabled for this run.\n\n")
@@ -533,23 +537,199 @@ func writeRunValidation(builder *strings.Builder, validation model.ScanTaskRunVa
 	builder.WriteString("\n")
 }
 
-func writeRunServiceSummary(builder *strings.Builder, snapshot model.ScanTaskRunSnapshot) {
-	builder.WriteString("## Port And Service Summary\n\n")
-	if len(snapshot.Ports) == 0 {
+func writeRunEndpointProfiles(builder *strings.Builder, report ScanTaskRunReport) {
+	builder.WriteString("## Endpoint Profiles\n\n")
+	if len(report.Snapshot.Ports) == 0 {
 		builder.WriteString("No open ports were recorded.\n\n")
 		return
 	}
 	evidenceByPort := make(map[string][]model.ScanTaskRunProtocolEvidence)
-	for _, evidence := range snapshot.ProtocolEvidence {
+	for _, evidence := range report.Snapshot.ProtocolEvidence {
 		key := fmt.Sprintf("%s:%d", evidence.IP, evidence.Port)
 		evidenceByPort[key] = append(evidenceByPort[key], evidence)
 	}
-	builder.WriteString("| Endpoint | Service | Product | Protocol response |\n| --- | --- | --- | --- |\n")
-	for _, port := range snapshot.Ports {
-		key := fmt.Sprintf("%s:%d", port.IP, port.Port)
-		fmt.Fprintf(builder, "| %s | %s | %s | %s |\n", markdownCell(key), markdownCell(port.ServiceType), markdownCell(port.Product), markdownCell(protocolEvidenceSummary(evidenceByPort[key])))
+	conclusionsByPort := make(map[string][]map[string]interface{})
+	for _, conclusion := range report.FingerprintConclusions {
+		key := fmt.Sprintf("%s:%d", reportMapString(conclusion, "ip"), reportMapInt(conclusion, "port"))
+		conclusionsByPort[key] = append(conclusionsByPort[key], conclusion)
 	}
-	builder.WriteString("\n")
+	sourcesByProduct := endpointProductSources(report.FingerprintMatches)
+	for _, port := range report.Snapshot.Ports {
+		key := fmt.Sprintf("%s:%d", port.IP, port.Port)
+		conclusions := conclusionsByPort[key]
+		fmt.Fprintf(builder, "### %s\n\n", markdownCell(key))
+		builder.WriteString("| Layer | Result |\n| --- | --- |\n")
+		fmt.Fprintf(builder, "| Port and transport | open / TCP |\n")
+		fmt.Fprintf(builder, "| Basic service | %s |\n", markdownCell(port.ServiceType))
+		fmt.Fprintf(builder, "| Protocol response | %s |\n", markdownCell(protocolEvidenceSummary(evidenceByPort[key])))
+		fmt.Fprintf(builder, "| Vulnerability validation | %s |\n\n", markdownCell(endpointValidationSummary(report.Snapshot, port, conclusions)))
+
+		if len(conclusions) == 0 {
+			builder.WriteString("Technology stack: no product fingerprint conclusion was recorded.\n\n")
+		} else {
+			sort.Slice(conclusions, func(left, right int) bool {
+				leftRole, rightRole := reportMapString(conclusions[left], "product_role"), reportMapString(conclusions[right], "product_role")
+				if fingerprintRoleRank(leftRole) != fingerprintRoleRank(rightRole) {
+					return fingerprintRoleRank(leftRole) < fingerprintRoleRank(rightRole)
+				}
+				return reportMapString(conclusions[left], "product_key") < reportMapString(conclusions[right], "product_key")
+			})
+			builder.WriteString("| Technology role | Product | Version | CPE | Recognition sources | Evidence status |\n| --- | --- | --- | --- | --- | --- |\n")
+			for _, conclusion := range conclusions {
+				product := reportMapString(conclusion, "product_key")
+				sourceKey := key + "\x00" + reportMapString(conclusion, "protocol") + "\x00" + product
+				fmt.Fprintf(builder, "| %s | %s | %s | %s | %s | %s |\n",
+					markdownCell(fingerprintRoleLabel(reportMapString(conclusion, "product_role"))), markdownCell(product),
+					markdownCell(reportMapString(conclusion, "version")), markdownCell(reportMapString(conclusion, "cpe")),
+					markdownCell(strings.Join(sourcesByProduct[sourceKey], ", ")), markdownCell(reportMapString(conclusion, "product_status")))
+			}
+			builder.WriteString("\n")
+		}
+		if reasons := endpointUnresolvedReasons(report.Snapshot, port, conclusions); len(reasons) > 0 {
+			builder.WriteString("Unresolved reasons: " + markdownCell(strings.Join(reasons, "; ")) + ".\n\n")
+		}
+	}
+}
+
+func endpointProductSources(matches []map[string]interface{}) map[string][]string {
+	sets := make(map[string]map[string]struct{})
+	for _, match := range matches {
+		if soft, ok := match["soft_match"].(bool); ok && soft {
+			continue
+		}
+		key := fmt.Sprintf("%s:%d\x00%s\x00%s", reportMapString(match, "ip"), reportMapInt(match, "port"), reportMapString(match, "protocol"), reportMapString(match, "product_key"))
+		if sets[key] == nil {
+			sets[key] = make(map[string]struct{})
+		}
+		if source := strings.TrimSpace(reportMapString(match, "source_key")); source != "" {
+			sets[key][source] = struct{}{}
+		}
+	}
+	result := make(map[string][]string, len(sets))
+	for key, values := range sets {
+		for value := range values {
+			result[key] = append(result[key], value)
+		}
+		sort.Strings(result[key])
+	}
+	return result
+}
+
+func fingerprintRoleRank(role string) int {
+	order := map[string]int{"network_service": 0, "database": 1, "web_server": 2, "runtime": 3, "framework": 4, "middleware": 5, "cms_application": 6, "control_panel": 7, "frontend": 8, "operating_system": 9, "application": 10}
+	if rank, ok := order[role]; ok {
+		return rank
+	}
+	return 99
+}
+
+func fingerprintRoleLabel(role string) string {
+	labels := map[string]string{"network_service": "Network service", "database": "Database", "web_server": "Web server", "runtime": "Runtime / language", "framework": "Framework", "middleware": "Middleware", "cms_application": "CMS / application", "control_panel": "Control panel", "frontend": "Frontend", "operating_system": "Operating system", "application": "Application"}
+	if label := labels[role]; label != "" {
+		return label
+	}
+	if role == "" {
+		return "Application"
+	}
+	return role
+}
+
+func endpointValidationSummary(snapshot model.ScanTaskRunSnapshot, port model.ScanTaskRunPort, conclusions []map[string]interface{}) string {
+	candidates := make(map[string]struct{})
+	executedTemplates := make(map[string]struct{})
+	findings := 0
+	for _, candidate := range snapshot.TemplateCandidates {
+		if candidate.IP == port.IP && candidate.Port == port.Port {
+			key := candidate.TemplateID + "\x00" + candidate.Path
+			candidates[key] = struct{}{}
+			if candidate.Executed {
+				executedTemplates[key] = struct{}{}
+			}
+		}
+	}
+	for _, finding := range snapshot.Vulnerabilities {
+		if finding.TargetIP == port.IP && finding.TargetPort == port.Port {
+			findings++
+		}
+	}
+	status := snapshot.Validation.Status
+	if status == "" {
+		status = "unavailable"
+	} else if status == model.ScanTaskRunValidationSuccess && len(candidates) == 0 {
+		status = model.ScanTaskRunValidationNoCandidates
+	}
+	reason := ""
+	if status == model.ScanTaskRunValidationNoCandidates {
+		if len(conclusions) == 0 {
+			reason = "; reason=unidentified product"
+		} else {
+			reason = "; reason=no template mapping"
+		}
+	}
+	return fmt.Sprintf("%s%s; candidate templates=%d; executed templates=%d; findings=%d", status, reason, len(candidates), len(executedTemplates), findings)
+}
+
+func endpointUnresolvedReasons(snapshot model.ScanTaskRunSnapshot, port model.ScanTaskRunPort, conclusions []map[string]interface{}) []string {
+	reasons := make([]string, 0, 3)
+	responded := false
+	for _, evidence := range snapshot.ProtocolEvidence {
+		if evidence.IP == port.IP && evidence.Port == port.Port && evidence.Responded {
+			responded = true
+			break
+		}
+	}
+	if !responded {
+		reasons = append(reasons, "no protocol response was captured")
+	}
+	if len(conclusions) == 0 {
+		reasons = append(reasons, "product was not identified")
+	}
+	mappedProducts := make(map[string]struct{})
+	for _, candidate := range snapshot.TemplateCandidates {
+		if candidate.IP == port.IP && candidate.Port == port.Port && strings.TrimSpace(candidate.ProductKey) != "" {
+			mappedProducts[strings.ToLower(strings.TrimSpace(candidate.ProductKey))] = struct{}{}
+		}
+	}
+	for _, conclusion := range conclusions {
+		product := strings.TrimSpace(reportMapString(conclusion, "product_key"))
+		if product == "" {
+			continue
+		}
+		if _, mapped := mappedProducts[strings.ToLower(product)]; !mapped {
+			reasons = append(reasons, "no template mapping for "+product)
+		}
+	}
+	switch snapshot.Validation.Status {
+	case model.ScanTaskRunValidationDisabled:
+		reasons = append(reasons, "vulnerability validation was disabled")
+	case model.ScanTaskRunValidationNotStarted:
+		reasons = append(reasons, "vulnerability validation did not start")
+	case model.ScanTaskRunValidationNoCandidates:
+		reasons = append(reasons, "no usable template mapping or candidate")
+	case model.ScanTaskRunValidationFailed:
+		reasons = append(reasons, "vulnerability validation failed")
+	case model.ScanTaskRunValidationSuccess:
+		if len(mappedProducts) == 0 {
+			reasons = append(reasons, "no usable template mapping or candidate")
+		}
+	}
+	return uniqueReportStrings(reasons)
+}
+
+func uniqueReportStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func protocolEvidenceSummary(evidence []model.ScanTaskRunProtocolEvidence) string {
@@ -675,13 +855,13 @@ func RenderScanTaskRunAuditMarkdown(report ScanTaskRunReport) string {
 	if len(report.Snapshot.TemplateCandidates) == 0 {
 		builder.WriteString("No validation templates were selected.\n\n")
 	} else {
-		builder.WriteString("| Endpoint | Template | Source | Mapping Revision | Template SHA-256 | Reason |\n| --- | --- | --- | --- | --- | --- |\n")
+		builder.WriteString("| Endpoint | Product | Template | Source | Executed | Mapping Revision | Template SHA-256 | Reason |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n")
 		for _, candidate := range report.Snapshot.TemplateCandidates {
 			endpoint := "-"
 			if candidate.IP != "" {
 				endpoint = fmt.Sprintf("%s:%d/%s", candidate.IP, candidate.Port, candidate.Protocol)
 			}
-			fmt.Fprintf(&builder, "| %s | %s | %s | %s | %s | %s |\n", markdownCell(endpoint), markdownCell(candidate.TemplateID), markdownCell(candidate.Source), markdownCell(candidate.TemplateSetRevision), markdownCell(candidate.TemplateSHA256), markdownCell(candidate.Reason))
+			fmt.Fprintf(&builder, "| %s | %s | %s | %s | %t | %s | %s | %s |\n", markdownCell(endpoint), markdownCell(candidate.ProductKey), markdownCell(candidate.TemplateID), markdownCell(candidate.Source), candidate.Executed, markdownCell(candidate.TemplateSetRevision), markdownCell(candidate.TemplateSHA256), markdownCell(candidate.Reason))
 		}
 		builder.WriteString("\n")
 	}

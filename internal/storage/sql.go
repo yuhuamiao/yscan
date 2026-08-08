@@ -200,9 +200,13 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS scan_task_run_validation (
 			scan_task_run_id INTEGER PRIMARY KEY REFERENCES scan_task_runs(id) ON DELETE CASCADE,
 			status TEXT NOT NULL CHECK (status IN ('disabled', 'not_started', 'no_candidates', 'success', 'failed')),
+			identified_product_count INTEGER NOT NULL DEFAULT 0,
+			mapped_product_count INTEGER NOT NULL DEFAULT 0,
+			unmapped_products_json TEXT NOT NULL DEFAULT '[]',
 			candidate_endpoint_count INTEGER NOT NULL DEFAULT 0,
 			executed_endpoint_count INTEGER NOT NULL DEFAULT 0,
 			template_count INTEGER NOT NULL DEFAULT 0,
+			executed_template_count INTEGER NOT NULL DEFAULT 0,
 			finding_count INTEGER NOT NULL DEFAULT 0,
 			started_at TEXT, finished_at TEXT, error_message TEXT
 		)`,
@@ -232,6 +236,8 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 			ip TEXT NOT NULL,
 			port INTEGER NOT NULL,
 			protocol TEXT NOT NULL,
+			product_key TEXT NOT NULL DEFAULT '',
+			executed INTEGER NOT NULL DEFAULT 0 CHECK (executed IN (0, 1)),
 			PRIMARY KEY (scan_task_run_id, template_id, path, ip, port, protocol),
 			FOREIGN KEY (scan_task_run_id, template_id, path)
 				REFERENCES scan_task_run_template_candidates(scan_task_run_id, template_id, path) ON DELETE CASCADE
@@ -458,6 +464,12 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 		`ALTER TABLE scan_task_run_template_candidates ADD COLUMN template_sha256 TEXT`,
 		`ALTER TABLE scan_task_run_template_candidates ADD COLUMN template_set_revision TEXT`,
 		`ALTER TABLE scan_task_run_template_candidates ADD COLUMN template_mapping_import_id INTEGER`,
+		`ALTER TABLE scan_task_run_template_candidate_endpoints ADD COLUMN product_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE scan_task_run_template_candidate_endpoints ADD COLUMN executed INTEGER NOT NULL DEFAULT 0 CHECK (executed IN (0, 1))`,
+		`ALTER TABLE scan_task_run_validation ADD COLUMN identified_product_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE scan_task_run_validation ADD COLUMN mapped_product_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE scan_task_run_validation ADD COLUMN unmapped_products_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE scan_task_run_validation ADD COLUMN executed_template_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE fingerprint_template_mappings ADD COLUMN source_key TEXT`,
 		`UPDATE domain_info SET last_seen = COALESCE(last_seen, first_seen, datetime('now'))`,
 		`UPDATE domain_info SET is_active = COALESCE(is_active, 1)`,
@@ -771,17 +783,23 @@ func migrateRunValidationSchema(db *sql.DB) error {
 	if _, err := tx.Exec(`CREATE TABLE scan_task_run_validation (
 		scan_task_run_id INTEGER PRIMARY KEY REFERENCES scan_task_runs(id) ON DELETE CASCADE,
 		status TEXT NOT NULL CHECK (status IN ('disabled', 'not_started', 'no_candidates', 'success', 'failed')),
+		identified_product_count INTEGER NOT NULL DEFAULT 0,
+		mapped_product_count INTEGER NOT NULL DEFAULT 0,
+		unmapped_products_json TEXT NOT NULL DEFAULT '[]',
 		candidate_endpoint_count INTEGER NOT NULL DEFAULT 0,
 		executed_endpoint_count INTEGER NOT NULL DEFAULT 0,
 		template_count INTEGER NOT NULL DEFAULT 0,
+		executed_template_count INTEGER NOT NULL DEFAULT 0,
 		finding_count INTEGER NOT NULL DEFAULT 0,
 		started_at TEXT, finished_at TEXT, error_message TEXT
 	)`); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT INTO scan_task_run_validation
-		(scan_task_run_id, status, candidate_endpoint_count, executed_endpoint_count, template_count, finding_count, started_at, finished_at, error_message)
-		SELECT scan_task_run_id, status, candidate_endpoint_count, executed_endpoint_count, template_count, finding_count, started_at, finished_at, error_message
+		(scan_task_run_id, status, identified_product_count, mapped_product_count, unmapped_products_json,
+		 candidate_endpoint_count, executed_endpoint_count, template_count, executed_template_count, finding_count, started_at, finished_at, error_message)
+		SELECT scan_task_run_id, status, identified_product_count, mapped_product_count, unmapped_products_json,
+		       candidate_endpoint_count, executed_endpoint_count, template_count, executed_template_count, finding_count, started_at, finished_at, error_message
 		FROM scan_task_run_validation_t321_legacy`); err != nil {
 		return err
 	}
@@ -1001,9 +1019,13 @@ CREATE TABLE IF NOT EXISTS scan_task_run_protocol_evidence (
 CREATE TABLE IF NOT EXISTS scan_task_run_validation (
     scan_task_run_id INTEGER PRIMARY KEY REFERENCES scan_task_runs(id) ON DELETE CASCADE,
 	status TEXT NOT NULL CHECK (status IN ('disabled', 'not_started', 'no_candidates', 'success', 'failed')),
+	identified_product_count INTEGER NOT NULL DEFAULT 0,
+	mapped_product_count INTEGER NOT NULL DEFAULT 0,
+	unmapped_products_json TEXT NOT NULL DEFAULT '[]',
     candidate_endpoint_count INTEGER NOT NULL DEFAULT 0,
     executed_endpoint_count INTEGER NOT NULL DEFAULT 0,
     template_count INTEGER NOT NULL DEFAULT 0,
+	executed_template_count INTEGER NOT NULL DEFAULT 0,
     finding_count INTEGER NOT NULL DEFAULT 0,
     started_at TEXT,
     finished_at TEXT,
@@ -1039,6 +1061,8 @@ CREATE TABLE IF NOT EXISTS scan_task_run_template_candidate_endpoints (
     ip TEXT NOT NULL,
     port INTEGER NOT NULL,
     protocol TEXT NOT NULL,
+	product_key TEXT NOT NULL DEFAULT '',
+	executed INTEGER NOT NULL DEFAULT 0 CHECK (executed IN (0, 1)),
     PRIMARY KEY (scan_task_run_id, template_id, path, ip, port, protocol),
     FOREIGN KEY (scan_task_run_id, template_id, path)
         REFERENCES scan_task_run_template_candidates(scan_task_run_id, template_id, path) ON DELETE CASCADE
@@ -2854,11 +2878,13 @@ func GetAssetDetail(db *sql.DB, ip string) (model.AssetDetail, error) {
 		return model.AssetDetail{}, err
 	}
 
-	rows, err := db.Query(`
-		SELECT port, service_type, last_seen
-		FROM current_port_inventory
-		WHERE ip = ?
-		ORDER BY port ASC`, ip)
+	rows, err := db.Query(latestAssetPortRunsCTE+`
+		SELECT inventory.port, inventory.service_type, inventory.last_seen,
+			COALESCE(latest.scan_task_run_id, 0), COALESCE(latest.observed_at, '')
+		FROM current_port_inventory AS inventory
+		LEFT JOIN latest_port_runs AS latest ON latest.port = inventory.port
+		WHERE inventory.ip = ?
+		ORDER BY inventory.port ASC`, ip, ip)
 	if isMissingCurrentPortInventory(err) {
 		detail.Ports = make([]model.AssetPort, 0)
 		return detail, nil
@@ -2869,9 +2895,16 @@ func GetAssetDetail(db *sql.DB, ip string) (model.AssetDetail, error) {
 	detail.Ports = make([]model.AssetPort, 0)
 	for rows.Next() {
 		var port model.AssetPort
-		if err := rows.Scan(&port.Port, &port.Service, &port.LastSeenAt); err != nil {
+		if err := rows.Scan(&port.Port, &port.Service, &port.LastSeenAt, &port.ObservationRunID, &port.ObservedAt); err != nil {
 			return model.AssetDetail{}, err
 		}
+		port.Transport = "tcp"
+		port.State = "open"
+		port.ProtocolEvidence = make([]model.ScanTaskRunProtocolEvidence, 0)
+		port.Technologies = make([]model.AssetTechnology, 0)
+		port.UnresolvedReasons = make([]string, 0)
+		port.Validation.UnmappedProducts = make([]string, 0)
+		port.Validation.Findings = make([]model.ScanTaskRunVulnerability, 0)
 		detail.Ports = append(detail.Ports, port)
 	}
 	if err := rows.Err(); err != nil {
@@ -2881,13 +2914,32 @@ func GetAssetDetail(db *sql.DB, ip string) (model.AssetDetail, error) {
 	if err := rows.Close(); err != nil {
 		return model.AssetDetail{}, err
 	}
-	if err := loadLatestAssetPortEvidenceSet(db, ip, detail.Ports); err != nil {
+	if err := loadAssetPortEvidenceSet(db, ip, detail.Ports); err != nil {
 		return model.AssetDetail{}, err
 	}
+	if err := loadAssetPortTechnologySet(db, ip, detail.Ports); err != nil {
+		return model.AssetDetail{}, err
+	}
+	if err := loadAssetPortValidationSet(db, ip, detail.Ports); err != nil {
+		return model.AssetDetail{}, err
+	}
+	finalizeAssetPortProfiles(detail.Ports)
 	return detail, nil
 }
 
-func loadLatestAssetPortEvidenceSet(db *sql.DB, ip string, ports []model.AssetPort) error {
+const latestAssetPortRunsCTE = `
+	WITH ranked_port_runs AS (
+		SELECT run_port.port, run_port.scan_task_run_id,
+			COALESCE(run.snapshot_written_at, run.finished_at, run.updated_at, run.created_at) AS observed_at,
+			ROW_NUMBER() OVER (PARTITION BY run_port.port ORDER BY run_port.scan_task_run_id DESC) AS position
+		FROM scan_task_run_ports AS run_port
+		JOIN scan_task_runs AS run ON run.id = run_port.scan_task_run_id
+		WHERE run_port.ip = ? AND run.snapshot_written_at IS NOT NULL
+	), latest_port_runs AS (
+		SELECT port, scan_task_run_id, observed_at FROM ranked_port_runs WHERE position = 1
+	)`
+
+func loadAssetPortEvidenceSet(db *sql.DB, ip string, ports []model.AssetPort) error {
 	if len(ports) == 0 {
 		return nil
 	}
@@ -2896,14 +2948,7 @@ func loadLatestAssetPortEvidenceSet(db *sql.DB, ip string, ports []model.AssetPo
 		portIndexes[ports[index].Port] = index
 		ports[index].ProtocolEvidence = make([]model.ScanTaskRunProtocolEvidence, 0)
 	}
-	rows, err := db.Query(`
-		WITH latest_port_runs AS (
-			SELECT run_port.port, MAX(run_port.scan_task_run_id) AS scan_task_run_id
-			FROM scan_task_run_ports AS run_port
-			JOIN scan_task_runs AS port_run ON port_run.id = run_port.scan_task_run_id
-			WHERE run_port.ip = ? AND port_run.snapshot_written_at IS NOT NULL
-			GROUP BY run_port.port
-		)
+	rows, err := db.Query(latestAssetPortRunsCTE+`
 		SELECT evidence.port, evidence.evidence_type, evidence.probe_name, evidence.protocol, evidence.responded,
 			COALESCE(evidence.outcome, ''), COALESCE(evidence.diagnostic, ''),
 			COALESCE(evidence.status_code, 0), COALESCE(evidence.server, ''), COALESCE(evidence.title, ''),
@@ -2945,6 +2990,406 @@ func loadLatestAssetPortEvidenceSet(db *sql.DB, ip string, ports []model.AssetPo
 		applyAssetPortEvidenceCompatibility(&ports[index])
 	}
 	return rows.Err()
+}
+
+type assetTechnologyAccumulator struct {
+	technology         model.AssetTechnology
+	protocols          map[string]struct{}
+	versions           map[string]struct{}
+	cpes               map[string]struct{}
+	tags               map[string]struct{}
+	sourceProducts     map[string]struct{}
+	sources            map[string]model.AssetTechnologySource
+	evidence           map[string]struct{}
+	productStatus      string
+	versionStatus      string
+	cpeStatus          string
+	productSourceCount int
+	versionSourceCount int
+	cpeSourceCount     int
+}
+
+func loadAssetPortTechnologySet(db *sql.DB, ip string, ports []model.AssetPort) error {
+	if len(ports) == 0 {
+		return nil
+	}
+	portIndexes := make(map[int]int, len(ports))
+	for index := range ports {
+		portIndexes[ports[index].Port] = index
+	}
+	rows, err := db.Query(latestAssetPortRunsCTE+`
+		SELECT conclusion.port, conclusion.protocol, conclusion.product_key,
+			COALESCE(conclusion.product_role, ''), COALESCE(conclusion.exclusive_group, ''),
+			COALESCE(conclusion.version, ''), COALESCE(conclusion.cpe, ''), conclusion.tags_json,
+			conclusion.product_status, conclusion.product_source_count,
+			conclusion.version_status, conclusion.version_source_count,
+			conclusion.cpe_status, conclusion.cpe_source_count,
+			COALESCE(source.source_key, ''), COALESCE(source_rule.source_rule_id, ''),
+			COALESCE(match.source_product_name, ''), COALESCE(match.evidence_summary, '')
+		FROM asset_fingerprint_conclusions AS conclusion
+		JOIN latest_port_runs AS latest ON latest.port = conclusion.port AND latest.scan_task_run_id = conclusion.scan_task_run_id
+		LEFT JOIN asset_fingerprint_matches AS match
+			ON match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip
+			AND match.port = conclusion.port AND match.protocol = conclusion.protocol
+			AND match.product_key = conclusion.product_key AND match.is_soft = 0
+		LEFT JOIN fingerprint_source_rules AS source_rule ON source_rule.id = match.fingerprint_source_rule_id
+		LEFT JOIN fingerprint_imports AS import_revision ON import_revision.id = source_rule.fingerprint_import_id
+		LEFT JOIN fingerprint_sources AS source ON source.id = import_revision.fingerprint_source_id
+		WHERE conclusion.ip = ?
+		ORDER BY conclusion.port, conclusion.product_role, conclusion.product_key, conclusion.protocol, source.source_key, source_rule.source_rule_id`, ip, ip)
+	if err != nil {
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "no such table") && strings.Contains(message, "fingerprint") {
+			return nil
+		}
+		return err
+	}
+	defer rows.Close()
+	byPort := make(map[int]map[string]*assetTechnologyAccumulator)
+	for rows.Next() {
+		var port, productSources, versionSources, cpeSources int
+		var protocol, product, role, exclusiveGroup, version, cpe, tagsJSON string
+		var productStatus, versionStatus, cpeStatus, sourceKey, sourceRuleID, sourceProduct, evidenceSummary string
+		if err := rows.Scan(&port, &protocol, &product, &role, &exclusiveGroup, &version, &cpe, &tagsJSON,
+			&productStatus, &productSources, &versionStatus, &versionSources, &cpeStatus, &cpeSources,
+			&sourceKey, &sourceRuleID, &sourceProduct, &evidenceSummary); err != nil {
+			return err
+		}
+		if _, ok := portIndexes[port]; !ok {
+			continue
+		}
+		if byPort[port] == nil {
+			byPort[port] = make(map[string]*assetTechnologyAccumulator)
+		}
+		key := strings.ToLower(strings.TrimSpace(product)) + "\x00" + strings.ToLower(strings.TrimSpace(role)) + "\x00" + strings.ToLower(strings.TrimSpace(exclusiveGroup))
+		value := byPort[port][key]
+		if value == nil {
+			value = &assetTechnologyAccumulator{
+				technology: model.AssetTechnology{ProductKey: product, DisplayName: product, Role: role, ExclusiveGroup: exclusiveGroup},
+				protocols:  make(map[string]struct{}), versions: make(map[string]struct{}), cpes: make(map[string]struct{}), tags: make(map[string]struct{}),
+				sourceProducts: make(map[string]struct{}), sources: make(map[string]model.AssetTechnologySource), evidence: make(map[string]struct{}),
+			}
+			byPort[port][key] = value
+		}
+		addNonEmptySet(value.protocols, protocol)
+		addNonEmptySet(value.versions, version)
+		addNonEmptySet(value.cpes, cpe)
+		var tags []string
+		_ = json.Unmarshal([]byte(tagsJSON), &tags)
+		for _, tag := range tags {
+			addNonEmptySet(value.tags, tag)
+		}
+		addNonEmptySet(value.sourceProducts, sourceProduct)
+		addNonEmptySet(value.evidence, evidenceSummary)
+		if sourceKey != "" || sourceRuleID != "" || sourceProduct != "" {
+			sourceIdentity := sourceKey + "\x00" + sourceRuleID + "\x00" + sourceProduct
+			value.sources[sourceIdentity] = model.AssetTechnologySource{SourceKey: sourceKey, SourceRuleID: sourceRuleID, SourceProduct: sourceProduct}
+		}
+		value.productStatus = strongerEvidenceStatus(value.productStatus, productStatus)
+		value.versionStatus = strongerEvidenceStatus(value.versionStatus, versionStatus)
+		value.cpeStatus = strongerEvidenceStatus(value.cpeStatus, cpeStatus)
+		value.productSourceCount = maxInt(value.productSourceCount, productSources)
+		value.versionSourceCount = maxInt(value.versionSourceCount, versionSources)
+		value.cpeSourceCount = maxInt(value.cpeSourceCount, cpeSources)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for port, products := range byPort {
+		index := portIndexes[port]
+		technologies := make([]model.AssetTechnology, 0, len(products))
+		for _, value := range products {
+			technology := value.technology
+			technology.Protocols = sortedSet(value.protocols)
+			technology.VersionCandidates = sortedSet(value.versions)
+			technology.CPECandidates = sortedSet(value.cpes)
+			technology.Tags = sortedSet(value.tags)
+			technology.SourceProductNames = sortedSet(value.sourceProducts)
+			technology.EvidenceSummaries = sortedSet(value.evidence)
+			technology.Sources = sortedTechnologySources(value.sources)
+			technology.ProductStatus = nonEmptyStatus(value.productStatus, "matched")
+			technology.VersionStatus = nonEmptyStatus(value.versionStatus, "unobserved")
+			technology.CPEStatus = nonEmptyStatus(value.cpeStatus, "unobserved")
+			technology.ProductSourceCount = maxInt(value.productSourceCount, len(technology.Sources))
+			technology.VersionSourceCount = value.versionSourceCount
+			technology.CPESourceCount = value.cpeSourceCount
+			if len(technology.VersionCandidates) == 1 {
+				technology.Version = technology.VersionCandidates[0]
+			} else if len(technology.VersionCandidates) > 1 {
+				technology.VersionStatus = "conflicted"
+			}
+			if len(technology.CPECandidates) == 1 {
+				technology.CPE = technology.CPECandidates[0]
+			} else if len(technology.CPECandidates) > 1 {
+				technology.CPEStatus = "conflicted"
+			}
+			technologies = append(technologies, technology)
+		}
+		sort.Slice(technologies, func(left, right int) bool {
+			if technologies[left].Role != technologies[right].Role {
+				return technologies[left].Role < technologies[right].Role
+			}
+			return technologies[left].ProductKey < technologies[right].ProductKey
+		})
+		for technologyIndex := range technologies {
+			if technologies[technologyIndex].ProductStatus != "conflicted" || technologies[technologyIndex].ExclusiveGroup == "" {
+				continue
+			}
+			for candidateIndex := range technologies {
+				if candidateIndex != technologyIndex && technologies[candidateIndex].ExclusiveGroup == technologies[technologyIndex].ExclusiveGroup {
+					technologies[technologyIndex].ConflictCandidates = append(technologies[technologyIndex].ConflictCandidates, technologies[candidateIndex].ProductKey)
+				}
+			}
+			sort.Strings(technologies[technologyIndex].ConflictCandidates)
+		}
+		ports[index].Technologies = technologies
+	}
+	return nil
+}
+
+func loadAssetPortValidationSet(db *sql.DB, ip string, ports []model.AssetPort) error {
+	if len(ports) == 0 {
+		return nil
+	}
+	portIndexes := make(map[int]int, len(ports))
+	for index := range ports {
+		portIndexes[ports[index].Port] = index
+	}
+	rows, err := db.Query(latestAssetPortRunsCTE+`
+		SELECT latest.port, validation.status, validation.identified_product_count, validation.mapped_product_count,
+			validation.unmapped_products_json, validation.candidate_endpoint_count,
+			validation.executed_endpoint_count, validation.template_count, validation.executed_template_count, validation.finding_count,
+			COALESCE(validation.started_at, ''), COALESCE(validation.finished_at, ''), COALESCE(validation.error_message, '')
+		FROM latest_port_runs AS latest
+		JOIN scan_task_run_validation AS validation ON validation.scan_task_run_id = latest.scan_task_run_id
+		ORDER BY latest.port`, ip)
+	if err != nil {
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "no such table: scan_task_run_validation") {
+			return nil
+		}
+		return err
+	}
+	for rows.Next() {
+		var port int
+		var summary model.AssetValidationSummary
+		var unmappedProductsJSON string
+		if err := rows.Scan(&port, &summary.Status, &summary.RunIdentifiedProductCount, &summary.RunMappedProductCount, &unmappedProductsJSON,
+			&summary.RunCandidateEndpointCount, &summary.RunExecutedEndpointCount,
+			&summary.RunTemplateCount, &summary.RunExecutedTemplateCount, &summary.RunFindingCount, &summary.StartedAt, &summary.FinishedAt, &summary.Error); err != nil {
+			rows.Close()
+			return err
+		}
+		if index, ok := portIndexes[port]; ok {
+			summary.Enabled = summary.Status != model.ScanTaskRunValidationDisabled
+			summary.UnmappedProducts = make([]string, 0)
+			var ignoredRunUnmappedProducts []string
+			_ = json.Unmarshal([]byte(unmappedProductsJSON), &ignoredRunUnmappedProducts)
+			summary.Findings = make([]model.ScanTaskRunVulnerability, 0)
+			ports[index].Validation = summary
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	candidateRows, err := db.Query(latestAssetPortRunsCTE+`
+		SELECT endpoint.port, endpoint.template_id, endpoint.path, COALESCE(endpoint.product_key, ''), COALESCE(endpoint.executed, 0)
+		FROM scan_task_run_template_candidate_endpoints AS endpoint
+		JOIN latest_port_runs AS latest ON latest.port = endpoint.port AND latest.scan_task_run_id = endpoint.scan_task_run_id
+		WHERE endpoint.ip = ?
+		ORDER BY endpoint.port, endpoint.template_id, endpoint.path`, ip, ip)
+	if err != nil {
+		return err
+	}
+	templatesByPort := make(map[int]map[string]struct{})
+	executedTemplatesByPort := make(map[int]map[string]struct{})
+	mappedProductsByPort := make(map[int]map[string]struct{})
+	for candidateRows.Next() {
+		var port, executed int
+		var templateID, path, product string
+		if err := candidateRows.Scan(&port, &templateID, &path, &product, &executed); err != nil {
+			candidateRows.Close()
+			return err
+		}
+		if _, ok := portIndexes[port]; ok {
+			if templatesByPort[port] == nil {
+				templatesByPort[port] = make(map[string]struct{})
+			}
+			templatesByPort[port][templateID+"\x00"+path] = struct{}{}
+			if executed != 0 {
+				if executedTemplatesByPort[port] == nil {
+					executedTemplatesByPort[port] = make(map[string]struct{})
+				}
+				executedTemplatesByPort[port][templateID+"\x00"+path] = struct{}{}
+			}
+			if product != "" {
+				if mappedProductsByPort[port] == nil {
+					mappedProductsByPort[port] = make(map[string]struct{})
+				}
+				mappedProductsByPort[port][strings.ToLower(strings.TrimSpace(product))] = struct{}{}
+			}
+		}
+	}
+	if err := candidateRows.Err(); err != nil {
+		candidateRows.Close()
+		return err
+	}
+	if err := candidateRows.Close(); err != nil {
+		return err
+	}
+	for port, index := range portIndexes {
+		ports[index].Validation.CandidateTemplateCount = len(templatesByPort[port])
+		ports[index].Validation.ExecutedTemplateCount = len(executedTemplatesByPort[port])
+		ports[index].Validation.MappedProductCount = len(mappedProductsByPort[port])
+		ports[index].Validation.UnmappedProducts = make([]string, 0)
+		for _, technology := range ports[index].Technologies {
+			if _, mapped := mappedProductsByPort[port][strings.ToLower(strings.TrimSpace(technology.ProductKey))]; !mapped {
+				ports[index].Validation.UnmappedProducts = append(ports[index].Validation.UnmappedProducts, technology.ProductKey)
+			}
+		}
+		sort.Strings(ports[index].Validation.UnmappedProducts)
+	}
+	findingRows, err := db.Query(latestAssetPortRunsCTE+`
+		SELECT finding.target_port, finding.finding_key, COALESCE(finding.template_id, ''), COALESCE(finding.name, ''),
+			COALESCE(finding.severity, ''), finding.target, COALESCE(finding.target_ip, ''),
+			COALESCE(finding.matched_at, ''), COALESCE(finding.description, '')
+		FROM scan_task_run_vulnerabilities AS finding
+		JOIN latest_port_runs AS latest ON latest.port = finding.target_port AND latest.scan_task_run_id = finding.scan_task_run_id
+		WHERE finding.target_ip = ?
+		ORDER BY finding.target_port, finding.finding_key`, ip, ip)
+	if err != nil {
+		return err
+	}
+	defer findingRows.Close()
+	for findingRows.Next() {
+		var finding model.ScanTaskRunVulnerability
+		if err := findingRows.Scan(&finding.TargetPort, &finding.FindingKey, &finding.TemplateID, &finding.Name,
+			&finding.Severity, &finding.Target, &finding.TargetIP, &finding.MatchedAt, &finding.Description); err != nil {
+			return err
+		}
+		if index, ok := portIndexes[finding.TargetPort]; ok {
+			ports[index].Validation.Findings = append(ports[index].Validation.Findings, finding)
+			ports[index].Validation.FindingCount = len(ports[index].Validation.Findings)
+		}
+	}
+	return findingRows.Err()
+}
+
+func finalizeAssetPortProfiles(ports []model.AssetPort) {
+	for index := range ports {
+		port := &ports[index]
+		port.Validation.IdentifiedProductCount = len(port.Technologies)
+		if port.Validation.Enabled && port.Validation.Status == model.ScanTaskRunValidationSuccess && port.Validation.CandidateTemplateCount == 0 {
+			port.Validation.Status = model.ScanTaskRunValidationNoCandidates
+		}
+		if port.ObservationRunID == 0 {
+			port.UnresolvedReasons = append(port.UnresolvedReasons, "observation_unavailable")
+		}
+		responded := false
+		for _, evidence := range port.ProtocolEvidence {
+			responded = responded || evidence.Responded
+		}
+		if !responded {
+			port.UnresolvedReasons = append(port.UnresolvedReasons, "no_protocol_response")
+		}
+		if len(port.Technologies) == 0 {
+			port.UnresolvedReasons = append(port.UnresolvedReasons, "unidentified_product")
+		}
+		if len(port.Validation.UnmappedProducts) > 0 && port.Validation.MappedProductCount > 0 {
+			port.UnresolvedReasons = append(port.UnresolvedReasons, "partial_template_mapping")
+		}
+		port.Validation.Reason = assetValidationReason(*port)
+		if port.Validation.Reason != "" && port.Validation.Reason != "disabled" {
+			port.UnresolvedReasons = append(port.UnresolvedReasons, port.Validation.Reason)
+		}
+		port.UnresolvedReasons = uniqueSortedStrings(port.UnresolvedReasons)
+	}
+}
+
+func assetValidationReason(port model.AssetPort) string {
+	switch port.Validation.Status {
+	case model.ScanTaskRunValidationDisabled:
+		return "disabled"
+	case model.ScanTaskRunValidationNotStarted:
+		return "scan_or_collection_incomplete"
+	case model.ScanTaskRunValidationNoCandidates:
+		if len(port.Technologies) == 0 {
+			return "unidentified_product"
+		}
+		return "mapping_missing"
+	case model.ScanTaskRunValidationFailed:
+		return "execution_failed"
+	case model.ScanTaskRunValidationSuccess:
+		return ""
+	default:
+		if port.ObservationRunID == 0 {
+			return "observation_unavailable"
+		}
+		return "validation_state_unavailable"
+	}
+}
+
+func addNonEmptySet(set map[string]struct{}, value string) {
+	value = strings.TrimSpace(value)
+	if value != "" {
+		set[value] = struct{}{}
+	}
+}
+
+func sortedSet(set map[string]struct{}) []string {
+	values := make([]string, 0, len(set))
+	for value := range set {
+		values = append(values, value)
+	}
+	sort.Strings(values)
+	return values
+}
+
+func sortedTechnologySources(values map[string]model.AssetTechnologySource) []model.AssetTechnologySource {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]model.AssetTechnologySource, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, values[key])
+	}
+	return result
+}
+
+func strongerEvidenceStatus(current, candidate string) string {
+	rank := map[string]int{"": 0, "unobserved": 1, "matched": 2, "corroborated": 3, "conflicted": 4}
+	if rank[candidate] > rank[current] {
+		return candidate
+	}
+	return current
+}
+
+func nonEmptyStatus(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func uniqueSortedStrings(values []string) []string {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		addNonEmptySet(set, value)
+	}
+	return sortedSet(set)
 }
 
 func applyAssetPortEvidenceCompatibility(port *model.AssetPort) {

@@ -29,8 +29,14 @@ func TestFingerprintProductClassificationSeparatesWebStackLayers(t *testing.T) {
 		{name: "nginx", role: "web_server", group: "web_server"},
 		{name: "Apache HTTP Server", role: "web_server", group: "web_server"},
 		{name: "宝塔-BT.cn", role: "control_panel"},
-		{name: "HTML5", role: "markup"},
-		{name: "script", role: "web_primitive"},
+		{name: "HTML5", role: "frontend"},
+		{name: "script", role: "frontend"},
+		{name: "PHP", role: "runtime"},
+		{name: "Python", role: "runtime"},
+		{name: "Flask", role: "framework"},
+		{name: "Werkzeug", role: "framework"},
+		{name: "Ubuntu", role: "operating_system"},
+		{name: "Dropbear sshd", role: "network_service", group: "network_service"},
 	} {
 		role, group := FingerprintProductClassification(test.name, nil)
 		if role != test.role || group != test.group {

@@ -11,13 +11,19 @@ import (
 	"golandproject/yscan/internal/model"
 )
 
-const ProductNormalizationRevision = "product-normalization-v1"
+const ProductNormalizationRevision = "product-normalization-v2"
 
-var productAliasesV1 = map[string]string{
-	"apache":             "apache http server",
-	"apache http server": "apache http server",
-	"apache httpd":       "apache http server",
-	"httpd":              "apache http server",
+var productAliasesV2 = map[string]string{
+	"apache":                "apache http server",
+	"apache http server":    "apache http server",
+	"apache httpd":          "apache http server",
+	"httpd":                 "apache http server",
+	"dropbear":              "dropbear",
+	"dropbear ssh server":   "dropbear",
+	"dropbear sshd":         "dropbear",
+	"dropbear_ssh_server":   "dropbear",
+	"redis":                 "redis",
+	"redis key-value store": "redis",
 }
 
 func projectExecutableRules(adapter SourceAdapter, rules []model.FingerprintSourceRule) ([]model.FingerprintRuleProjection, error) {
@@ -50,7 +56,7 @@ func projectExecutableRules(adapter SourceAdapter, rules []model.FingerprintSour
 func normalizedProduct(product model.FingerprintProduct) model.FingerprintProduct {
 	original := strings.TrimSpace(product.CanonicalName)
 	normalized := strings.ToLower(original)
-	if canonical := productAliasesV1[normalized]; canonical != "" {
+	if canonical := productAliasesV2[normalized]; canonical != "" {
 		normalized = canonical
 	}
 	product.CanonicalName = normalized
@@ -175,9 +181,10 @@ func (fingerprintHubV4Adapter) Project(source model.FingerprintSourceRule) (mode
 			Name     string `json:"name"`
 			Tags     string `json:"tags"`
 			Metadata struct {
-				Product string `json:"product"`
-				Vendor  string `json:"vendor"`
-				CPE     string `json:"cpe"`
+				Product   string   `json:"product"`
+				Vendor    string   `json:"vendor"`
+				CPE       string   `json:"cpe"`
+				FOFAQuery []string `json:"fofa-query"`
 			} `json:"metadata"`
 		} `json:"info"`
 		HTTP []struct {
@@ -200,7 +207,11 @@ func (fingerprintHubV4Adapter) Project(source model.FingerprintSourceRule) (mode
 	for _, request := range rule.HTTP {
 		requestGroup := model.FingerprintMatchGroupProjection{Operator: normalizedGroupOperator(request.MatchersCondition)}
 		for _, upstream := range request.Matchers {
-			condition := model.FingerprintMatchGroupProjection{Operator: normalizedGroupOperator(upstream.Condition)}
+			conditionOperator := normalizedGroupOperator(upstream.Condition)
+			if fofaQueryRequiresAllWords(rule.Info.Metadata.FOFAQuery, upstream.Words) {
+				conditionOperator = "all"
+			}
+			condition := model.FingerprintMatchGroupProjection{Operator: conditionOperator}
 			values := upstream.Words
 			operator := "contains"
 			evidenceType, target := webMatcherTarget(upstream.Part)
@@ -330,6 +341,32 @@ func normalizedGroupOperator(value string) string {
 		return "all"
 	}
 	return "any"
+}
+
+// FingerprintHub keeps some boolean semantics only in its FOFA query. When a
+// query explicitly ANDs every word in one matcher, preserve that constraint
+// instead of interpreting Nuclei's omitted condition as OR.
+func fofaQueryRequiresAllWords(queries, words []string) bool {
+	if len(words) < 2 {
+		return false
+	}
+	for _, query := range queries {
+		query = strings.ToLower(query)
+		if strings.Count(query, "&&") < len(words)-1 {
+			continue
+		}
+		allPresent := true
+		for _, word := range words {
+			if !strings.Contains(query, strings.ToLower(strings.TrimSpace(word))) {
+				allPresent = false
+				break
+			}
+		}
+		if allPresent {
+			return true
+		}
+	}
+	return false
 }
 
 func webMatcherTarget(part string) (string, string) {

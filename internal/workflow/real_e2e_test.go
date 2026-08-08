@@ -513,7 +513,7 @@ func assertAuditReport(t *testing.T, reportPath string, canceled bool) {
 		t.Fatal(err)
 	}
 	userText := string(userRaw)
-	if strings.Contains(userText, "Frozen Fingerprint Revisions") || strings.Index(userText, "Vulnerability Validation") > strings.Index(userText, "Port And Service Summary") {
+	if strings.Contains(userText, "Frozen Fingerprint Revisions") || strings.Index(userText, "Vulnerability Validation") > strings.Index(userText, "Endpoint Profiles") {
 		t.Fatalf("user report is not result-first or contains audit internals: %s", reportPath)
 	}
 	auditPath := strings.TrimSuffix(reportPath, ".md") + "-audit.md"

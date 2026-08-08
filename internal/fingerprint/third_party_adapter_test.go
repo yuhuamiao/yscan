@@ -46,6 +46,34 @@ func TestFingerprintHubYAMLRealRulesPreserveWebAndPassiveTCPConditions(t *testin
 	}
 }
 
+func TestFingerprintHubSpringCloudPreservesFOFAConjunction(t *testing.T) {
+	for _, sourceKey := range []string{"fingerprinthub-web-yaml", "fingerprinthub-web-v4"} {
+		t.Run(sourceKey, func(t *testing.T) {
+			adapter := SourceAdapter(fingerprintHubWebYAMLSourceAdapter{})
+			path := "web-fingerprint/vmware/spring_cloud_config.yaml"
+			ruleID := "vmware/spring_cloud_config"
+			if sourceKey == "fingerprinthub-web-v4" {
+				adapter = fingerprintHubV4Adapter{}
+				path = "web_fingerprint_v4.json"
+				ruleID = "spring_cloud_config"
+			}
+			snapshot := embeddedVerifiedSnapshot(t, sourceKey)
+			rules, err := adapter.Adapt(snapshotSubset(snapshot, path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rules = selectedSourceRules(t, rules, ruleID)
+			engine := projectedRulesEngine(t, sourceKey, adapter, rules)
+			if hasProduct(engine.Match(Evidence{Protocol: "http", Body: "label"}), "spring_cloud_config") {
+				t.Fatal("one generic word must not identify Spring Cloud Config")
+			}
+			if !hasProduct(engine.Match(Evidence{Protocol: "http", Body: "label profiles propertySources"}), "spring_cloud_config") {
+				t.Fatal("complete Spring Cloud Config evidence did not match")
+			}
+		})
+	}
+}
+
 func TestWhatWebRealJenkinsRuleExtractsHeaderVersion(t *testing.T) {
 	snapshot := embeddedVerifiedSnapshot(t, "whatweb")
 	adapter := whatWebSourceAdapter{}
@@ -169,6 +197,11 @@ func TestProductNormalizationAliasesPreserveSourceNames(t *testing.T) {
 		}
 		if !strings.EqualFold(sourceName, product.CanonicalName) && !strings.Contains(strings.ToLower(product.AliasesJSON), strings.ToLower(sourceName)) {
 			t.Fatalf("source product %q missing from aliases %s", sourceName, product.AliasesJSON)
+		}
+	}
+	for sourceName, canonical := range map[string]string{"Dropbear sshd": "dropbear", "dropbear_ssh_server": "dropbear", "Redis key-value store": "redis"} {
+		if product := normalizedProduct(model.FingerprintProduct{CanonicalName: sourceName}); product.CanonicalName != canonical {
+			t.Fatalf("source product %q normalized to %q, want %q", sourceName, product.CanonicalName, canonical)
 		}
 	}
 }

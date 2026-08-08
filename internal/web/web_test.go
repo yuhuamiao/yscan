@@ -95,9 +95,20 @@ func TestReportsLoadStructuredFindingsAndSeparateAuditReport(t *testing.T) {
 func TestAssetDetailRendersProtocolResponseSummary(t *testing.T) {
 	page := string(indexHTML)
 	section := pageSection(t, page, "async function showAssetDetail(ip)", "async function renderReports()")
-	for _, expected := range []string{"port.protocol_evidence", "passive_banner", "active_probe", "item.status_code", "item.server", "item.title", "TCP 被动 Banner", "TCP 主动 Probe", "未保存协议响应摘要"} {
+	for _, expected := range []string{
+		"port.protocol_evidence", "passive_banner", "active_probe", "item.status_code", "item.server", "item.title",
+		"TCP 被动 Banner", "TCP 主动 Probe", "未保存协议响应摘要",
+		"port.technologies", "item.version", "item.cpe", "item.sources", "item.product_status", "item.conflict_candidates",
+		"网络服务", "Web Server", "运行时 / 语言", "框架", "CMS / 应用", "控制面板", "前端技术",
+		"port.validation", "candidate_template_count", "identified_product_count", "finding_count", "unresolved_reasons", "observation_run_id",
+	} {
 		if !strings.Contains(section, expected) {
 			t.Fatalf("asset detail missing %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"raw_response", "raw_content", "item.raw"} {
+		if strings.Contains(section, forbidden) {
+			t.Fatalf("asset detail must not expose %q", forbidden)
 		}
 	}
 }

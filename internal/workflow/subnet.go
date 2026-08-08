@@ -62,13 +62,15 @@ func (executor SubnetTaskRunExecutor) Execute(ctx context.Context, run model.Sca
 }
 
 type subnetDependencies struct {
-	discover            func(context.Context, string, pipeline.SubnetDiscoveryOptions) ([]string, error)
-	scanHost            func(context.Context, string, string) ([]model.ScanResult, error)
-	scanSelected        func(context.Context, string, string, []int) ([]model.ScanResult, error)
-	collectFingerprints func(context.Context, *sql.DB, model.ScanTaskRun, string, []model.ScanResult) ([]model.ScanResult, []model.FingerprintRunMatch, error)
-	runNuclei           func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error)
-	executeNuclei       func(context.Context, string, []model.ScanResult, string, []string) vuln.NucleiExecutionResult
-	saveFindings        func(*sql.DB, int64, []model.NucleiFinding) error
+	discover             func(context.Context, string, pipeline.SubnetDiscoveryOptions) ([]string, error)
+	scanHost             func(context.Context, string, string) ([]model.ScanResult, error)
+	scanSelected         func(context.Context, string, string, []int) ([]model.ScanResult, error)
+	collectFingerprints  func(context.Context, *sql.DB, model.ScanTaskRun, string, []model.ScanResult) ([]model.ScanResult, []model.FingerprintRunMatch, error)
+	runNuclei            func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error)
+	executeNuclei        func(context.Context, string, []model.ScanResult, string, []string) vuln.NucleiExecutionResult
+	loadTemplateIndex    func(string) (string, *planner.NucleiTemplateIndex, error)
+	executeTemplatePaths func(context.Context, string, []model.ScanResult, []string) vuln.NucleiExecutionResult
+	saveFindings         func(*sql.DB, int64, []model.NucleiFinding) error
 }
 
 // RunSubnet executes discovery, quick profiling, optional vulnerability
@@ -97,13 +99,27 @@ func RunSubnetTaskRun(ctx context.Context, options SubnetTaskRunOptions) (model.
 		return model.ScanTaskRunSnapshot{}, err
 	}
 	return runSubnetTaskRun(ctx, options, subnetDependencies{
-		discover:            pipeline.DiscoverAliveHosts,
-		scanHost:            scan.RunQuickDiscovery,
-		scanSelected:        scan.RunSelectedDiscovery,
-		collectFingerprints: collector,
-		runNuclei:           vuln.RunNucleiForOpenPortsWithTags,
-		executeNuclei:       vuln.ExecuteNucleiForOpenPortsWithTags,
+		discover:             pipeline.DiscoverAliveHosts,
+		scanHost:             scan.RunQuickDiscovery,
+		scanSelected:         scan.RunSelectedDiscovery,
+		collectFingerprints:  collector,
+		runNuclei:            vuln.RunNucleiForOpenPortsWithTags,
+		executeNuclei:        vuln.ExecuteNucleiForOpenPortsWithTags,
+		loadTemplateIndex:    loadNucleiTemplateIndex,
+		executeTemplatePaths: vuln.ExecuteNucleiForOpenPortsWithTemplatePaths,
 	})
+}
+
+func loadNucleiTemplateIndex(configuredPath string) (string, *planner.NucleiTemplateIndex, error) {
+	root, err := vuln.ResolveNucleiTemplatesPath(configuredPath)
+	if err != nil {
+		return "", nil, err
+	}
+	index, err := planner.BuildNucleiTemplateIndex(root)
+	if err != nil {
+		return "", nil, err
+	}
+	return root, index, nil
 }
 
 func runSubnetTaskRun(ctx context.Context, options SubnetTaskRunOptions, dependencies subnetDependencies) (model.ScanTaskRunSnapshot, error) {
@@ -144,6 +160,9 @@ func runSubnetTaskRun(ctx context.Context, options SubnetTaskRunOptions, depende
 		Validation:         initialRunValidation(options.Run.Config.VulnerabilityOn),
 	}
 	var validation *runValidationTracker
+	templateRoot := options.Run.Config.NucleiTemplates
+	var templateIndex *planner.NucleiTemplateIndex
+	templateIndexLoaded := false
 	if options.Run.Config.VulnerabilityOn {
 		validation = newRunValidationTracker()
 	}
@@ -216,7 +235,15 @@ func runSubnetTaskRun(ctx context.Context, options SubnetTaskRunOptions, depende
 		}
 
 		if options.Run.Config.VulnerabilityOn {
-			mappingResult := runFingerprintMappingValidation(ctx, options.DB, options.Run, ip, openPorts, snapshot.FingerprintMatches, options.Run.Config.NucleiTemplates)
+			if dependencies.loadTemplateIndex != nil && !templateIndexLoaded {
+				templateRoot, templateIndex, err = dependencies.loadTemplateIndex(options.Run.Config.NucleiTemplates)
+				templateIndexLoaded = true
+				if err != nil {
+					validation.finish(&snapshot, err)
+					return snapshot, err
+				}
+			}
+			mappingResult := runFingerprintMappingValidation(ctx, options.DB, options.Run, ip, openPorts, snapshot.FingerprintMatches, templateRoot, templateIndex, dependencies.executeTemplatePaths)
 			validation.observe(mappingResult)
 			snapshot.TemplateCandidates = uniqueTemplateCandidates(append(snapshot.TemplateCandidates, mappingResult.candidates...))
 			snapshot.Vulnerabilities = uniqueSnapshotVulnerabilities(append(snapshot.Vulnerabilities, snapshotVulnerabilities(mappingResult.findings)...))
@@ -224,7 +251,7 @@ func runSubnetTaskRun(ctx context.Context, options SubnetTaskRunOptions, depende
 				validation.finish(&snapshot, mappingResult.err)
 				return snapshot, mappingResult.err
 			}
-			fallbackResult := runServiceTagValidation(ctx, ip, portsWithoutFingerprintMappings(openPorts, mappingResult.candidates), options.Run.Config.NucleiTemplates, nucleiExecutionDependency(dependencies.executeNuclei, dependencies.runNuclei))
+			fallbackResult := runServiceTagValidation(ctx, ip, portsWithoutFingerprintMappings(openPorts, mappingResult.candidates, snapshot.FingerprintMatches), templateRoot, nucleiExecutionDependency(dependencies.executeNuclei, dependencies.runNuclei))
 			validation.observe(fallbackResult)
 			allCandidates := append(mappingResult.candidates, fallbackResult.candidates...)
 			allFindings := append(mappingResult.findings, fallbackResult.findings...)
@@ -257,25 +284,60 @@ func runSubnetTaskRun(ctx context.Context, options SubnetTaskRunOptions, depende
 // templates justified by this run's endpoint conclusions. It deliberately
 // does not read historical fingerprint results.
 type validationExecutionResult struct {
-	findings          []model.NucleiFinding
-	candidates        []model.ScanTaskRunTemplateCandidate
-	executedEndpoints map[string]struct{}
-	err               error
+	findings           []model.NucleiFinding
+	candidates         []model.ScanTaskRunTemplateCandidate
+	executedEndpoints  map[string]struct{}
+	executedTemplates  map[string]struct{}
+	identifiedProducts map[string]struct{}
+	mappedProducts     map[string]struct{}
+	err                error
 }
 
 func (result *validationExecutionResult) markExecuted(candidates []model.ScanTaskRunTemplateCandidate) {
 	if result.executedEndpoints == nil {
 		result.executedEndpoints = make(map[string]struct{})
 	}
+	if result.executedTemplates == nil {
+		result.executedTemplates = make(map[string]struct{})
+	}
 	for _, candidate := range candidates {
 		if endpoint := validationEndpointKey(candidate); endpoint != "" {
 			result.executedEndpoints[endpoint] = struct{}{}
 		}
+		result.executedTemplates[candidate.TemplateID+"\x00"+candidate.Path] = struct{}{}
 	}
 }
 
-func runFingerprintMappingValidation(ctx context.Context, db *sql.DB, run model.ScanTaskRun, ip string, ports []model.ScanResult, matches []model.FingerprintRunMatch, templatesRoot string) validationExecutionResult {
-	result := validationExecutionResult{}
+func runFingerprintMappingValidation(ctx context.Context, db *sql.DB, run model.ScanTaskRun, ip string, ports []model.ScanResult, matches []model.FingerprintRunMatch, templatesRoot string, templateIndex *planner.NucleiTemplateIndex, executeTemplatePaths func(context.Context, string, []model.ScanResult, []string) vuln.NucleiExecutionResult) validationExecutionResult {
+	result := validationExecutionResult{identifiedProducts: make(map[string]struct{}), mappedProducts: make(map[string]struct{})}
+	if executeTemplatePaths == nil {
+		executeTemplatePaths = vuln.ExecuteNucleiForOpenPortsWithTemplatePaths
+	}
+	portResults := make(map[int]model.ScanResult)
+	for _, portResult := range ports {
+		if !portResult.Open {
+			continue
+		}
+		_, portText, err := net.SplitHostPort(portResult.Address)
+		port, parseErr := strconv.Atoi(portText)
+		if err == nil && parseErr == nil {
+			portResults[port] = portResult
+		}
+	}
+	endpointProducts := make(map[string]model.FingerprintRunMatch)
+	for _, match := range matches {
+		if match.Soft || match.IP != ip || match.Product == "" {
+			continue
+		}
+		if _, exists := portResults[match.Port]; !exists {
+			continue
+		}
+		identity := validationProductIdentity(match.IP, match.Port, match.Protocol, match.Product)
+		result.identifiedProducts[identity] = struct{}{}
+		if current, exists := endpointProducts[identity]; !exists || (current.CPE == "" && match.CPE != "") {
+			endpointProducts[identity] = match
+		}
+	}
 	noTemplates := false
 	for _, portResult := range ports {
 		if !portResult.Open {
@@ -307,15 +369,18 @@ func runFingerprintMappingValidation(ctx context.Context, db *sql.DB, run model.
 			invocationCandidates := make([]model.ScanTaskRunTemplateCandidate, 0, len(resolved))
 			for _, candidate := range resolved {
 				paths = append(paths, candidate.AbsolutePath)
-				invocationCandidates = append(invocationCandidates, model.ScanTaskRunTemplateCandidate{TemplateID: candidate.Mapping.TemplateID, Path: candidate.Mapping.TemplatePath, Source: "fingerprint_mapping", Reason: fmt.Sprintf("approved fingerprint mapping %s", candidate.Mapping.ProductKey), TemplateSHA256: candidate.Mapping.TemplateSHA256, TemplateSetRevision: candidate.Mapping.TemplateSetRevision, MappingImportID: candidate.Mapping.TemplateMappingImportID, IP: ip, Port: port, Protocol: protocol})
+				invocationCandidate := model.ScanTaskRunTemplateCandidate{TemplateID: candidate.Mapping.TemplateID, Path: candidate.Mapping.TemplatePath, ProductKey: candidate.Mapping.ProductKey, Source: "fingerprint_mapping", Reason: fmt.Sprintf("approved fingerprint mapping %s", candidate.Mapping.ProductKey), TemplateSHA256: candidate.Mapping.TemplateSHA256, TemplateSetRevision: candidate.Mapping.TemplateSetRevision, MappingImportID: candidate.Mapping.TemplateMappingImportID, IP: ip, Port: port, Protocol: protocol}
+				invocationCandidates = append(invocationCandidates, invocationCandidate)
+				result.mappedProducts[validationProductIdentity(ip, port, protocol, candidate.Mapping.ProductKey)] = struct{}{}
 			}
-			result.candidates = append(result.candidates, invocationCandidates...)
 			if len(paths) > 0 {
-				execution := vuln.ExecuteNucleiForOpenPortsWithTemplatePaths(ctx, ip, []model.ScanResult{portResult}, paths)
+				execution := executeTemplatePaths(ctx, ip, []model.ScanResult{portResult}, paths)
 				result.findings = append(result.findings, execution.Findings...)
 				if execution.Executed {
+					markTemplateCandidatesExecuted(invocationCandidates)
 					result.markExecuted(invocationCandidates)
 				}
+				result.candidates = append(result.candidates, invocationCandidates...)
 				err := execution.Err
 				if err == nil {
 					continue
@@ -328,7 +393,72 @@ func runFingerprintMappingValidation(ctx context.Context, db *sql.DB, run model.
 					result.err = err
 					return result
 				}
+			} else {
+				result.candidates = append(result.candidates, invocationCandidates...)
 			}
+		}
+	}
+	if templateIndex != nil {
+		type automaticInvocation struct {
+			port       model.ScanResult
+			paths      []string
+			candidates []model.ScanTaskRunTemplateCandidate
+			seen       map[string]struct{}
+		}
+		invocations := make(map[string]*automaticInvocation)
+		for identity, match := range endpointProducts {
+			if _, reviewed := result.mappedProducts[identity]; reviewed {
+				continue
+			}
+			selected := templateIndex.Select(match.Product, match.CPE, match.Protocol)
+			if len(selected) == 0 {
+				continue
+			}
+			result.mappedProducts[identity] = struct{}{}
+			invocationKey := fmt.Sprintf("%d/%s", match.Port, strings.ToLower(match.Protocol))
+			invocation := invocations[invocationKey]
+			if invocation == nil {
+				invocation = &automaticInvocation{port: portResults[match.Port], seen: make(map[string]struct{})}
+				invocations[invocationKey] = invocation
+			}
+			for _, entry := range selected {
+				entryKey := entry.TemplateID + "\x00" + entry.Path
+				if _, duplicate := invocation.seen[entryKey]; duplicate {
+					continue
+				}
+				invocation.seen[entryKey] = struct{}{}
+				invocation.paths = append(invocation.paths, entry.AbsolutePath)
+				invocation.candidates = append(invocation.candidates, model.ScanTaskRunTemplateCandidate{
+					TemplateID: entry.TemplateID, Path: entry.Path, ProductKey: match.Product,
+					Source: "automatic_template_index", Reason: "normalized product, CPE, or exact product tag",
+					TemplateSHA256: entry.SHA256, TemplateSetRevision: templateIndex.Revision,
+					IP: ip, Port: match.Port, Protocol: match.Protocol,
+				})
+			}
+		}
+		invocationKeys := make([]string, 0, len(invocations))
+		for key := range invocations {
+			invocationKeys = append(invocationKeys, key)
+		}
+		sort.Strings(invocationKeys)
+		for _, key := range invocationKeys {
+			invocation := invocations[key]
+			execution := executeTemplatePaths(ctx, ip, []model.ScanResult{invocation.port}, invocation.paths)
+			result.findings = append(result.findings, execution.Findings...)
+			if execution.Executed {
+				markTemplateCandidatesExecuted(invocation.candidates)
+				result.markExecuted(invocation.candidates)
+			}
+			result.candidates = append(result.candidates, invocation.candidates...)
+			if execution.Err == nil {
+				continue
+			}
+			if errors.Is(execution.Err, vuln.ErrNoTemplates) {
+				noTemplates = true
+				continue
+			}
+			result.err = execution.Err
+			return result
 		}
 	}
 	if noTemplates {
@@ -337,14 +467,32 @@ func runFingerprintMappingValidation(ctx context.Context, db *sql.DB, run model.
 	return result
 }
 
-func portsWithoutFingerprintMappings(ports []model.ScanResult, candidates []model.ScanTaskRunTemplateCandidate) []model.ScanResult {
+func validationProductIdentity(ip string, port int, protocol, product string) string {
+	return fmt.Sprintf("%s:%d/%s product=%s", ip, port, strings.ToLower(strings.TrimSpace(protocol)), strings.ToLower(strings.TrimSpace(product)))
+}
+
+func markTemplateCandidatesExecuted(candidates []model.ScanTaskRunTemplateCandidate) {
+	for index := range candidates {
+		candidates[index].Executed = true
+	}
+}
+
+func portsWithoutFingerprintMappings(ports []model.ScanResult, candidates []model.ScanTaskRunTemplateCandidate, matches ...[]model.FingerprintRunMatch) []model.ScanResult {
 	covered := make(map[string]struct{})
 	for _, candidate := range candidates {
-		if candidate.Source != "fingerprint_mapping" {
+		if candidate.Source != "fingerprint_mapping" && candidate.Source != "automatic_template_index" {
 			continue
 		}
 		if candidate.IP != "" && candidate.Port > 0 && candidate.Protocol != "" {
 			covered[fmt.Sprintf("%s:%d:%s", candidate.IP, candidate.Port, candidate.Protocol)] = struct{}{}
+		}
+	}
+	identifiedPorts := make(map[string]struct{})
+	for _, group := range matches {
+		for _, match := range group {
+			if !match.Soft && match.Product != "" {
+				identifiedPorts[fmt.Sprintf("%s:%d", match.IP, match.Port)] = struct{}{}
+			}
 		}
 	}
 	result := make([]model.ScanResult, 0, len(ports))
@@ -352,6 +500,9 @@ func portsWithoutFingerprintMappings(ports []model.ScanResult, candidates []mode
 		host, value, err := net.SplitHostPort(port.Address)
 		if err == nil {
 			portNumber, _ := strconv.Atoi(value)
+			if _, ok := identifiedPorts[fmt.Sprintf("%s:%d", host, portNumber)]; ok {
+				continue
+			}
 			if _, ok := covered[fmt.Sprintf("%s:%d:%s", host, portNumber, candidateProtocolForService(port.Service))]; ok {
 				continue
 			}
@@ -375,12 +526,13 @@ func runServiceTagValidation(ctx context.Context, ip string, ports []model.ScanR
 		_, portText, _ := net.SplitHostPort(port.Address)
 		portNumber, _ := strconv.Atoi(portText)
 		invocationCandidates := serviceFallbackCandidates(ip, portNumber, candidateProtocolForService(port.Service), groups)
-		result.candidates = append(result.candidates, invocationCandidates...)
 		execution := runNuclei(ctx, ip, []model.ScanResult{port}, templates, groups)
 		result.findings = append(result.findings, execution.Findings...)
 		if execution.Executed {
+			markTemplateCandidatesExecuted(invocationCandidates)
 			result.markExecuted(invocationCandidates)
 		}
+		result.candidates = append(result.candidates, invocationCandidates...)
 		err := execution.Err
 		if err == nil {
 			continue
@@ -414,10 +566,13 @@ func nucleiExecutionDependency(
 }
 
 type runValidationTracker struct {
-	startedAt  time.Time
-	candidates map[string]struct{}
-	templates  map[string]struct{}
-	executed   map[string]struct{}
+	startedAt          time.Time
+	candidates         map[string]struct{}
+	templates          map[string]struct{}
+	executed           map[string]struct{}
+	executedTemplates  map[string]struct{}
+	identifiedProducts map[string]struct{}
+	mappedProducts     map[string]struct{}
 }
 
 func initialRunValidation(enabled bool) model.ScanTaskRunValidation {
@@ -431,7 +586,8 @@ func initialRunValidation(enabled bool) model.ScanTaskRunValidation {
 func newRunValidationTracker() *runValidationTracker {
 	return &runValidationTracker{
 		startedAt: time.Now().UTC(), candidates: make(map[string]struct{}),
-		templates: make(map[string]struct{}), executed: make(map[string]struct{}),
+		templates: make(map[string]struct{}), executed: make(map[string]struct{}), executedTemplates: make(map[string]struct{}),
+		identifiedProducts: make(map[string]struct{}), mappedProducts: make(map[string]struct{}),
 	}
 }
 
@@ -449,6 +605,15 @@ func (tracker *runValidationTracker) observe(result validationExecutionResult) {
 	for endpoint := range result.executedEndpoints {
 		tracker.executed[endpoint] = struct{}{}
 	}
+	for template := range result.executedTemplates {
+		tracker.executedTemplates[template] = struct{}{}
+	}
+	for product := range result.identifiedProducts {
+		tracker.identifiedProducts[product] = struct{}{}
+	}
+	for product := range result.mappedProducts {
+		tracker.mappedProducts[product] = struct{}{}
+	}
 }
 
 func (tracker *runValidationTracker) finish(snapshot *model.ScanTaskRunSnapshot, executionErr error) {
@@ -457,13 +622,22 @@ func (tracker *runValidationTracker) finish(snapshot *model.ScanTaskRunSnapshot,
 	}
 	validation := model.ScanTaskRunValidation{
 		Status:                 model.ScanTaskRunValidationNoCandidates,
+		IdentifiedProductCount: len(tracker.identifiedProducts),
+		MappedProductCount:     len(tracker.mappedProducts),
 		CandidateEndpointCount: len(tracker.candidates),
 		ExecutedEndpointCount:  len(tracker.executed),
 		TemplateCount:          len(tracker.templates),
+		ExecutedTemplateCount:  len(tracker.executedTemplates),
 		FindingCount:           len(snapshot.Vulnerabilities),
 		StartedAt:              tracker.startedAt.Format(time.RFC3339Nano),
 		FinishedAt:             time.Now().UTC().Format(time.RFC3339Nano),
 	}
+	for product := range tracker.identifiedProducts {
+		if _, mapped := tracker.mappedProducts[product]; !mapped {
+			validation.UnmappedProducts = append(validation.UnmappedProducts, product)
+		}
+	}
+	sort.Strings(validation.UnmappedProducts)
 	if executionErr != nil && !errors.Is(executionErr, vuln.ErrNoTemplates) {
 		validation.Status = model.ScanTaskRunValidationFailed
 		validation.Error = safeValidationError(executionErr)

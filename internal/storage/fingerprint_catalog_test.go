@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -246,6 +247,39 @@ func TestLegacyBannerMigrationPreservesRulesWithoutChangingBannerRuntimeTable(t 
 	}
 	if legacyBannerRows != 1 {
 		t.Fatalf("legacy banner table changed during migration: %d", legacyBannerRows)
+	}
+}
+
+func TestLegacyOpenSSHRuleOnlyMatchesSSHIdentificationLine(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	var operator, pattern string
+	if err := db.QueryRow(`
+		SELECT matcher.operator, matcher.value
+		FROM fingerprint_matchers AS matcher
+		JOIN fingerprint_match_groups AS match_group ON match_group.id = matcher.fingerprint_match_group_id
+		JOIN fingerprint_rules AS rule ON rule.id = match_group.fingerprint_rule_id
+		JOIN fingerprint_source_rules AS source_rule ON source_rule.id = rule.fingerprint_source_rule_id
+		JOIN fingerprint_imports AS fingerprint_import ON fingerprint_import.id = source_rule.fingerprint_import_id AND fingerprint_import.is_active = 1
+		JOIN fingerprint_sources AS source ON source.id = fingerprint_import.fingerprint_source_id
+		WHERE source.source_key = ? AND json_extract(source_rule.raw_content, '$.service_name') = 'openssh'
+		LIMIT 1`, legacyBannerSourceKey).Scan(&operator, &pattern); err != nil {
+		t.Fatal(err)
+	}
+	if operator != "regex_ci" {
+		t.Fatalf("OpenSSH legacy operator=%q", operator)
+	}
+	expression, err := regexp.Compile("(?i)" + pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expression.MatchString("SSH-2.0-dropbear_2020.81\r\nserver-sig-algs=<ssh-rsa,ssh-ed25519>,publickey-hostbound@openssh.com") {
+		t.Fatal("Dropbear extension text matched OpenSSH")
+	}
+	if !expression.MatchString("SSH-2.0-OpenSSH_8.0\r\n") {
+		t.Fatal("OpenSSH identification line did not match")
 	}
 }
 

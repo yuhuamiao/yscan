@@ -523,11 +523,17 @@ func SaveScanTaskRunSnapshot(db *sql.DB, snapshot model.ScanTaskRunSnapshot) err
 		}
 	}
 	if snapshot.Validation.Status != "" {
+		unmappedProductsJSON, err := json.Marshal(snapshot.Validation.UnmappedProducts)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`
 			INSERT INTO scan_task_run_validation
-				(scan_task_run_id, status, candidate_endpoint_count, executed_endpoint_count, template_count, finding_count, started_at, finished_at, error_message)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, snapshot.RunID, snapshot.Validation.Status,
-			snapshot.Validation.CandidateEndpointCount, snapshot.Validation.ExecutedEndpointCount, snapshot.Validation.TemplateCount, snapshot.Validation.FindingCount,
+				(scan_task_run_id, status, identified_product_count, mapped_product_count, unmapped_products_json,
+				 candidate_endpoint_count, executed_endpoint_count, template_count, executed_template_count, finding_count, started_at, finished_at, error_message)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, snapshot.RunID, snapshot.Validation.Status,
+			snapshot.Validation.IdentifiedProductCount, snapshot.Validation.MappedProductCount, string(unmappedProductsJSON),
+			snapshot.Validation.CandidateEndpointCount, snapshot.Validation.ExecutedEndpointCount, snapshot.Validation.TemplateCount, snapshot.Validation.ExecutedTemplateCount, snapshot.Validation.FindingCount,
 			nullIfEmpty(snapshot.Validation.StartedAt), nullIfEmpty(snapshot.Validation.FinishedAt), nullIfEmpty(snapshot.Validation.Error)); err != nil {
 			return err
 		}
@@ -541,7 +547,7 @@ func SaveScanTaskRunSnapshot(db *sql.DB, snapshot model.ScanTaskRunSnapshot) err
 			return err
 		}
 		if candidate.IP != "" && candidate.Port > 0 && candidate.Protocol != "" {
-			if _, err := tx.Exec(`INSERT INTO scan_task_run_template_candidate_endpoints (scan_task_run_id, template_id, path, ip, port, protocol) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, snapshot.RunID, candidate.TemplateID, candidate.Path, candidate.IP, candidate.Port, candidate.Protocol); err != nil {
+			if _, err := tx.Exec(`INSERT INTO scan_task_run_template_candidate_endpoints (scan_task_run_id, template_id, path, ip, port, protocol, product_key, executed) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET product_key = excluded.product_key, executed = excluded.executed`, snapshot.RunID, candidate.TemplateID, candidate.Path, candidate.IP, candidate.Port, candidate.Protocol, candidate.ProductKey, boolToInt(candidate.Executed)); err != nil {
 				return err
 			}
 		}
@@ -609,7 +615,7 @@ func GetScanTaskRunSnapshot(db *sql.DB, runID int64) (model.ScanTaskRunSnapshot,
 	rows, err := db.Query(`
 		SELECT candidate.template_id, candidate.path, candidate.source, candidate.reason,
 			COALESCE(candidate.template_sha256, ''), COALESCE(candidate.template_set_revision, ''),
-			COALESCE(candidate.template_mapping_import_id, 0), endpoint.ip, endpoint.port, endpoint.protocol
+			COALESCE(candidate.template_mapping_import_id, 0), endpoint.ip, endpoint.port, endpoint.protocol, COALESCE(endpoint.product_key, ''), COALESCE(endpoint.executed, 0)
 		FROM scan_task_run_template_candidates AS candidate
 		JOIN scan_task_run_template_candidate_endpoints AS endpoint
 			ON endpoint.scan_task_run_id = candidate.scan_task_run_id AND endpoint.template_id = candidate.template_id AND endpoint.path = candidate.path
@@ -635,10 +641,12 @@ func GetScanTaskRunSnapshot(db *sql.DB, runID int64) (model.ScanTaskRunSnapshot,
 	}
 	for rows.Next() {
 		var candidate model.ScanTaskRunTemplateCandidate
-		if err := rows.Scan(&candidate.TemplateID, &candidate.Path, &candidate.Source, &candidate.Reason, &candidate.TemplateSHA256, &candidate.TemplateSetRevision, &candidate.MappingImportID, &candidate.IP, &candidate.Port, &candidate.Protocol); err != nil {
+		var executed int
+		if err := rows.Scan(&candidate.TemplateID, &candidate.Path, &candidate.Source, &candidate.Reason, &candidate.TemplateSHA256, &candidate.TemplateSetRevision, &candidate.MappingImportID, &candidate.IP, &candidate.Port, &candidate.Protocol, &candidate.ProductKey, &executed); err != nil {
 			rows.Close()
 			return model.ScanTaskRunSnapshot{}, err
 		}
+		candidate.Executed = executed != 0
 		snapshot.TemplateCandidates = append(snapshot.TemplateCandidates, candidate)
 	}
 	if err := rows.Err(); err != nil {
@@ -774,7 +782,7 @@ func validateScanTaskRunSnapshot(snapshot model.ScanTaskRunSnapshot) error {
 		}
 	}
 	if snapshot.Validation.Status != "" {
-		if !isScanTaskRunValidationStatus(snapshot.Validation.Status) || snapshot.Validation.CandidateEndpointCount < 0 || snapshot.Validation.ExecutedEndpointCount < 0 || snapshot.Validation.TemplateCount < 0 || snapshot.Validation.FindingCount < 0 || snapshot.Validation.ExecutedEndpointCount > snapshot.Validation.CandidateEndpointCount || snapshot.Validation.FindingCount != len(snapshot.Vulnerabilities) {
+		if !isScanTaskRunValidationStatus(snapshot.Validation.Status) || snapshot.Validation.IdentifiedProductCount < 0 || snapshot.Validation.MappedProductCount < 0 || snapshot.Validation.MappedProductCount > snapshot.Validation.IdentifiedProductCount || snapshot.Validation.CandidateEndpointCount < 0 || snapshot.Validation.ExecutedEndpointCount < 0 || snapshot.Validation.TemplateCount < 0 || snapshot.Validation.ExecutedTemplateCount < 0 || snapshot.Validation.ExecutedTemplateCount > snapshot.Validation.TemplateCount || snapshot.Validation.FindingCount < 0 || snapshot.Validation.ExecutedEndpointCount > snapshot.Validation.CandidateEndpointCount || snapshot.Validation.FindingCount != len(snapshot.Vulnerabilities) {
 			return errors.New("invalid snapshot validation state")
 		}
 	}
@@ -877,12 +885,15 @@ func loadScanTaskRunProtocolEvidence(db *sql.DB, snapshot *model.ScanTaskRunSnap
 
 func loadScanTaskRunValidation(db *sql.DB, snapshot *model.ScanTaskRunSnapshot) error {
 	var startedAt, finishedAt, errorMessage sql.NullString
+	var unmappedProductsJSON string
 	err := db.QueryRow(`
-		SELECT status, candidate_endpoint_count, executed_endpoint_count, template_count, finding_count,
+		SELECT status, identified_product_count, mapped_product_count, unmapped_products_json,
+			candidate_endpoint_count, executed_endpoint_count, template_count, executed_template_count, finding_count,
 			started_at, finished_at, error_message
 		FROM scan_task_run_validation WHERE scan_task_run_id = ?`, snapshot.RunID).Scan(
-		&snapshot.Validation.Status, &snapshot.Validation.CandidateEndpointCount, &snapshot.Validation.ExecutedEndpointCount,
-		&snapshot.Validation.TemplateCount, &snapshot.Validation.FindingCount, &startedAt, &finishedAt, &errorMessage,
+		&snapshot.Validation.Status, &snapshot.Validation.IdentifiedProductCount, &snapshot.Validation.MappedProductCount, &unmappedProductsJSON,
+		&snapshot.Validation.CandidateEndpointCount, &snapshot.Validation.ExecutedEndpointCount,
+		&snapshot.Validation.TemplateCount, &snapshot.Validation.ExecutedTemplateCount, &snapshot.Validation.FindingCount, &startedAt, &finishedAt, &errorMessage,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
@@ -896,6 +907,8 @@ func loadScanTaskRunValidation(db *sql.DB, snapshot *model.ScanTaskRunSnapshot) 
 	snapshot.Validation.StartedAt = startedAt.String
 	snapshot.Validation.FinishedAt = finishedAt.String
 	snapshot.Validation.Error = errorMessage.String
+	snapshot.Validation.UnmappedProducts = make([]string, 0)
+	_ = json.Unmarshal([]byte(unmappedProductsJSON), &snapshot.Validation.UnmappedProducts)
 	return nil
 }
 
