@@ -62,7 +62,7 @@ func TestTaskServiceCreatesScheduledTaskWithoutInitialRun(t *testing.T) {
 	}
 }
 
-func TestTaskServiceNormalizesAndRestrictsInternalTargets(t *testing.T) {
+func TestTaskServiceNormalizesSubnetAndAcceptsExplicitIPv4Targets(t *testing.T) {
 	db := openRunnerTestDB(t)
 	service := NewTaskService(db, ClockFunc(func() time.Time { return time.Date(2026, time.July, 24, 2, 0, 0, 0, time.UTC) }))
 	task, _, err := service.Create(context.Background(), model.ScanTask{
@@ -75,12 +75,20 @@ func TestTaskServiceNormalizesAndRestrictsInternalTargets(t *testing.T) {
 	if err != nil || task.Target != "192.168.10.0/24" {
 		t.Fatalf("normalized task = %#v, error = %v", task, err)
 	}
-	if _, _, err := service.Create(context.Background(), model.ScanTask{
+	public, _, err := service.Create(context.Background(), model.ScanTask{
 		Target:   "8.8.8.8",
 		ScanType: model.ScanTypeIP,
 		Mode:     model.ScanTaskModeOnce,
+	})
+	if err != nil || public.Target != "8.8.8.8" {
+		t.Fatalf("public IP task = %#v, error = %v", public, err)
+	}
+	if _, _, err := service.Create(context.Background(), model.ScanTask{
+		Target:   "not-an-ip",
+		ScanType: model.ScanTypeIP,
+		Mode:     model.ScanTaskModeOnce,
 	}); err == nil {
-		t.Fatal("public IP target must be rejected")
+		t.Fatal("non-IP target must be rejected")
 	}
 }
 
@@ -109,5 +117,21 @@ func TestTaskServiceUpdatePreservesExistingRunSnapshot(t *testing.T) {
 	}
 	if _, err := service.Update(context.Background(), model.ScanTask{ID: task.ID, Target: task.Target, ScanType: task.ScanType, Mode: task.Mode, Cron: "@every 1m", Timezone: task.Timezone, Config: task.Config, Status: task.Status}); err == nil {
 		t.Fatal("invalid updated cron must be rejected")
+	}
+}
+
+func TestTaskServiceRejectsInvalidPortSpecOnCreateAndUpdate(t *testing.T) {
+	db := openRunnerTestDB(t)
+	service := NewTaskService(db, ClockFunc(func() time.Time { return time.Date(2026, 7, 24, 2, 0, 0, 0, time.UTC) }))
+	if _, _, err := service.Create(context.Background(), model.ScanTask{Target: "192.168.30.10", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeOnce, Config: model.ScanTaskConfig{PortSpec: "443-80"}}); err == nil {
+		t.Fatal("invalid create port_spec was accepted")
+	}
+	task, _, err := service.Create(context.Background(), model.ScanTask{Target: "192.168.30.0/24", ScanType: model.ScanTypeSubnet, Mode: model.ScanTaskModeScheduled, Cron: "0 2 * * *", Timezone: "UTC", Config: model.ScanTaskConfig{PortSpec: "443,80"}})
+	if err != nil || task.Config.PortSpec != "80,443" {
+		t.Fatalf("created task=%#v err=%v", task, err)
+	}
+	task.Config.PortSpec = "invalid"
+	if _, err := service.Update(context.Background(), task); err == nil {
+		t.Fatal("invalid update port_spec was accepted")
 	}
 }

@@ -94,16 +94,14 @@ func (executor *Executor) executeStartedRun(ctx context.Context, run model.ScanT
 		} else {
 			message = executionErr.Error()
 		}
+		if snapshotHasObservations(snapshot) {
+			snapshot.RunID = runID
+			if snapshotErr := storage.SaveScanTaskRunSnapshot(executor.DB, snapshot); snapshotErr != nil {
+				message = fmt.Sprintf("%s; persist partial snapshot: %v", message, snapshotErr)
+			}
+		}
 		return executor.completeRun(runID, status, message)
 	}
-	cancelRequested, err := executor.isCancelRequested(runID)
-	if err != nil {
-		return err
-	}
-	if cancelRequested {
-		return executor.completeRun(runID, model.ScanTaskRunStatusCanceled, "canceled by request")
-	}
-
 	snapshot.RunID = runID
 	if err := storage.SaveScanTaskRunSnapshot(executor.DB, snapshot); err != nil {
 		terminalErr := executor.completeRun(runID, model.ScanTaskRunStatusFailed, fmt.Sprintf("persist run snapshot: %v", err))
@@ -112,7 +110,19 @@ func (executor *Executor) executeStartedRun(ctx context.Context, run model.ScanT
 		}
 		return err
 	}
+	cancelRequested, err := executor.isCancelRequested(runID)
+	if err != nil {
+		return err
+	}
+	if cancelRequested {
+		return executor.completeRun(runID, model.ScanTaskRunStatusCanceled, "canceled by request")
+	}
 	return executor.completeRun(runID, model.ScanTaskRunStatusSuccess, "")
+}
+
+func snapshotHasObservations(snapshot model.ScanTaskRunSnapshot) bool {
+	return len(snapshot.Hosts) > 0 || len(snapshot.Ports) > 0 || len(snapshot.Vulnerabilities) > 0 ||
+		len(snapshot.TemplateCandidates) > 0 || len(snapshot.FingerprintMatches) > 0
 }
 
 func (executor *Executor) runContext(parent context.Context, runID int64) (context.Context, func()) {

@@ -25,10 +25,23 @@ import (
 
 const maxNucleiStderrBytes = 32 * 1024
 
+var ErrNoTemplates = errors.New("no usable nuclei templates")
+
+// NucleiExecutionResult separates process startup and actual template
+// execution from findings and errors. Callers must not infer coverage from an
+// empty finding list or a final process error.
+type NucleiExecutionResult struct {
+	Findings []model.NucleiFinding
+	Started  bool
+	Executed bool
+	Err      error
+}
+
 type nucleiJSONLine struct {
 	TemplateID string `json:"template-id"`
 	Type       string `json:"type"`
 	Host       string `json:"host"`
+	Port       string `json:"port"`
 	MatchedAt  string `json:"matched-at"`
 	Timestamp  string `json:"timestamp"`
 	Info       struct {
@@ -52,72 +65,93 @@ func RunNucleiForOpenPorts(ctx context.Context, ip string, openPorts []model.Sca
 // RunNucleiForOpenPortsWithTags restricts Nuclei to a set of template tags
 // when tags are supplied. An empty tag set keeps the legacy full-template mode.
 func RunNucleiForOpenPortsWithTags(ctx context.Context, ip string, openPorts []model.ScanResult, templatesPath string, tags []string) ([]model.NucleiFinding, error) {
-	return runNucleiForOpenPorts(ctx, ip, openPorts, templatesPath, tags, nil)
+	result := ExecuteNucleiForOpenPortsWithTags(ctx, ip, openPorts, templatesPath, tags)
+	return result.Findings, result.Err
 }
 
-// RunNucleiForOpenPortsWithTemplatePaths runs only reviewed relative template
-// paths under the configured root.
-func RunNucleiForOpenPortsWithTemplatePaths(ctx context.Context, ip string, openPorts []model.ScanResult, templatesPath string, paths []string) ([]model.NucleiFinding, error) {
-	return runNucleiForOpenPorts(ctx, ip, openPorts, templatesPath, nil, paths)
-}
-
-func runNucleiForOpenPorts(ctx context.Context, ip string, openPorts []model.ScanResult, templatesPath string, tags, paths []string) ([]model.NucleiFinding, error) {
-	nucleiPath, err := detectNucleiBinary()
-	if err != nil {
-		return nil, err
-	}
-
+func ExecuteNucleiForOpenPortsWithTags(ctx context.Context, ip string, openPorts []model.ScanResult, templatesPath string, tags []string) NucleiExecutionResult {
 	resolvedTemplates, err := resolveNucleiTemplates(templatesPath)
 	if err != nil {
-		return nil, err
+		return NucleiExecutionResult{Err: err}
+	}
+	return executeNucleiForOpenPortsWithTemplatePaths(ctx, ip, openPorts, []string{resolvedTemplates}, tags)
+}
+
+// RunNucleiForOpenPortsWithTemplatePaths executes only the supplied reviewed
+// local template files. Callers are responsible for content pinning.
+func RunNucleiForOpenPortsWithTemplatePaths(ctx context.Context, ip string, openPorts []model.ScanResult, templatePaths []string) ([]model.NucleiFinding, error) {
+	result := ExecuteNucleiForOpenPortsWithTemplatePaths(ctx, ip, openPorts, templatePaths)
+	return result.Findings, result.Err
+}
+
+func ExecuteNucleiForOpenPortsWithTemplatePaths(ctx context.Context, ip string, openPorts []model.ScanResult, templatePaths []string) NucleiExecutionResult {
+	paths := make([]string, 0, len(templatePaths))
+	for _, path := range templatePaths {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return NucleiExecutionResult{Err: err}
+		}
+		info, err := os.Stat(absolute)
+		if err != nil || info.IsDir() {
+			return NucleiExecutionResult{Err: fmt.Errorf("reviewed nuclei template is not a file: %s", path)}
+		}
+		paths = append(paths, absolute)
+	}
+	return executeNucleiForOpenPortsWithTemplatePaths(ctx, ip, openPorts, paths, nil)
+}
+
+func runNucleiForOpenPortsWithTemplatePaths(ctx context.Context, ip string, openPorts []model.ScanResult, templatePaths []string, tags []string) ([]model.NucleiFinding, error) {
+	result := executeNucleiForOpenPortsWithTemplatePaths(ctx, ip, openPorts, templatePaths, tags)
+	return result.Findings, result.Err
+}
+
+func executeNucleiForOpenPortsWithTemplatePaths(ctx context.Context, ip string, openPorts []model.ScanResult, templatePaths []string, tags []string) NucleiExecutionResult {
+	nucleiPath, err := detectNucleiBinary()
+	if err != nil {
+		return NucleiExecutionResult{Err: err}
 	}
 
 	targets := buildTargets(ip, openPorts)
 	if len(targets) == 0 {
-		return nil, nil
+		return NucleiExecutionResult{}
 	}
 
 	tmp, err := os.CreateTemp("", "yscan-nuclei-targets-*.txt")
 	if err != nil {
-		return nil, err
+		return NucleiExecutionResult{Err: err}
 	}
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
 
 	for _, t := range targets {
 		if _, err := tmp.WriteString(t + "\n"); err != nil {
-			return nil, err
+			return NucleiExecutionResult{Err: err}
 		}
 	}
 
 	if err := tmp.Sync(); err != nil {
-		return nil, err
+		return NucleiExecutionResult{Err: err}
 	}
 
-	args := buildNucleiArgs(tmp.Name(), resolvedTemplates, tags)
-	if len(paths) > 0 {
-		args = []string{"-jsonl", "-silent", "-l", tmp.Name(), "-exclude-tags", strings.Join(planner.DefaultExcludedTemplateTags(), ",")}
-		for _, path := range paths {
-			args = append(args, "-t", filepath.Join(resolvedTemplates, path))
-		}
-	}
+	args := buildNucleiArgs(tmp.Name(), templatePaths, tags)
 
 	cmd := newNucleiCommand(ctx, nucleiPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return NucleiExecutionResult{Err: err}
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, err
+		return NucleiExecutionResult{Err: err}
 	}
 
 	if err := cmd.Start(); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return NucleiExecutionResult{Err: ctxErr}
 		}
-		return nil, err
+		return NucleiExecutionResult{Err: err}
 	}
+	result := NucleiExecutionResult{Started: true}
 
 	stdoutDone := make(chan nucleiStdoutResult, 1)
 	go func() {
@@ -135,27 +169,43 @@ func runNucleiForOpenPorts(ctx context.Context, ip string, openPorts []model.Sca
 	stdoutResult := <-stdoutDone
 	stderrErr := <-stderrDone
 	waitErr := cmd.Wait()
+	result.Findings = stdoutResult.findings
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
+		result.Executed = true
+		result.Err = ctxErr
+		return result
 	}
 	if stdoutResult.err != nil {
-		return nil, stdoutResult.err
+		result.Executed = true
+		result.Err = stdoutResult.err
+		return result
 	}
 	if stderrErr != nil {
-		return nil, stderrErr
+		result.Executed = true
+		result.Err = stderrErr
+		return result
 	}
 	if waitErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			result.Executed = true
+			result.Err = ctxErr
+			return result
 		}
 		msg := strings.TrimSpace(stderrOutput.String())
+		if strings.Contains(strings.ToLower(msg), "no templates provided for scan") {
+			result.Err = ErrNoTemplates
+			return result
+		}
 		if msg == "" {
 			msg = waitErr.Error()
 		}
-		return nil, fmt.Errorf("nuclei execution failed: %s", msg)
+		result.Executed = true
+		result.Err = fmt.Errorf("nuclei execution failed: %s", msg)
+		return result
 	}
 
-	return stdoutResult.findings, nil
+	result.Executed = true
+	return result
 }
 
 type nucleiStdoutResult struct {
@@ -177,7 +227,7 @@ func parseNucleiJSONL(reader io.Reader, ip string) ([]model.NucleiFinding, error
 			continue
 		}
 
-		targetIP, targetPort := parseTarget(row.Host, row.MatchedAt)
+		targetIP, targetPort := parseTarget(row.Host, row.MatchedAt, row.Port)
 		if targetIP == "" {
 			targetIP = ip
 		}
@@ -205,7 +255,7 @@ func parseNucleiJSONL(reader io.Reader, ip string) ([]model.NucleiFinding, error
 		})
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return findings, err
 	}
 	return findings, nil
 }
@@ -238,10 +288,12 @@ func (output *boundedOutput) String() string {
 	return output.buffer.String() + "\n[stderr truncated]"
 }
 
-func buildNucleiArgs(targetFile, templatesPath string, tags []string) []string {
+func buildNucleiArgs(targetFile string, templatePaths []string, tags []string) []string {
 	args := []string{"-jsonl", "-silent", "-l", targetFile, "-exclude-tags", strings.Join(planner.DefaultExcludedTemplateTags(), ",")}
-	if templatesPath != "" {
-		args = append(args, "-t", templatesPath)
+	for _, templatePath := range templatePaths {
+		if strings.TrimSpace(templatePath) != "" {
+			args = append(args, "-t", templatePath)
+		}
 	}
 	if normalizedTags := normalizeTagList(tags); len(normalizedTags) > 0 {
 		args = append(args, "-tags", strings.Join(normalizedTags, ","))
@@ -395,6 +447,12 @@ func buildTargets(ip string, openPorts []model.ScanResult) []string {
 			continue
 		}
 		t := net.JoinHostPort(ip, portStr)
+		switch strings.ToLower(strings.TrimSpace(r.Service)) {
+		case "http", "http-unknown":
+			t = "http://" + t
+		case "https":
+			t = "https://" + t
+		}
 		if _, ok := seen[t]; ok {
 			continue
 		}
@@ -404,12 +462,18 @@ func buildTargets(ip string, openPorts []model.ScanResult) []string {
 	return targets
 }
 
-func parseTarget(hostField, matchedAt string) (string, int) {
-	if ip, port, ok := parseHostPort(hostField); ok {
+func parseTarget(hostField, matchedAt, portField string) (string, int) {
+	// matched-at is the concrete endpoint in current Nuclei JSONL. The host
+	// field may contain only an IP while port is emitted as a separate field.
+	if ip, port, ok := parseHostPort(matchedAt); ok && port > 0 {
 		return ip, port
 	}
-	if ip, port, ok := parseHostPort(matchedAt); ok {
+	if ip, port, ok := parseHostPort(hostField); ok && port > 0 {
 		return ip, port
+	}
+	if ip := net.ParseIP(strings.TrimSpace(hostField)); ip != nil {
+		port, _ := strconv.Atoi(strings.TrimSpace(portField))
+		return ip.String(), port
 	}
 	return "", 0
 }

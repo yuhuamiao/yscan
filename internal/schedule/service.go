@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"golandproject/yscan/internal/model"
+	"golandproject/yscan/internal/scan"
 	"golandproject/yscan/internal/storage"
 )
 
@@ -43,6 +44,13 @@ func (service *TaskService) Create(ctx context.Context, task model.ScanTask) (mo
 		return model.ScanTask{}, nil, err
 	}
 	task.Target = normalizedTarget
+	ports, err := scan.ParsePortSpec(task.Config.PortSpec)
+	if err != nil {
+		return model.ScanTask{}, nil, fmt.Errorf("invalid port_spec: %w", err)
+	}
+	if len(ports) > 0 {
+		task.Config.PortSpec = scan.FormatPortSpec(ports)
+	}
 	if task.Mode == model.ScanTaskModeScheduled {
 		if _, err := ParseCron(task.Cron, task.Timezone); err != nil {
 			return model.ScanTask{}, nil, err
@@ -89,6 +97,13 @@ func (service *TaskService) Update(ctx context.Context, task model.ScanTask) (mo
 		return model.ScanTask{}, err
 	}
 	task.Target = normalizedTarget
+	ports, err := scan.ParsePortSpec(task.Config.PortSpec)
+	if err != nil {
+		return model.ScanTask{}, fmt.Errorf("invalid port_spec: %w", err)
+	}
+	if len(ports) > 0 {
+		task.Config.PortSpec = scan.FormatPortSpec(ports)
+	}
 	if task.Mode == model.ScanTaskModeScheduled {
 		if _, err := ParseCron(task.Cron, task.Timezone); err != nil {
 			return model.ScanTask{}, err
@@ -98,14 +113,15 @@ func (service *TaskService) Update(ctx context.Context, task model.ScanTask) (mo
 }
 
 // NormalizeInternalScanTarget is the shared admission boundary for v2 CLI and
-// API task creation. The current product scope is RFC1918 IPv4 assets only.
+// API task creation. One-time IP tasks accept an explicit IPv4 address; subnet
+// tasks retain the internal-CIDR boundary used by scheduled discovery.
 func NormalizeInternalScanTarget(scanType, target string) (string, error) {
 	target = strings.TrimSpace(target)
 	switch scanType {
 	case model.ScanTypeIP:
 		ip := net.ParseIP(target).To4()
-		if ip == nil || !ip.IsPrivate() {
-			return "", fmt.Errorf("scan target must be an internal IPv4 address: %s", target)
+		if ip == nil {
+			return "", fmt.Errorf("scan target must be an IPv4 address: %s", target)
 		}
 		return ip.String(), nil
 	case model.ScanTypeSubnet:

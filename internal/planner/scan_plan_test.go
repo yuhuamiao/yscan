@@ -26,6 +26,13 @@ func TestTemplateGroupsForRequiredServices(t *testing.T) {
 	}
 }
 
+func TestNonStandardHTTPSUsesWebValidationGroups(t *testing.T) {
+	groups := TemplateGroupsForScanResults([]model.ScanResult{{Address: "192.0.2.10:30957", Open: true, Service: "https"}})
+	if !reflect.DeepEqual(groups, []string{"http", "misconfiguration", "technologies"}) {
+		t.Fatalf("non-standard HTTPS groups = %#v", groups)
+	}
+}
+
 func TestDefaultExcludedTemplateTagsReturnsCopy(t *testing.T) {
 	tags := DefaultExcludedTemplateTags()
 	want := []string{"intrusive", "dos", "auth"}

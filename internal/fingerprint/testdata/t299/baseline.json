@@ -1,0 +1,2527 @@
+{
+  "revision": "t299-v3",
+  "fixtures": [
+    {
+      "category": "web_framework",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Angular IO (AngularJS):153",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "-1255347784",
+      "expected_product": "angular io (angularjs)",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:195",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "location",
+      "operator": "contains_ci",
+      "observed_value": "/index.action",
+      "expected_product": "apache-struts",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:196",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "location",
+      "operator": "contains_ci",
+      "observed_value": "/login.action",
+      "expected_product": "apache-struts",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:197",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "=\"struts.token.name\"",
+      "expected_product": "apache-struts",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:198",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003cform action=\"login.action\" method=\"post",
+      "expected_product": "apache-struts",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:199",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003cform action=\"/login.action\" method=\"post",
+      "expected_product": "apache-struts",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:200",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "content=\"Struts2 Showcase for Apache Struts Project\"",
+      "expected_product": "apache-struts",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:201",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "struts problem report",
+      "expected_product": "apache-struts",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:202",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "there is no action mapped for namespace",
+      "expected_product": "apache-struts",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:203",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "no result defined for action and result input",
+      "expected_product": "apache-struts",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:227",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "this script was generated by apphp calendar",
+      "expected_product": "apphp-calendar",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:271",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "title=\"autoindex default",
+      "expected_product": "autoindex-php-script",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:272",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "set-cookie",
+      "operator": "contains_ci",
+      "observed_value": "autoindex2",
+      "expected_product": "autoindex-php-script",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:273",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "autoindex.sourceforge.net/",
+      "expected_product": "autoindex-php-script",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:312",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "powered by: \u003ca href=\"http://www.mevin.com/\"\u003e",
+      "expected_product": "basic-php-events-lister",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Cake PHP:396",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "980692677",
+      "expected_product": "cake php",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:669",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "content=\"discuz",
+      "expected_product": "discuz",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:671",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "href=\"/forum.php?",
+      "expected_product": "discuz",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:672",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "id=\"discuz_tips",
+      "expected_product": "discuz",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:673",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "powered by \u003cstrong\u003e\u003ca href=\"http://www.discuz.net",
+      "expected_product": "discuz",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Apache ActiveMQ:685",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "1766699363",
+      "expected_product": "apache activemq",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Apache Airflow:100",
+      "protocol": "http",
+      "evidence_type": "html_title",
+      "target": "title",
+      "operator": "contains_ci",
+      "observed_value": "Airflow - Login",
+      "expected_product": "apache airflow",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Apache APISIX:885",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "{\"error_msg\":\"404 Route Not Found\"}",
+      "expected_product": "apache apisix",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Apache Haus:438",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "-632070065",
+      "expected_product": "apache haus",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Apache Tomcat:204",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "-297069493",
+      "expected_product": "apache tomcat",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:149",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "Airflow",
+      "expected_product": "apache-airflow",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:150",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "src=\"/static/pin_100.png\"",
+      "expected_product": "apache-airflow",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:151",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003cspan\u003eairflow\u003c/span\u003e",
+      "expected_product": "apache-airflow",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:153",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "server",
+      "operator": "contains_ci",
+      "observed_value": "apisix",
+      "expected_product": "apache-apisix",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:158",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003ctitle\u003eapache apisix dashboard\u003c/title\u003e",
+      "expected_product": "apache-apisix-dashboard",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:160",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "/archiva.js",
+      "expected_product": "apache-archiva",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:161",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "/archiva.css",
+      "expected_product": "apache-archiva",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:162",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "http://ws.apache.org/axis2",
+      "expected_product": "apache-axis",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:164",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "x-cocoon-version",
+      "operator": "contains_ci",
+      "observed_value": "*",
+      "expected_product": "apache-cocoon",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:168",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "www-authenticate",
+      "operator": "contains_ci",
+      "observed_value": "Basic realm=\"dubbo\"",
+      "expected_product": "apache-dubbo",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:170",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003cimg alt=\"apache flink dashboard\" src=\"images/flink-logo.png",
+      "expected_product": "apache-flink",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:171",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "content=\"apache forrest",
+      "expected_product": "apache-forrest",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:172",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "name=\"forrest",
+      "expected_product": "apache-forrest",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:173",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "images/guacamole-logo",
+      "expected_product": "apache-guacamole",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:176",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "/static/yarn.css",
+      "expected_product": "apache-hadoop-yarn",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:294",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003ch2\u003ewhat's next?\u003c/h2\u003e",
+      "expected_product": "aws-elastic-beanstalk",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:295",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "aws.amazon.com/elasticbeanstalk",
+      "expected_product": "aws-elastic-beanstalk",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:592",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "server",
+      "operator": "contains_ci",
+      "observed_value": "couchbase",
+      "expected_product": "couchbase",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Elastic (Database):289",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "1611729805",
+      "expected_product": "elastic (database)",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Elastic (Database):582",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "1552860581",
+      "expected_product": "elastic (database)",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:797",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003ctitle\u003eElastic HD Dashboard\u003c/title\u003e",
+      "expected_product": "elastichd-dashboard",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "wappalyzer",
+      "source_commit": "206b81ff73111aa98af217f35b8f3003e2730617",
+      "source_rule_id": "ElasticPress",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "x-elasticpress-query",
+      "operator": "exists",
+      "observed_value": "present",
+      "expected_product": "elasticpress",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1122",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003cmeta http-equiv=\"refresh\" content=\"0;url=/master-status\"/\u003e",
+      "expected_product": "hbase",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1292",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "class=\"influxdb-version\"",
+      "expected_product": "influxdata-influxdb",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1293",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "influxdb",
+      "expected_product": "influxdata-influxdb",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Influxdb:60",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "operator": "contains_ci",
+      "observed_value": "X-Influxdb",
+      "expected_product": "influxdb",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1735",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "It looks like you are trying to access MongoDB over HTTP on the native driver port.",
+      "expected_product": "mongodb",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1769",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003cselect class=\"sqlcombo\" name=\"tablecombo",
+      "expected_product": "mysqldumper",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1770",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "href=\"mysql.cgi?do=top_level_op",
+      "expected_product": "mysqlman",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1771",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "size=\"1\"\u003emysqlman",
+      "expected_product": "mysqlman",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1785",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "content=\"neo4j",
+      "expected_product": "neo4j",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1786",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "ng-show=\"neo4j.enterpriseedition",
+      "expected_product": "neo4j",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1787",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "play-topic=\"neo4j-sync",
+      "expected_product": "neo4j",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1788",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "{{ neo4j.version | neo4jdeveloperdoc }}/",
+      "expected_product": "neo4j",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "database_cache",
+      "source_key": "wappalyzer",
+      "source_commit": "206b81ff73111aa98af217f35b8f3003e2730617",
+      "source_rule_id": "Oracle Dynamic Monitoring Service",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "x-oracle-dms-ecid",
+      "operator": "exists",
+      "observed_value": "present",
+      "expected_product": "oracle dynamic monitoring service",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:100",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "trusguard ssl vpn client",
+      "expected_product": "ahnlab-trusguard-ssl-vpn",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:237",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "an_util.js",
+      "expected_product": "array-vpn",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:299",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "class=\"axgate\"",
+      "expected_product": "axgate-sslvpn",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:311",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "barracuda ssl vpn",
+      "expected_product": "barracuda-ssl-vpn",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Cisco SSLVPN:87",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "/+CSCOE+/logon.html",
+      "expected_product": "cisco sslvpn",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:477",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "set-cookie",
+      "operator": "contains_ci",
+      "observed_value": "webvpncontext=",
+      "expected_product": "cisco-ssl-vpn",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:481",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "/+CSCOE+/logon.html",
+      "expected_product": "ciscovpn",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Citrix 虚拟桌面:682",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "-1272756243",
+      "expected_product": "citrix 虚拟桌面",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:486",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "href=\"/vpn/images/accessgateway.ico",
+      "expected_product": "citrix-access-gateway",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:487",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "class=\"citrixreceiverlogoaboutbox\"",
+      "expected_product": "citrix-access-gateway",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:488",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "/vpn/js/gateway_login_view.js?",
+      "expected_product": "citrix-access-gateway",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:489",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "cloud.ottoworkfroce.eu/vpn/index.html",
+      "expected_product": "citrix-access-gateway",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:490",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "vpn/js/lsgateway_login_view.js",
+      "expected_product": "citrix-access-gateway",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:491",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "class=\"_ctxstxt_netscalergateway\"",
+      "expected_product": "citrix-access-gateway",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:492",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "receiver/images/common/icon_vpn.ico",
+      "expected_product": "citrix-access-gateway",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:493",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "window.location=\"/citrix/metaframe",
+      "expected_product": "citrix-metaframe",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:494",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "set-cookie",
+      "operator": "contains_ci",
+      "observed_value": "citrix_ns_id",
+      "expected_product": "citrix-netscaler",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:495",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "netscape/firefox/opera",
+      "expected_product": "citrix-netscaler",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:496",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "href=\"clients/html5client/src/receiverthirdpartynotices.html\"",
+      "expected_product": "citrix-receiver",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "remote_management",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:498",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "server",
+      "operator": "contains_ci",
+      "observed_value": "citrix web pn server",
+      "expected_product": "citrix-web-pn-server",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:183",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003cimg src=\"/static/img/mesos_logo.png\" alt=\"apache mesos\"\u003e",
+      "expected_product": "apache-mesos",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:424",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "class=\"ceph-none-found\" rv-hide=\"rbd_pools",
+      "expected_product": "ceph",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Docker:238",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "-1814887000",
+      "expected_product": "docker",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Docker:239",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "1937209448",
+      "expected_product": "docker",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:843",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003ca class=\"navbar-brand\" href=\"./home\"\u003eetcd viewer\u003c/a\u003e",
+      "expected_product": "etcd-viewer",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Grafana:833",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003ctitle\u003eGrafana\u003c/title\u003e",
+      "expected_product": "grafana",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1031",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "window.grafanabootdata = ",
+      "expected_product": "grafana",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1032",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "grafana-app",
+      "expected_product": "grafana",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Kubeflow:175",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "-1203021870",
+      "expected_product": "kubeflow",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Kubernetes:807",
+      "protocol": "http",
+      "evidence_type": "html_title",
+      "target": "title",
+      "operator": "contains_ci",
+      "observed_value": "Kubernetes Dashboard",
+      "expected_product": "kubernetes",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1490",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "href=\"assets/images/kubernetes-logo.png",
+      "expected_product": "kubernetes",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1491",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003carticle class=\"post kubernetes",
+      "expected_product": "kubernetes",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1492",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003cb\u003ekubernetes\u003c/b\u003e listening",
+      "expected_product": "kubernetes",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1493",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "value=\"kubernetes",
+      "expected_product": "kubernetes",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1494",
+      "protocol": "http",
+      "evidence_type": "http_header",
+      "target": "www-authenticate",
+      "operator": "contains_ci",
+      "observed_value": "realm=\"kubernetes",
+      "expected_product": "kubernetes",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "MinIO:741",
+      "protocol": "http",
+      "evidence_type": "html_title",
+      "target": "title",
+      "operator": "contains_ci",
+      "observed_value": "MinIO Browser",
+      "expected_product": "minio",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Minio Browser:797",
+      "protocol": "http",
+      "evidence_type": "html_title",
+      "target": "title",
+      "operator": "contains_ci",
+      "observed_value": "Minio Browser",
+      "expected_product": "minio browser",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1713",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003ctitle\u003eMinIO Console\u003c/title\u003e",
+      "expected_product": "minio-browser",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1714",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "href=\"/minio/loader.css\"",
+      "expected_product": "minio-browser",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1715",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003ctitle\u003eMinIO Browser\u003c/title\u003e",
+      "expected_product": "minio-browser",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Dahua:410",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "-1466785234",
+      "expected_product": "dahua",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Dahua Storm (DVR):279",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "1281253102",
+      "expected_product": "dahua storm (dvr)",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Dahua Storm (IP Camera):193",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "2019488876",
+      "expected_product": "dahua storm (ip camera)",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Dahua Storm (IP Camera):268",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "833190513",
+      "expected_product": "dahua storm (ip camera)",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:770",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "content=\"weaver e-mobile\"",
+      "expected_product": "ecology泛微e-mobile",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:771",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "e-mobile\u0026nbsp;",
+      "expected_product": "ecology泛微e-mobile",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:773",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "window.apiprifix = \"/emp\";",
+      "expected_product": "ecology泛微e-mobile",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:775",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "/general/login/view//images/updateload.gif",
+      "expected_product": "ecology泛微e-office",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:776",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "szfeatures",
+      "expected_product": "ecology泛微e-office",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:777",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003cmeta name=\"searchtitle\" content=\"泛微云桥e-Bridge\"\u003e ",
+      "expected_product": "ecology泛微云桥e-bridge",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:778",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "e-Bridge",
+      "expected_product": "ecology泛微云桥e-bridge",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:779",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "wx.weaver",
+      "expected_product": "ecology泛微云桥e-bridge",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:780",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "content=\"泛微云桥e-bridge\"",
+      "expected_product": "ecology泛微云桥e-bridge",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "H3C Router:86",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "/wnm/ssl/web/frame/login.html",
+      "expected_product": "h3c router",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "H3C SecPath 运维审计系统:851",
+      "protocol": "http",
+      "evidence_type": "favicon_hash",
+      "target": "mmh3",
+      "operator": "equals",
+      "observed_value": "1776863739",
+      "expected_product": "h3c secpath 运维审计系统",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1057",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "href=\"cas.css",
+      "expected_product": "h3c-cas",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1058",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "分布式存储管理系统 \u003c/p\u003e",
+      "expected_product": "h3c-cloud",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1059",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "vstor",
+      "expected_product": "h3c-cloud",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1062",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "/video_record.jnlp",
+      "expected_product": "h3c-hdm",
+      "expected_version": "",
+      "expected_cpe": ""
+    },
+    {
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:1063",
+      "protocol": "http",
+      "evidence_type": "http_body",
+      "target": "body",
+      "operator": "contains_ci",
+      "observed_value": "\u003ciframe frameborder=\"0\" class=\"framelayout\" src=\"./page/blank.html\" name=\"mainframe\" id=\"mainframe",
+      "expected_product": "h3c-hdm",
+      "expected_version": "",
+      "expected_cpe": ""
+    }
+  ],
+  "semantic_fixtures": [
+    {
+      "case_id": "fh-v3-apache-struts-header",
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-v3",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "index:195",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "headers": {
+          "Location": "/index.action"
+        }
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "headers": {
+          "Location": "/login"
+        }
+      },
+      "features": [
+        "http_header"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "apache-struts",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "fh-v4-nginx-header",
+      "category": "middleware",
+      "source_key": "fingerprinthub-web-v4",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "nginx",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "headers": {
+          "Server": "nginx/1.27.5"
+        }
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "headers": {
+          "Server": "fixture"
+        }
+      },
+      "features": [
+        "http_header"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "nginx",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "ehole-apache-airflow-title",
+      "category": "middleware",
+      "source_key": "ehole",
+      "source_commit": "9a91e0b3372537681d1b88a31cfab3d00620c1e5",
+      "source_rule_id": "Apache Airflow:100",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "title": "Airflow - Login"
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "title": "Sign in"
+      },
+      "features": [
+        "html_title"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "apache airflow",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "fscan-bt-panel-body",
+      "category": "china_common",
+      "source_key": "fscan-native-web",
+      "source_commit": "bf036fd9b272a56d493796badcf0a269f0a83ec0",
+      "source_rule_id": "regex:0",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "body": "\u003cimg src=\"https://app.bt.cn/static/app.png\"\u003e"
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "body": "\u003cimg src=\"/static/app.png\"\u003e"
+      },
+      "features": [
+        "http_body",
+        "regex"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "宝塔",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "fh-service-lukemftpd",
+      "category": "remote_management",
+      "source_key": "fingerprinthub-service-yaml",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "null/ftp/1002551213",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "220 fixture FTP server (lukemftpd 1.2) ready.\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "tcp_banner",
+        "regex",
+        "version"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "lukemftpd",
+      "expected_version": "1.2",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "tcp-securetransport",
+      "category": "remote_management",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:NULL:327",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "220 host FTP server (SecureTransport 5.2) ready.\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "tcp_banner",
+        "regex",
+        "version",
+        "cpe"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "tumbleweed securetransport ftpd",
+      "expected_version": "5.2",
+      "expected_cpe": "cpe:/a:tumbleweed:securetransport:5.2",
+      "expected_soft": false
+    },
+    {
+      "case_id": "tcp-3com-ftpd",
+      "category": "remote_management",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:NULL:329",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "220 3Com 3CDaemon FTP Server Version 2.0\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "tcp_banner",
+        "regex",
+        "version"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "3com 3cdaemon ftpd",
+      "expected_version": "2.0",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "tcp-guild-ftpd",
+      "category": "remote_management",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:NULL:331",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "220-GuildFTPd FTP Server (c) 2020-2024\r\n220-Version 1.2\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "tcp_banner",
+        "regex",
+        "version",
+        "cpe"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "guild ftpd",
+      "expected_version": "1.2",
+      "expected_cpe": "cpe:/o:microsoft:windows",
+      "expected_soft": false
+    },
+    {
+      "case_id": "tcp-iis-denied",
+      "category": "remote_management",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:NULL:338",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "530 Connection refused, unknown IP address.\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "tcp_banner",
+        "regex",
+        "cpe"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "microsoft iis ftpd",
+      "expected_version": "",
+      "expected_cpe": "cpe:/a:microsoft:internet_information_services",
+      "expected_soft": false
+    },
+    {
+      "case_id": "tcp-iis-version",
+      "category": "remote_management",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:NULL:339",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "220 IIS 10.0 FTP\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "tcp_banner",
+        "regex",
+        "version",
+        "cpe"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "microsoft iis ftpd",
+      "expected_version": "10.0",
+      "expected_cpe": "cpe:/a:microsoft:internet_information_services:10.0",
+      "expected_soft": false
+    },
+    {
+      "case_id": "tcp-vsftpd-bind",
+      "category": "remote_management",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:NULL:349",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "500 OOPS: could not bind listening IPv4 socket\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "tcp_banner",
+        "regex",
+        "cpe"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "vsftpd",
+      "expected_version": "",
+      "expected_cpe": "cpe:/a:vsftpd:vsftpd",
+      "expected_soft": false
+    },
+    {
+      "case_id": "tcp-vsftpd-error",
+      "category": "remote_management",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:NULL:350",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "500 OOPS: vsftpd: configuration error\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "tcp_banner",
+        "regex",
+        "cpe"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "vsftpd",
+      "expected_version": "",
+      "expected_cpe": "cpe:/a:vsftpd:vsftpd",
+      "expected_soft": false
+    },
+    {
+      "case_id": "tcp-filezilla-static",
+      "category": "remote_management",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:NULL:354",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "220 FTP Server - FileZilla\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "tcp_banner",
+        "regex",
+        "cpe"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "filezilla ftpd",
+      "expected_version": "",
+      "expected_cpe": "cpe:/a:filezilla-project:filezilla_server",
+      "expected_soft": false
+    },
+    {
+      "case_id": "tcp-filezilla-version",
+      "category": "remote_management",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:NULL:358",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "220 FileZilla Server 1.9.0\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "tcp_banner",
+        "regex",
+        "version",
+        "cpe"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "filezilla ftpd",
+      "expected_version": "1.9.0",
+      "expected_cpe": "cpe:/a:filezilla-project:filezilla_server:1.9.0",
+      "expected_soft": false
+    },
+    {
+      "case_id": "tcp-gnu-inetutils",
+      "category": "remote_management",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:NULL:363",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "220 (none) FTP server (GNU inetutils 2.4) ready.\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "tcp_banner",
+        "regex",
+        "version",
+        "cpe"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "gnu inetutils ftpd",
+      "expected_version": "2.4",
+      "expected_cpe": "cpe:/a:gnu:inetutils:2.4",
+      "expected_soft": false
+    },
+    {
+      "case_id": "probe-bitcoin-jsonrpc",
+      "category": "database_cache",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:GetRequest:4803",
+      "mode": "nmap_active",
+      "probe_name": "GetRequest",
+      "probe_port": 80,
+      "service": "unknown",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "HTTP/1.0 405 Method Not Allowed\r\nContent-Type: text/html; charset=ISO-8859-1\r\n\r\nJSONRPC server handles only POST requests"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "nmap_active",
+        "regex"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "bitcoin or litecoin json-rpc",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "probe-distributed-keyproxy",
+      "category": "middleware",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:GetRequest:4831",
+      "mode": "nmap_active",
+      "probe_name": "GetRequest",
+      "probe_port": 80,
+      "service": "unknown",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "HTTP/1.0 302 Found\r\nLocation: http://www.distributed.net/\r\n\r\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "nmap_active",
+        "regex"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "distributed.net http keyproxy",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "probe-docker",
+      "category": "container_k8s",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:GetRequest:4832",
+      "mode": "nmap_active",
+      "probe_name": "GetRequest",
+      "probe_port": 80,
+      "service": "unknown",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "HTTP/1.0 404 Not Found\r\nContent-Type: application/json\r\nDate: fixture\r\nContent-Length: 29\r\n\r\n{\"message\":\"page not found\"}\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "nmap_active",
+        "regex",
+        "soft"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "docker remote api",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": true
+    },
+    {
+      "case_id": "probe-elasticsearch",
+      "category": "database_cache",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:GetRequest:4837",
+      "mode": "nmap_active",
+      "probe_name": "GetRequest",
+      "probe_port": 80,
+      "service": "unknown",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "This is not an HTTP port"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "nmap_active",
+        "regex",
+        "cpe"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "elasticsearch binary api",
+      "expected_version": "",
+      "expected_cpe": "cpe:/a:elasticsearch:elasticsearch",
+      "expected_soft": false
+    },
+    {
+      "case_id": "probe-ethereum-jsonrpc",
+      "category": "database_cache",
+      "source_key": "nmap-service-probes",
+      "source_commit": "508531ed5904c2382ad25e908b75adc1374baaee",
+      "source_rule_id": "tcp:GetRequest:4840",
+      "mode": "nmap_active",
+      "probe_name": "GetRequest",
+      "probe_port": 80,
+      "service": "unknown",
+      "evidence": {
+        "protocol": "tcp",
+        "banner": "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nVary: Origin\r\nDate: fixture\r\nContent-Length: 55\r\n\r\n{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":\"EOF\"}}\n"
+      },
+      "negative_evidence": {
+        "protocol": "tcp",
+        "banner": "T299 negative banner\r\n"
+      },
+      "features": [
+        "nmap_active",
+        "regex"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "ethereum json-rpc",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "whatweb-4d-offset",
+      "category": "middleware",
+      "source_key": "whatweb",
+      "source_commit": "d279d93042d034f3fd29d5a893d44ccc0595d3f8",
+      "source_rule_id": "4d",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "headers": {
+          "Server": "4D_v19_SQL/12.3"
+        }
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "headers": {
+          "Server": "Apache"
+        }
+      },
+      "features": [
+        "http_header",
+        "regex",
+        "version",
+        "offset"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "4d",
+      "expected_version": "12.3",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "whatweb-jenkins-version",
+      "category": "web_framework",
+      "source_key": "whatweb",
+      "source_commit": "d279d93042d034f3fd29d5a893d44ccc0595d3f8",
+      "source_rule_id": "jenkins",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "headers": {
+          "X-Jenkins": "2.452.1"
+        }
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "headers": {
+          "Server": "Jenkins"
+        }
+      },
+      "features": [
+        "http_header",
+        "regex",
+        "version"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "jenkins",
+      "expected_version": "2.452.1",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "wapp-nagacommerce-meta",
+      "category": "web_framework",
+      "source_key": "wappalyzer",
+      "source_commit": "206b81ff73111aa98af217f35b8f3003e2730617",
+      "source_rule_id": "NagaCommerce",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "meta": {
+          "generator": "NagaCommerce"
+        }
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "meta": {
+          "generator": "other"
+        }
+      },
+      "features": [
+        "html_meta",
+        "regex"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "nagacommerce",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "wapp-naver-script-version",
+      "category": "web_framework",
+      "source_key": "wappalyzer",
+      "source_commit": "206b81ff73111aa98af217f35b8f3003e2730617",
+      "source_rule_id": "Naver Maps",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "body": "\u003cscript src=\"https://openapi.map.naver.com/openapi/v3.0/maps.js\"\u003e\u003c/script\u003e"
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "body": "\u003cscript src=\"/maps.js\"\u003e\u003c/script\u003e"
+      },
+      "features": [
+        "http_body",
+        "regex",
+        "version"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "naver maps",
+      "expected_version": "3.0",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "wapp-neos-header-version",
+      "category": "web_framework",
+      "source_key": "wappalyzer",
+      "source_commit": "206b81ff73111aa98af217f35b8f3003e2730617",
+      "source_rule_id": "Neos CMS",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "headers": {
+          "X-Flow-Powered": "Neos/8.3"
+        }
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "headers": {
+          "X-Flow-Powered": "Flow"
+        }
+      },
+      "features": [
+        "http_header",
+        "regex",
+        "version"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "neos cms",
+      "expected_version": "8.3",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "wapp-netsuite-cookie",
+      "category": "web_framework",
+      "source_key": "wappalyzer",
+      "source_commit": "206b81ff73111aa98af217f35b8f3003e2730617",
+      "source_rule_id": "NetSuite",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "cookies": {
+          "ns_ver": ""
+        }
+      },
+      "negative_evidence": {
+        "protocol": "http"
+      },
+      "features": [
+        "http_cookie",
+        "exists"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "netsuite",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "wapp-netlify-url",
+      "category": "container_k8s",
+      "source_key": "wappalyzer",
+      "source_commit": "206b81ff73111aa98af217f35b8f3003e2730617",
+      "source_rule_id": "Netlify",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "https",
+        "url": "https://fixture.netlify.app/"
+      },
+      "negative_evidence": {
+        "protocol": "https",
+        "url": "https://example.invalid/"
+      },
+      "features": [
+        "http_url",
+        "regex"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "netlify",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "fh-jenkins-and",
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-yaml",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "jenkins/jenkins",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "headers": {
+          "X-Jenkins": "2.452",
+          "X-Jenkins-Session": "fixture"
+        }
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "headers": {
+          "X-Jenkins": "2.452"
+        }
+      },
+      "features": [
+        "http_header",
+        "group_all"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "jenkins",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "fh-jenkins-favicon-or",
+      "category": "web_framework",
+      "source_key": "fingerprinthub-web-yaml",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "jenkins/jenkins",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "favicon_md5": "23e8c7bd78e8cd826c5a6073b15068b1"
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "favicon_md5": "00000000000000000000000000000000"
+      },
+      "features": [
+        "favicon_hash",
+        "group_any"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "jenkins",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "fh-harbor-regex",
+      "category": "container_k8s",
+      "source_key": "fingerprinthub-web-yaml",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "goharbor/harbor",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "https",
+        "body": "\u003cTITLE\u003eHarbor Registry\u003c/TITLE\u003e"
+      },
+      "negative_evidence": {
+        "protocol": "https",
+        "body": "registry"
+      },
+      "features": [
+        "http_body",
+        "regex"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "harbor",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    },
+    {
+      "case_id": "fh-seeyon-and",
+      "category": "china_common",
+      "source_key": "fingerprinthub-web-yaml",
+      "source_commit": "1ca878524ec242a39629a3704532139917779e9c",
+      "source_rule_id": "00_unknown/yonyou-seeyon-oa",
+      "mode": "passive",
+      "evidence": {
+        "protocol": "http",
+        "body": "seeyon seeyonproductid"
+      },
+      "negative_evidence": {
+        "protocol": "http",
+        "body": "seeyon"
+      },
+      "features": [
+        "http_body",
+        "group_all",
+        "group_any"
+      ],
+      "evidence_origin": "curated-real-response",
+      "expected_product": "yonyou-seeyon-oa",
+      "expected_version": "",
+      "expected_cpe": "",
+      "expected_soft": false
+    }
+  ]
+}

@@ -1,8 +1,6 @@
 package identify
 
 import (
-	"bufio"
-	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -10,14 +8,16 @@ import (
 	"golandproject/yscan/internal/assist"
 )
 
+const MaxBannerBytes = 16 << 10
+
 // 协议配置
 var protocolConfig = map[int]struct {
 	probe      string
 	timeout    time.Duration
 	identifier func(string) string
 }{
-	21:   {"USER anonymous\r\n", 5 * time.Second, identifyFTP},
-	22:   {"SSH-2.0-GoScan\r\n", 3 * time.Second, identifySSH},
+	21:   {"", 5 * time.Second, identifyFTP},
+	22:   {"", 3 * time.Second, identifySSH},
 	80:   {"", 8 * time.Second, identifyHTTP},
 	443:  {"", 8 * time.Second, identifyHTTP},
 	3306: {"", 5 * time.Second, identifyMySQL},
@@ -26,6 +26,13 @@ var protocolConfig = map[int]struct {
 }
 
 func ReadBanner(conn net.Conn) string {
+	banner, _ := ReadBannerEvidence(conn)
+	return banner
+}
+
+// ReadBannerEvidence keeps the bounded bytes even when the peer closes the
+// connection or the read deadline fires in the same read that returned data.
+func ReadBannerEvidence(conn net.Conn) (string, bool) {
 	remoteAddr := conn.RemoteAddr().(*net.TCPAddr) //conn.RemoteAddr()返回一个 net.Addr 接口，包含对端（客户端）的网络地址信息（IP、port、Zone）
 	port := remoteAddr.Port
 
@@ -33,8 +40,8 @@ func ReadBanner(conn net.Conn) string {
 	setupConnection(conn, port)
 
 	// 尝试读取初始banner
-	if banner := tryReadBanner(conn); banner != "" {
-		return banner //cleanResponse(banner)
+	if banner, truncated := tryReadBanner(conn); banner != "" {
+		return banner, truncated //cleanResponse(banner)
 	}
 
 	// 协议特定探测
@@ -42,8 +49,9 @@ func ReadBanner(conn net.Conn) string {
 		return probeProtocol(conn, port, cfg.probe, cfg.timeout)
 	}
 
-	// 默认探测
-	return probeDefault(conn)
+	// Unknown services retain an empty banner. Web fallback and any future
+	// protocol probe are executed only by the run-scoped, read-only collector.
+	return "", false
 }
 
 func setupConnection(conn net.Conn, port int) {
@@ -59,80 +67,45 @@ func setupConnection(conn net.Conn, port int) {
 	}
 }
 
-func tryReadBanner(conn net.Conn) string {
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
-	if err == nil && n > 0 {
-		return string(buf[:n])
-	}
-	return ""
-}
-
-func probeProtocol(conn net.Conn, port int, probe string, timeout time.Duration) string {
-	switch port {
-	case 80, 443, 8888:
-		return probeHTTP(conn)
-	default:
-		if probe != "" {
-			conn.Write([]byte(probe))
+func tryReadBanner(conn net.Conn) (string, bool) {
+	data := make([]byte, 0, MaxBannerBytes)
+	buffer := make([]byte, MaxBannerBytes+1)
+	for len(data) <= MaxBannerBytes {
+		n, err := conn.Read(buffer[:min(len(buffer), MaxBannerBytes+1-len(data))])
+		if n > 0 {
+			data = append(data, buffer[:n]...)
+			if len(data) > MaxBannerBytes {
+				return string(data[:MaxBannerBytes]), true
+			}
+			// Once bytes arrive, only a short inter-read window is needed to
+			// collect a split response without holding the entire scan worker.
+			_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 		}
-		return readWithTimeout(conn, timeout)
-	}
-}
-
-func probeHTTP(conn net.Conn) string {
-	//req := buildHTTPRequest(conn.RemoteAddr().(*net.TCPAddr).IP.String())
-	req := fmt.Sprintf(
-		"GET / HTTP/1.1\r\n"+
-			"Host: %s\r\n"+
-			"User-Agent: Mozilla/5.0 (compatible; GoScanner/1.0)\r\n"+
-			"Accept: */*\r\n"+
-			"Connection: close\r\n\r\n",
-		conn.RemoteAddr().(*net.TCPAddr).IP.String(),
-	)
-
-	conn.Write([]byte(req))
-
-	reader := bufio.NewReader(conn)
-	var resp strings.Builder
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil || line == "\r\n" {
+		if err != nil || n == 0 {
 			break
 		}
-		resp.WriteString(line)
 	}
-
-	return resp.String()
+	return string(data), false
 }
 
-//func buildHTTPRequest(host string) string { //并入 probeHTTP 函数
-//	return fmt.Sprintf(
-//		"GET / HTTP/1.1\r\n"+
-//			"Host: %s\r\n"+
-//			"User-Agent: Mozilla/5.0\r\n"+
-//			"Connection: close\r\n\r\n",
-//		host,
-//	)
-//}
-
-func probeDefault(conn net.Conn) string { //万能请求包
-	conn.Write([]byte("\x01\x02\x03\x04\n"))
-	return readWithTimeout(conn, 1*time.Second)
+func probeProtocol(conn net.Conn, port int, probe string, timeout time.Duration) (string, bool) {
+	if probe != "" {
+		_, _ = conn.Write([]byte(probe))
+	}
+	return readWithTimeout(conn, timeout)
 }
 
-func readWithTimeout(conn net.Conn, timeout time.Duration) string {
+func readWithTimeout(conn net.Conn, timeout time.Duration) (string, bool) {
 	conn.SetReadDeadline(time.Now().Add(timeout))
-	buf := make([]byte, 1024)
-	n, _ := conn.Read(buf)
-	return string(buf[:n])
+	return tryReadBanner(conn)
 }
 
 func IdentifyService(banner string, port int) string {
 	switch {
 	case strings.Contains(banner, "HTTP/"):
 		return identifyHTTP(banner)
+	case strings.HasPrefix(strings.TrimSpace(banner), "SSH-"):
+		return identifySSH(banner)
 	case port == 21:
 		return identifyFTP(banner)
 	case port == 22:
@@ -149,7 +122,9 @@ func IdentifyService(banner string, port int) string {
 		return "redis"
 	case port == 27017:
 		return "mongodb"
-	case port == 80 || port == 443:
+	case port == 443:
+		return "https"
+	case port == 80:
 		return "http"
 	case banner == "":
 		return "None_unknown"

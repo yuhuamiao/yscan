@@ -42,6 +42,12 @@ const (
 	ScanTaskRunStatusCanceled        = "canceled"
 	ScanTaskRunStatusSkippedOverlap  = "skipped_overlap"
 	ScanTaskRunStatusSkippedMisfire  = "skipped_misfire"
+
+	ScanTaskRunValidationDisabled     = "disabled"
+	ScanTaskRunValidationNotStarted   = "not_started"
+	ScanTaskRunValidationNoCandidates = "no_candidates"
+	ScanTaskRunValidationSuccess      = "success"
+	ScanTaskRunValidationFailed       = "failed"
 )
 
 type Scanner struct {
@@ -63,6 +69,8 @@ type ScanResult struct {
 	Product           string
 	FingerprintSource string
 	Banner            string
+	BannerTruncated   bool
+	ProtocolEvidence  []ScanTaskRunProtocolEvidence
 }
 
 type Task struct {
@@ -120,12 +128,228 @@ type ScanTaskRun struct {
 	ConfigHash        string         `json:"config_hash"`
 	ErrorMessage      string         `json:"error_message,omitempty"`
 	ReportPath        string         `json:"report_path,omitempty"`
+	AuditReportPath   string         `json:"audit_report_path,omitempty"`
 	ReportError       string         `json:"report_error,omitempty"`
 	StartedAt         string         `json:"started_at,omitempty"`
 	FinishedAt        string         `json:"finished_at,omitempty"`
 	SnapshotWrittenAt string         `json:"snapshot_written_at,omitempty"`
 	CreatedAt         string         `json:"created_at"`
 	UpdatedAt         string         `json:"updated_at,omitempty"`
+}
+
+// FingerprintSource identifies one stable upstream rule provider. Immutable
+// commits and statistics belong to FingerprintImport, never to this record.
+type FingerprintSource struct {
+	ID              int64  `json:"id"`
+	SourceKey       string `json:"source_key"`
+	RepositoryURL   string `json:"repository_url"`
+	License         string `json:"license,omitempty"`
+	Status          string `json:"status"`
+	CatalogStatus   string `json:"catalog_status,omitempty"`
+	LastError       string `json:"last_error,omitempty"`
+	LastFailedAt    string `json:"last_failed_at,omitempty"`
+	HasActiveImport bool   `json:"has_active_import"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at,omitempty"`
+}
+
+// FingerprintImport is one immutable, manifest-verified source revision.
+type FingerprintImport struct {
+	ID                    int64  `json:"id"`
+	FingerprintSourceID   int64  `json:"fingerprint_source_id"`
+	Commit                string `json:"commit"`
+	ContentSHA256         string `json:"content_sha256"`
+	UpstreamContentSHA256 string `json:"upstream_content_sha256"`
+	AdapterVersion        string `json:"adapter_version"`
+	ProjectionSHA256      string `json:"projection_sha256"`
+	ManifestJSON          string `json:"manifest_json"`
+	RuleTotal             int    `json:"rule_total"`
+	ExecutableTotal       int    `json:"executable_total"`
+	UnsupportedTotal      int    `json:"unsupported_total"`
+	ImportErrorTotal      int    `json:"import_error_total"`
+	ErrorSummary          string `json:"error_summary,omitempty"`
+	IsActive              bool   `json:"is_active"`
+	CreatedAt             string `json:"created_at"`
+}
+
+// FingerprintImportSummary is safe for catalog and run list endpoints. The
+// potentially multi-megabyte manifest is available only from the detail API.
+type FingerprintImportSummary struct {
+	ID                    int64  `json:"id"`
+	FingerprintSourceID   int64  `json:"fingerprint_source_id"`
+	Commit                string `json:"commit"`
+	ContentSHA256         string `json:"content_sha256"`
+	UpstreamContentSHA256 string `json:"upstream_content_sha256"`
+	AdapterVersion        string `json:"adapter_version"`
+	ProjectionSHA256      string `json:"projection_sha256"`
+	RuleTotal             int    `json:"rule_total"`
+	ExecutableTotal       int    `json:"executable_total"`
+	UnsupportedTotal      int    `json:"unsupported_total"`
+	ImportErrorTotal      int    `json:"import_error_total"`
+	ErrorSummary          string `json:"error_summary,omitempty"`
+	IsActive              bool   `json:"is_active"`
+	CreatedAt             string `json:"created_at"`
+}
+
+// FingerprintSourceRule preserves an upstream rule before normalization.
+type FingerprintSourceRule struct {
+	ID                  int64  `json:"id"`
+	FingerprintImportID int64  `json:"fingerprint_import_id"`
+	SourceRuleID        string `json:"source_rule_id,omitempty"`
+	SourcePath          string `json:"source_path"`
+	ContentSHA256       string `json:"content_sha256"`
+	RawContent          string `json:"raw_content"`
+	RawStructure        string `json:"raw_structure,omitempty"`
+	ImportStatus        string `json:"import_status"`
+	ImportError         string `json:"import_error,omitempty"`
+	CreatedAt           string `json:"created_at"`
+	Product             string `json:"product,omitempty"`
+}
+
+type FingerprintSourceRulePage struct {
+	Items    []FingerprintSourceRule `json:"items"`
+	Page     int                     `json:"page"`
+	PageSize int                     `json:"page_size"`
+	Total    int                     `json:"total"`
+}
+
+// FingerprintProduct is the normalized product identity attached to one or
+// more source rules. Source wording remains preserved on FingerprintSourceRule.
+type FingerprintProduct struct {
+	ID             int64  `json:"id"`
+	CanonicalName  string `json:"canonical_name"`
+	Vendor         string `json:"vendor,omitempty"`
+	AliasesJSON    string `json:"aliases_json,omitempty"`
+	CPE            string `json:"cpe,omitempty"`
+	Role           string `json:"role,omitempty"`
+	ExclusiveGroup string `json:"exclusive_group,omitempty"`
+}
+
+// FingerprintProductClassification is the fixed T320 role projection. Roles
+// describe stack layers; only a non-empty exclusive group can create product
+// conflicts at one endpoint.
+func FingerprintProductClassification(name string, tags []string) (string, string) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch name {
+	case "nginx", "apache", "apache http server", "apache httpd", "httpd", "iis", "microsoft iis", "caddy", "lighttpd", "jetty", "openresty":
+		return "web_server", "web_server"
+	case "html5":
+		return "markup", ""
+	case "script":
+		return "web_primitive", ""
+	case "jquery", "bootstrap":
+		return "frontend_library", ""
+	case "open-graph-protocol":
+		return "metadata", ""
+	case "http", "https", "ssh", "ftp", "tcp", "unknown", "none_unknown":
+		return "protocol", ""
+	case "mysql", "postgresql", "mongodb", "redis", "openssh", "pure-ftpd", "vsftpd", "elasticsearch", "docker-api", "kubernetes-api":
+		return "network_service", "network_service"
+	}
+	if strings.Contains(name, "宝塔") || strings.Contains(name, "bt.cn") || strings.Contains(name, "cpanel") || strings.Contains(name, "plesk") {
+		return "control_panel", ""
+	}
+	if strings.Contains(name, "cdn") {
+		return "cdn", ""
+	}
+	for _, tag := range tags {
+		switch strings.ToLower(strings.TrimSpace(tag)) {
+		case "cms":
+			return "cms", ""
+		case "framework":
+			return "framework", ""
+		case "nmap-service", "service", "ftp", "database":
+			return "network_service", "network_service"
+		}
+	}
+	return "application", ""
+}
+
+// FingerprintRule is an executable projection of one preserved source rule.
+type FingerprintRule struct {
+	ID                      int64  `json:"id"`
+	FingerprintSourceRuleID int64  `json:"fingerprint_source_rule_id"`
+	FingerprintProductID    int64  `json:"fingerprint_product_id"`
+	SourceProduct           string `json:"source_product,omitempty"`
+	Protocol                string `json:"protocol"`
+	Status                  string `json:"status"`
+	SoftMatch               bool   `json:"soft_match"`
+	VersionTemplate         string `json:"version_template,omitempty"`
+	CPE                     string `json:"cpe,omitempty"`
+	TagsJSON                string `json:"tags_json,omitempty"`
+}
+
+// FingerprintMatchGroup preserves AND/OR/nested relations from an upstream
+// rule. ParentID is nil for the root group.
+type FingerprintMatchGroup struct {
+	ID                int64  `json:"id"`
+	FingerprintRuleID int64  `json:"fingerprint_rule_id"`
+	ParentID          *int64 `json:"parent_id,omitempty"`
+	Operator          string `json:"operator"`
+	Position          int    `json:"position"`
+}
+
+// FingerprintMatcher is one condition within a preserved match group.
+type FingerprintMatcher struct {
+	ID                      int64  `json:"id"`
+	FingerprintMatchGroupID int64  `json:"fingerprint_match_group_id"`
+	EvidenceType            string `json:"evidence_type"`
+	Target                  string `json:"target,omitempty"`
+	Operator                string `json:"operator"`
+	Value                   string `json:"value"`
+	VersionCapture          string `json:"version_capture,omitempty"`
+	Position                int    `json:"position"`
+}
+
+// FingerprintRuleProjection is the source-independent executable form written
+// in the same transaction as its preserved upstream source rule.
+type FingerprintRuleProjection struct {
+	SourcePath      string
+	ContentSHA256   string
+	SourceProduct   string
+	Product         FingerprintProduct
+	Protocol        string
+	SoftMatch       bool
+	VersionTemplate string
+	CPE             string
+	Tags            []string
+	Root            FingerprintMatchGroupProjection
+}
+
+type FingerprintMatchGroupProjection struct {
+	Operator string
+	Matchers []FingerprintMatcher
+	Children []FingerprintMatchGroupProjection
+}
+
+// TemplateMappingImport is an immutable reviewed mapping revision. Its digest
+// binds the mapping record to the exact template content reviewed for use.
+type TemplateMappingImport struct {
+	ID            int64  `json:"id"`
+	Revision      string `json:"revision"`
+	ContentSHA256 string `json:"content_sha256"`
+	ManifestJSON  string `json:"manifest_json"`
+	IsActive      bool   `json:"is_active"`
+	CreatedAt     string `json:"created_at"`
+}
+
+// FingerprintTemplateMapping allows only an approved, content-pinned local
+// template to be selected from a fingerprint conclusion.
+type FingerprintTemplateMapping struct {
+	ID                      int64  `json:"id"`
+	TemplateMappingImportID int64  `json:"template_mapping_import_id"`
+	ProductKey              string `json:"product_key"`
+	SourceKey               string `json:"source_key,omitempty"`
+	SourceRuleID            string `json:"source_rule_id,omitempty"`
+	TemplateID              string `json:"template_id"`
+	TemplatePath            string `json:"template_path"`
+	TemplateSHA256          string `json:"template_sha256"`
+	TemplateSetRevision     string `json:"template_set_revision"`
+	SideEffect              string `json:"side_effect"`
+	ReviewStatus            string `json:"review_status"`
+	Enabled                 bool   `json:"enabled"`
+	CreatedAt               string `json:"created_at"`
+	DisabledAt              string `json:"disabled_at,omitempty"`
 }
 
 type ScanTaskRunHost struct {
@@ -141,32 +365,129 @@ type ScanTaskRunPort struct {
 	Banner      string `json:"banner,omitempty"`
 }
 
+// ScanTaskRunProtocolEvidence is a safe, structured endpoint observation.
+// Raw HTTP headers and bodies never enter the run snapshot.
+const (
+	ProtocolEvidencePassiveBanner = "passive_banner"
+	ProtocolEvidenceActiveProbe   = "active_probe"
+	ProtocolEvidenceWeb           = "web"
+
+	ProtocolProbeOutcomeResponded      = "responded"
+	ProtocolProbeOutcomeNoResponse     = "no_response"
+	ProtocolProbeOutcomeConnectFailed  = "connect_failed"
+	ProtocolProbeOutcomeConnectTimeout = "connect_timeout"
+	ProtocolProbeOutcomeWriteFailed    = "write_failed"
+	ProtocolProbeOutcomeReadFailed     = "read_failed"
+	ProtocolProbeOutcomeReadTimeout    = "read_timeout"
+	ProtocolProbeOutcomeBudgetTimeout  = "budget_timeout"
+	ProtocolProbeOutcomeCanceled       = "canceled"
+)
+
+type ScanTaskRunProtocolEvidence struct {
+	IP                   string `json:"ip"`
+	Port                 int    `json:"port"`
+	EvidenceType         string `json:"evidence_type"`
+	ProbeName            string `json:"probe_name,omitempty"`
+	Protocol             string `json:"protocol"`
+	Responded            bool   `json:"responded"`
+	Outcome              string `json:"outcome,omitempty"`
+	Diagnostic           string `json:"diagnostic,omitempty"`
+	StatusCode           int    `json:"status_code,omitempty"`
+	Server               string `json:"server,omitempty"`
+	Title                string `json:"title,omitempty"`
+	BannerCapturedLength int    `json:"banner_captured_length,omitempty"`
+	BannerSHA256         string `json:"banner_sha256,omitempty"`
+	BannerTruncated      bool   `json:"banner_truncated,omitempty"`
+	HeaderCapturedLength int    `json:"header_captured_length,omitempty"`
+	HeaderSHA256         string `json:"header_sha256,omitempty"`
+	HeaderTruncated      bool   `json:"header_truncated,omitempty"`
+	BodyCapturedLength   int    `json:"body_captured_length,omitempty"`
+	BodySHA256           string `json:"body_sha256,omitempty"`
+	BodyTruncated        bool   `json:"body_truncated,omitempty"`
+}
+
 type ScanTaskRunVulnerability struct {
-	FindingKey string `json:"finding_key"`
-	TemplateID string `json:"template_id,omitempty"`
-	Name       string `json:"name,omitempty"`
-	Severity   string `json:"severity,omitempty"`
-	Target     string `json:"target"`
-	TargetIP   string `json:"target_ip,omitempty"`
-	TargetPort int    `json:"target_port,omitempty"`
-	MatchedAt  string `json:"matched_at,omitempty"`
-	Evidence   string `json:"evidence,omitempty"`
+	FindingKey  string `json:"finding_key"`
+	TemplateID  string `json:"template_id,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Severity    string `json:"severity,omitempty"`
+	Target      string `json:"target"`
+	TargetIP    string `json:"target_ip,omitempty"`
+	TargetPort  int    `json:"target_port,omitempty"`
+	MatchedAt   string `json:"matched_at,omitempty"`
+	Description string `json:"description,omitempty"`
+	Evidence    string `json:"-"`
+}
+
+// ScanTaskRunValidation records what vulnerability verification actually did.
+// A successful scan run alone never implies that validation executed.
+type ScanTaskRunValidation struct {
+	Status                 string `json:"status"`
+	CandidateEndpointCount int    `json:"candidate_endpoint_count"`
+	ExecutedEndpointCount  int    `json:"executed_endpoint_count"`
+	TemplateCount          int    `json:"template_count"`
+	FindingCount           int    `json:"finding_count"`
+	StartedAt              string `json:"started_at,omitempty"`
+	FinishedAt             string `json:"finished_at,omitempty"`
+	Error                  string `json:"error,omitempty"`
 }
 
 // ScanTaskRunTemplateCandidate preserves why one reviewed template was chosen.
 type ScanTaskRunTemplateCandidate struct {
-	TemplateID string `json:"template_id"`
-	Path       string `json:"path"`
-	Source     string `json:"source"`
-	Reason     string `json:"reason"`
+	TemplateID          string `json:"template_id"`
+	Path                string `json:"path"`
+	Source              string `json:"source"`
+	Reason              string `json:"reason"`
+	TemplateSHA256      string `json:"template_sha256,omitempty"`
+	TemplateSetRevision string `json:"template_set_revision,omitempty"`
+	MappingImportID     int64  `json:"template_mapping_import_id,omitempty"`
+	IP                  string `json:"ip,omitempty"`
+	Port                int    `json:"port,omitempty"`
+	Protocol            string `json:"protocol,omitempty"`
+}
+
+type FingerprintMatchEvidence struct {
+	MatcherID      int64  `json:"matcher_id"`
+	EvidenceType   string `json:"evidence_type"`
+	Target         string `json:"target,omitempty"`
+	Operator       string `json:"operator"`
+	ObservedSHA256 string `json:"observed_sha256"`
+	ObservedLength int    `json:"observed_length"`
+	Truncated      bool   `json:"truncated"`
+	Summary        string `json:"summary"`
+}
+
+// FingerprintRunMatch remains in memory until the run snapshot transaction
+// commits. SourceRuleID and SourceKey support reviewed source-specific mappings.
+type FingerprintRunMatch struct {
+	FingerprintImportID     int64                      `json:"fingerprint_import_id"`
+	FingerprintSourceRuleID int64                      `json:"fingerprint_source_rule_id"`
+	SourceKey               string                     `json:"source_key"`
+	SourceRuleID            string                     `json:"source_rule_id"`
+	IP                      string                     `json:"ip"`
+	Port                    int                        `json:"port"`
+	Protocol                string                     `json:"protocol"`
+	Product                 string                     `json:"product_key"`
+	SourceProduct           string                     `json:"source_product,omitempty"`
+	ProductRole             string                     `json:"product_role,omitempty"`
+	ExclusiveGroup          string                     `json:"exclusive_group,omitempty"`
+	Version                 string                     `json:"version,omitempty"`
+	CPE                     string                     `json:"cpe,omitempty"`
+	Tags                    []string                   `json:"tags,omitempty"`
+	Soft                    bool                       `json:"soft_match"`
+	EvidenceSummary         string                     `json:"evidence_summary"`
+	Evidence                []FingerprintMatchEvidence `json:"evidence"`
 }
 
 type ScanTaskRunSnapshot struct {
 	RunID              int64                          `json:"run_id"`
 	Hosts              []ScanTaskRunHost              `json:"hosts"`
 	Ports              []ScanTaskRunPort              `json:"ports"`
+	ProtocolEvidence   []ScanTaskRunProtocolEvidence  `json:"protocol_evidence"`
+	Validation         ScanTaskRunValidation          `json:"validation"`
 	Vulnerabilities    []ScanTaskRunVulnerability     `json:"vulnerabilities"`
 	TemplateCandidates []ScanTaskRunTemplateCandidate `json:"template_candidates"`
+	FingerprintMatches []FingerprintRunMatch          `json:"fingerprint_matches,omitempty"`
 }
 
 // LegacyTaskSummary exposes v1 task records as read-only history. They never
@@ -254,51 +575,17 @@ func (membership HostScopeMembership) Valid() bool {
 }
 
 type AssetPort struct {
-	Port       int    `json:"port"`
-	Service    string `json:"service"`
-	LastSeenAt string `json:"last_seen_at"`
-}
-
-// FingerprintEvidence is the persistence-safe form of one fingerprint match.
-// Summary describes the matched rule condition and never stores a raw body,
-// header value or TCP banner fragment.
-type FingerprintEvidence struct {
-	Target     string `json:"target"`
-	HeaderName string `json:"header_name,omitempty"`
-	Operator   string `json:"operator"`
-	Pattern    string `json:"pattern"`
-	Summary    string `json:"summary"`
-}
-
-// AssetFingerprint is a stateful product conclusion for one IP and port.
-// RuleID and SourceID make every conclusion traceable to an audited rule
-// snapshot, while Evidence records the non-sensitive reason for the match.
-type AssetFingerprint struct {
-	IP         string                `json:"ip"`
-	Port       int                   `json:"port"`
-	Protocol   string                `json:"protocol"`
-	RuleID     string                `json:"rule_id"`
-	SourceID   string                `json:"source_id"`
-	Vendor     string                `json:"vendor,omitempty"`
-	Product    string                `json:"product"`
-	Version    string                `json:"version,omitempty"`
-	CPE        string                `json:"cpe,omitempty"`
-	Confidence int                   `json:"confidence"`
-	Evidence   []FingerprintEvidence `json:"evidence"`
-	FirstSeen  string                `json:"first_seen,omitempty"`
-	LastSeen   string                `json:"last_seen,omitempty"`
-}
-
-func (fingerprint AssetFingerprint) Valid() bool {
-	protocol := strings.ToLower(strings.TrimSpace(fingerprint.Protocol))
-	return net.ParseIP(strings.TrimSpace(fingerprint.IP)) != nil &&
-		fingerprint.Port > 0 && fingerprint.Port <= 65535 &&
-		(protocol == "http" || protocol == "https" || protocol == "tcp" || protocol == "tls") &&
-		strings.TrimSpace(fingerprint.RuleID) != "" &&
-		strings.TrimSpace(fingerprint.SourceID) != "" &&
-		strings.TrimSpace(fingerprint.Product) != "" &&
-		fingerprint.Confidence >= 0 && fingerprint.Confidence <= 100 &&
-		len(fingerprint.Evidence) > 0
+	Port              int                           `json:"port"`
+	Service           string                        `json:"service"`
+	Protocol          string                        `json:"protocol,omitempty"`
+	StatusCode        int                           `json:"status_code,omitempty"`
+	Server            string                        `json:"server,omitempty"`
+	Title             string                        `json:"title,omitempty"`
+	ResponseLength    int                           `json:"response_length,omitempty"`
+	ResponseSHA256    string                        `json:"response_sha256,omitempty"`
+	ResponseTruncated bool                          `json:"response_truncated,omitempty"`
+	ProtocolEvidence  []ScanTaskRunProtocolEvidence `json:"protocol_evidence"`
+	LastSeenAt        string                        `json:"last_seen_at"`
 }
 
 type AssetDetail struct {

@@ -15,6 +15,7 @@ import (
 	"golandproject/yscan/internal/api"
 	"golandproject/yscan/internal/assist"
 	"golandproject/yscan/internal/domain"
+	"golandproject/yscan/internal/fingerprint"
 	"golandproject/yscan/internal/identify"
 	"golandproject/yscan/internal/model"
 	"golandproject/yscan/internal/pipeline"
@@ -601,7 +602,13 @@ func (executor logicalScanTaskRunExecutor) Execute(ctx context.Context, run mode
 }
 
 func executeLogicalScanTaskRun(ctx context.Context, db *sql.DB, baseTask model.Scanner, run model.ScanTaskRun) error {
-	scanCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	runTimeout := 30 * time.Minute
+	if run.ScanType == model.ScanTypeIP {
+		// The discovery budget is derived from scanner concurrency and the
+		// per-port hard deadline. Remaining time covers evidence and validation.
+		runTimeout = scan.FullPortScanWorstCaseBudget() + 20*time.Minute
+	}
+	scanCtx, cancel := context.WithTimeout(ctx, runTimeout)
 	defer cancel()
 
 	executor := schedule.NewExecutor(db, logicalScanTaskRunExecutor{db: db, baseTask: baseTask})
@@ -674,14 +681,20 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-
-	identify.SetFingerprintMatcher(func(banner string) string {
-		return storage.MatchFingerprint(db, banner)
-	})
+	args, cfg := parseCLIConfig(os.Args[1:])
+	if _, err := fingerprint.InitializeEmbeddedSourcesIfEmpty(context.Background(), db); err != nil {
+		log.Fatal(err)
+	}
+	if commandNeedsLegacyBannerMatcher(args) {
+		engine, err := fingerprint.LoadActiveLegacyBannerEngine(db)
+		if err != nil {
+			log.Fatal(err)
+		}
+		identify.SetFingerprintMatcher(func(banner string) string { return engine.MatchBanner(banner) })
+	}
 
 	task := model.Scanner{Network: "tcp"}
 
-	args, cfg := parseCLIConfig(os.Args[1:])
 	task.NucleiTemplates = cfg.Templates
 	task.DNSResolveMode = cfg.DNSResolveMode
 	task.DNSDenyCIDRs = cfg.DNSDenyCIDRs
@@ -691,6 +704,18 @@ func main() {
 	}
 
 	runInteractive(task, db)
+}
+
+func commandNeedsLegacyBannerMatcher(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(args[0])) {
+	case "scan", "subnet", "vuln", "domain", "api":
+		return true
+	default:
+		return false
+	}
 }
 
 func runByArgs(args []string, task model.Scanner, db *sql.DB) {
@@ -783,9 +808,18 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) {
 		printTaskStatus(db, taskID)
 
 	case "api":
-		addr := ":8080"
+		addr := "127.0.0.1:8080"
+		policy := api.AccessPolicy{}
 		if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
 			addr = strings.TrimSpace(args[1])
+		}
+		for index := 2; index < len(args); index++ {
+			if args[index] != "--allow-cidr" || index+1 >= len(args) {
+				fmt.Println("usage: yscan api [listen_addr] [--allow-cidr <cidr>]...")
+				return
+			}
+			policy.TrustedCIDRs = append(policy.TrustedCIDRs, strings.TrimSpace(args[index+1]))
+			index++
 		}
 		schedulerContext, stopScheduler := context.WithCancel(context.Background())
 		defer stopScheduler()
@@ -801,7 +835,7 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) {
 			}
 		}()
 		service := schedule.NewTaskService(db, nil)
-		if err := api.StartServerWithScanTasks(db, addr, func(taskType, target string) (int64, error) {
+		if err := api.StartServerWithScanTasksAndAccessPolicy(db, addr, func(taskType, target string) (int64, error) {
 			return runTaskAsync(db, task, taskType, target)
 		}, service, func(ctx context.Context, run model.ScanTaskRun) {
 			if err := executeLogicalScanTaskRun(ctx, db, task, run); err != nil {
@@ -810,12 +844,15 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) {
 				}
 				log.Printf("one-time ScanTask run %d failed: %v", run.ID, err)
 			}
-		}); err != nil {
+		}, policy); err != nil {
 			log.Printf("API server stopped: %v", err)
 		}
 
 	case "schedule":
 		runScheduleCommand(args[1:], task, db)
+
+	case "fingerprint":
+		runFingerprintCommand(args[1:], db)
 
 	case "findings":
 		if len(args) < 2 {
@@ -854,6 +891,20 @@ func runScheduleCommand(args []string, baseTask model.Scanner, db *sql.DB) {
 		return executeLogicalScanTaskRun(ctx, db, baseTask, run)
 	}, os.Stdout); err != nil {
 		log.Printf("schedule command failed: %v", err)
+	}
+}
+
+func runFingerprintCommand(args []string, db *sql.DB) {
+	// T258+ supplies embedded production manifests and adapters. Until then the
+	// command remains usable for listing the migrated legacy source, while
+	// import/upgrade correctly reject unknown non-embedded source revisions.
+	registry, err := fingerprint.NewEmbeddedRegistry(db)
+	if err != nil {
+		log.Printf("load embedded fingerprint registry: %v", err)
+		return
+	}
+	if err := fingerprint.RunCLI(context.Background(), registry, args, os.Stdout); err != nil {
+		log.Printf("fingerprint command failed: %v", err)
 	}
 }
 

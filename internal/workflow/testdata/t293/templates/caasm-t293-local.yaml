@@ -1,0 +1,17 @@
+id: caasm-t293-local
+
+info:
+  name: CAASM T293 local read-only verification
+  author: caasm-test
+  severity: info
+  tags: http,t293
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "X-Jenkins"

@@ -21,10 +21,23 @@ import (
 
 const sqliteFile = "asm.db"
 
-func InitDB() (*sql.DB, error) {
-	dbExists := fileExists(sqliteFile)
+const t320FrozenProductRolesMigration = "t320-frozen-product-roles-v2"
 
-	db, err := sql.Open("sqlite3", sqliteFile)
+func InitDB() (*sql.DB, error) {
+	return InitDBAt(sqliteFile)
+}
+
+// InitDBAt applies the production schema and migrations to an explicit SQLite
+// file. It is used by isolated upgrade verification and never changes the
+// default asm.db location used by InitDB.
+func InitDBAt(databasePath string) (*sql.DB, error) {
+	databasePath = strings.TrimSpace(databasePath)
+	if databasePath == "" {
+		return nil, errors.New("SQLite database path is required")
+	}
+	dbExists := fileExists(databasePath)
+
+	db, err := sql.Open("sqlite3", databasePath)
 	if err != nil {
 		return nil, fmt.Errorf("打开 SQLite 数据库失败: %v", err)
 	}
@@ -38,7 +51,7 @@ func InitDB() (*sql.DB, error) {
 	}
 
 	if !dbExists {
-		log.Printf("检测到不存在 %s，正在初始化数据库结构...", sqliteFile)
+		log.Printf("检测到不存在 %s，正在初始化数据库结构...", databasePath)
 	}
 
 	if err := initSQLiteSchema(db); err != nil {
@@ -74,7 +87,15 @@ func resetSequencesIfEmpty(db *sql.DB) error {
 }
 
 func ensureSQLiteMigrations(db *sql.DB) error {
+	hadConclusionEvidenceStatus, err := sqliteTableHasColumn(db, "asset_fingerprint_conclusions", "version_source_count")
+	if err != nil {
+		return err
+	}
 	statements := []string{
+		`CREATE TABLE IF NOT EXISTS schema_migrations (
+			name TEXT PRIMARY KEY,
+			applied_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		)`,
 		`CREATE TABLE IF NOT EXISTS host_inventory (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ip TEXT NOT NULL UNIQUE,
@@ -137,6 +158,7 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 			config_hash TEXT NOT NULL DEFAULT '',
 			error_message TEXT,
 			report_path TEXT,
+			audit_report_path TEXT,
 			started_at DATETIME,
 			finished_at DATETIME,
 			snapshot_written_at DATETIME,
@@ -160,6 +182,30 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 			banner TEXT,
 			PRIMARY KEY (scan_task_run_id, ip, port)
 		)`,
+		`CREATE TABLE IF NOT EXISTS scan_task_run_protocol_evidence (
+			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+			ip TEXT NOT NULL, port INTEGER NOT NULL, evidence_type TEXT NOT NULL,
+			probe_name TEXT NOT NULL DEFAULT '', protocol TEXT NOT NULL,
+			responded INTEGER NOT NULL DEFAULT 0 CHECK (responded IN (0, 1)), status_code INTEGER,
+			outcome TEXT NOT NULL DEFAULT '', diagnostic TEXT NOT NULL DEFAULT '',
+			server TEXT, title TEXT,
+			banner_captured_length INTEGER NOT NULL DEFAULT 0, banner_sha256 TEXT,
+			banner_truncated INTEGER NOT NULL DEFAULT 0 CHECK (banner_truncated IN (0, 1)),
+			header_captured_length INTEGER NOT NULL DEFAULT 0, header_sha256 TEXT,
+			header_truncated INTEGER NOT NULL DEFAULT 0 CHECK (header_truncated IN (0, 1)),
+			body_captured_length INTEGER NOT NULL DEFAULT 0, body_sha256 TEXT,
+			body_truncated INTEGER NOT NULL DEFAULT 0 CHECK (body_truncated IN (0, 1)),
+			PRIMARY KEY (scan_task_run_id, ip, port, evidence_type, protocol, probe_name)
+		)`,
+		`CREATE TABLE IF NOT EXISTS scan_task_run_validation (
+			scan_task_run_id INTEGER PRIMARY KEY REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+			status TEXT NOT NULL CHECK (status IN ('disabled', 'not_started', 'no_candidates', 'success', 'failed')),
+			candidate_endpoint_count INTEGER NOT NULL DEFAULT 0,
+			executed_endpoint_count INTEGER NOT NULL DEFAULT 0,
+			template_count INTEGER NOT NULL DEFAULT 0,
+			finding_count INTEGER NOT NULL DEFAULT 0,
+			started_at TEXT, finished_at TEXT, error_message TEXT
+		)`,
 		`CREATE TABLE IF NOT EXISTS scan_task_run_vulnerabilities (
 			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
 			finding_key TEXT NOT NULL,
@@ -170,28 +216,198 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 			target_ip TEXT,
 			target_port INTEGER,
 			matched_at TEXT,
+			description TEXT,
 			evidence TEXT,
 			PRIMARY KEY (scan_task_run_id, finding_key)
 		)`,
-		`CREATE TABLE IF NOT EXISTS asset_fingerprints (
-			ip TEXT NOT NULL,
-			port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
-			protocol TEXT NOT NULL CHECK (protocol IN ('http', 'https', 'tcp', 'tls')),
-			rule_id TEXT NOT NULL,
-			source_id TEXT NOT NULL,
-			vendor TEXT,
-			product TEXT NOT NULL,
-			version TEXT,
-			cpe TEXT,
-			confidence INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
-			evidence_json TEXT NOT NULL,
-			first_seen DATETIME NOT NULL DEFAULT (datetime('now')),
-			last_seen DATETIME NOT NULL DEFAULT (datetime('now')),
-			PRIMARY KEY (ip, port, protocol, rule_id, source_id)
-		)`,
 		`CREATE TABLE IF NOT EXISTS scan_task_run_template_candidates (
 			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id), template_id TEXT NOT NULL, path TEXT NOT NULL, source TEXT NOT NULL, reason TEXT NOT NULL,
+			template_sha256 TEXT, template_set_revision TEXT, template_mapping_import_id INTEGER,
 			PRIMARY KEY (scan_task_run_id, template_id, path)
+		)`,
+		`CREATE TABLE IF NOT EXISTS scan_task_run_template_candidate_endpoints (
+			scan_task_run_id INTEGER NOT NULL,
+			template_id TEXT NOT NULL,
+			path TEXT NOT NULL,
+			ip TEXT NOT NULL,
+			port INTEGER NOT NULL,
+			protocol TEXT NOT NULL,
+			PRIMARY KEY (scan_task_run_id, template_id, path, ip, port, protocol),
+			FOREIGN KEY (scan_task_run_id, template_id, path)
+				REFERENCES scan_task_run_template_candidates(scan_task_run_id, template_id, path) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS fingerprint_sources (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			source_key TEXT NOT NULL UNIQUE,
+			repository_url TEXT NOT NULL,
+			license TEXT,
+			status TEXT NOT NULL DEFAULT 'enabled',
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE IF NOT EXISTS fingerprint_source_bootstrap_diagnostics (
+			source_key TEXT PRIMARY KEY,
+			last_error TEXT NOT NULL DEFAULT '',
+			last_failed_at DATETIME,
+			resolved_at DATETIME,
+			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE IF NOT EXISTS fingerprint_imports (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			fingerprint_source_id INTEGER NOT NULL REFERENCES fingerprint_sources(id) ON DELETE CASCADE,
+			commit_hash TEXT NOT NULL,
+			content_sha256 TEXT NOT NULL,
+			upstream_content_sha256 TEXT NOT NULL DEFAULT '',
+			adapter_version TEXT NOT NULL DEFAULT 'legacy-v1',
+			projection_sha256 TEXT NOT NULL DEFAULT '',
+			manifest_json TEXT NOT NULL,
+			rule_total INTEGER NOT NULL DEFAULT 0,
+			executable_total INTEGER NOT NULL DEFAULT 0,
+			unsupported_total INTEGER NOT NULL DEFAULT 0,
+			import_error_total INTEGER NOT NULL DEFAULT 0,
+			error_summary TEXT,
+			is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(fingerprint_source_id, commit_hash, content_sha256)
+		)`,
+		`CREATE TABLE IF NOT EXISTS fingerprint_source_rules (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			fingerprint_import_id INTEGER NOT NULL REFERENCES fingerprint_imports(id) ON DELETE CASCADE,
+			source_rule_id TEXT,
+			source_path TEXT NOT NULL,
+			content_sha256 TEXT NOT NULL,
+			raw_content TEXT NOT NULL,
+			raw_structure TEXT,
+			import_status TEXT NOT NULL CHECK (import_status IN ('executable', 'unsupported', 'import_error')),
+			import_error TEXT,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(fingerprint_import_id, source_path, content_sha256)
+		)`,
+		`CREATE TABLE IF NOT EXISTS fingerprint_products (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			canonical_name TEXT NOT NULL UNIQUE,
+			vendor TEXT,
+			aliases_json TEXT,
+			cpe TEXT,
+			product_role TEXT NOT NULL DEFAULT 'application',
+			exclusive_group TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS fingerprint_rules (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			fingerprint_source_rule_id INTEGER NOT NULL UNIQUE REFERENCES fingerprint_source_rules(id) ON DELETE CASCADE,
+			fingerprint_product_id INTEGER NOT NULL REFERENCES fingerprint_products(id),
+			source_product_name TEXT NOT NULL DEFAULT '',
+			protocol TEXT NOT NULL,
+			soft_match INTEGER NOT NULL DEFAULT 0 CHECK (soft_match IN (0, 1)),
+			version_template TEXT,
+			cpe TEXT,
+			tags_json TEXT NOT NULL DEFAULT '[]',
+			product_role TEXT NOT NULL DEFAULT 'application',
+			exclusive_group TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL CHECK (status IN ('executable', 'unsupported', 'disabled'))
+		)`,
+		`CREATE TABLE IF NOT EXISTS fingerprint_match_groups (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			fingerprint_rule_id INTEGER NOT NULL REFERENCES fingerprint_rules(id) ON DELETE CASCADE,
+			parent_id INTEGER REFERENCES fingerprint_match_groups(id) ON DELETE CASCADE,
+			operator TEXT NOT NULL CHECK (operator IN ('all', 'any')),
+			position INTEGER NOT NULL,
+			UNIQUE(fingerprint_rule_id, parent_id, position)
+		)`,
+		`CREATE TABLE IF NOT EXISTS fingerprint_matchers (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			fingerprint_match_group_id INTEGER NOT NULL REFERENCES fingerprint_match_groups(id) ON DELETE CASCADE,
+			evidence_type TEXT NOT NULL,
+			target TEXT,
+			operator TEXT NOT NULL,
+			value TEXT NOT NULL,
+			version_capture TEXT,
+			position INTEGER NOT NULL,
+			UNIQUE(fingerprint_match_group_id, position)
+		)`,
+		`CREATE TABLE IF NOT EXISTS scan_task_run_fingerprint_imports (
+			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+			fingerprint_import_id INTEGER NOT NULL REFERENCES fingerprint_imports(id),
+			PRIMARY KEY (scan_task_run_id, fingerprint_import_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS asset_fingerprint_matches (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+			fingerprint_import_id INTEGER NOT NULL REFERENCES fingerprint_imports(id),
+			fingerprint_source_rule_id INTEGER NOT NULL REFERENCES fingerprint_source_rules(id),
+			ip TEXT NOT NULL,
+			port INTEGER NOT NULL,
+			protocol TEXT NOT NULL,
+			product_key TEXT NOT NULL DEFAULT '',
+			source_product_name TEXT NOT NULL DEFAULT '',
+			product_role TEXT NOT NULL DEFAULT 'application',
+			exclusive_group TEXT NOT NULL DEFAULT '',
+			version TEXT,
+			cpe TEXT,
+			tags_json TEXT NOT NULL DEFAULT '[]',
+			is_soft INTEGER NOT NULL DEFAULT 0 CHECK (is_soft IN (0, 1)),
+			evidence_summary TEXT NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(scan_task_run_id, ip, port, fingerprint_source_rule_id, evidence_summary)
+		)`,
+		`CREATE TABLE IF NOT EXISTS asset_fingerprint_match_evidence (
+			asset_fingerprint_match_id INTEGER NOT NULL REFERENCES asset_fingerprint_matches(id) ON DELETE CASCADE,
+			fingerprint_matcher_id INTEGER NOT NULL REFERENCES fingerprint_matchers(id),
+			evidence_type TEXT NOT NULL,
+			target TEXT,
+			operator TEXT NOT NULL,
+			observed_sha256 TEXT NOT NULL,
+			observed_length INTEGER NOT NULL,
+			truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
+			summary TEXT NOT NULL,
+			PRIMARY KEY (asset_fingerprint_match_id, fingerprint_matcher_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS asset_fingerprint_conclusions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+			ip TEXT NOT NULL,
+			port INTEGER NOT NULL,
+			protocol TEXT NOT NULL,
+			product_key TEXT NOT NULL,
+			product_role TEXT NOT NULL DEFAULT 'application',
+			exclusive_group TEXT NOT NULL DEFAULT '',
+			version TEXT,
+			cpe TEXT,
+			tags_json TEXT NOT NULL DEFAULT '[]',
+			conclusion_status TEXT NOT NULL CHECK (conclusion_status IN ('matched', 'corroborated', 'conflicted')),
+			product_status TEXT NOT NULL DEFAULT 'matched' CHECK (product_status IN ('matched', 'corroborated', 'conflicted')),
+			product_source_count INTEGER NOT NULL DEFAULT 1,
+			version_status TEXT NOT NULL DEFAULT 'unobserved' CHECK (version_status IN ('unobserved', 'matched', 'corroborated', 'conflicted')),
+			version_source_count INTEGER NOT NULL DEFAULT 0,
+			cpe_status TEXT NOT NULL DEFAULT 'unobserved' CHECK (cpe_status IN ('unobserved', 'matched', 'corroborated', 'conflicted')),
+			cpe_source_count INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(scan_task_run_id, ip, port, protocol, product_key)
+		)`,
+		`CREATE TABLE IF NOT EXISTS template_mapping_imports (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			revision TEXT NOT NULL,
+			content_sha256 TEXT NOT NULL UNIQUE,
+			manifest_json TEXT NOT NULL,
+			is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+			created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE IF NOT EXISTS fingerprint_template_mappings (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			template_mapping_import_id INTEGER NOT NULL REFERENCES template_mapping_imports(id) ON DELETE CASCADE,
+			product_key TEXT NOT NULL,
+			source_key TEXT,
+			source_rule_id TEXT,
+			template_id TEXT NOT NULL,
+			template_path TEXT NOT NULL,
+			template_sha256 TEXT NOT NULL,
+			template_set_revision TEXT NOT NULL,
+			side_effect TEXT NOT NULL,
+			review_status TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			disabled_at DATETIME,
+			UNIQUE(template_mapping_import_id, product_key, source_rule_id, template_id, template_path)
 		)`,
 		`ALTER TABLE banner ADD COLUMN match_type TEXT NOT NULL DEFAULT 'contains'`,
 		`ALTER TABLE banner ADD COLUMN protocol TEXT`,
@@ -201,14 +417,57 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 		`ALTER TABLE domain_ips ADD COLUMN first_seen DATETIME`,
 		`ALTER TABLE domain_ips ADD COLUMN last_seen DATETIME`,
 		`ALTER TABLE domain_ips ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE fingerprint_rules ADD COLUMN soft_match INTEGER NOT NULL DEFAULT 0 CHECK (soft_match IN (0, 1))`,
+		`ALTER TABLE fingerprint_rules ADD COLUMN version_template TEXT`,
+		`ALTER TABLE fingerprint_rules ADD COLUMN cpe TEXT`,
+		`ALTER TABLE fingerprint_rules ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE fingerprint_rules ADD COLUMN source_product_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE fingerprint_rules ADD COLUMN product_role TEXT NOT NULL DEFAULT 'application'`,
+		`ALTER TABLE fingerprint_rules ADD COLUMN exclusive_group TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE fingerprint_products ADD COLUMN product_role TEXT NOT NULL DEFAULT 'application'`,
+		`ALTER TABLE fingerprint_products ADD COLUMN exclusive_group TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE fingerprint_imports ADD COLUMN upstream_content_sha256 TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE fingerprint_imports ADD COLUMN adapter_version TEXT NOT NULL DEFAULT 'legacy-v1'`,
+		`ALTER TABLE fingerprint_imports ADD COLUMN projection_sha256 TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE asset_fingerprint_matches ADD COLUMN product_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE asset_fingerprint_matches ADD COLUMN source_product_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE asset_fingerprint_matches ADD COLUMN product_role TEXT NOT NULL DEFAULT 'application'`,
+		`ALTER TABLE asset_fingerprint_matches ADD COLUMN exclusive_group TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE asset_fingerprint_matches ADD COLUMN version TEXT`,
+		`ALTER TABLE asset_fingerprint_matches ADD COLUMN cpe TEXT`,
+		`ALTER TABLE asset_fingerprint_matches ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE asset_fingerprint_matches ADD COLUMN is_soft INTEGER NOT NULL DEFAULT 0 CHECK (is_soft IN (0, 1))`,
+		`ALTER TABLE asset_fingerprint_conclusions ADD COLUMN version TEXT`,
+		`ALTER TABLE asset_fingerprint_conclusions ADD COLUMN cpe TEXT`,
+		`ALTER TABLE asset_fingerprint_conclusions ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE asset_fingerprint_conclusions ADD COLUMN product_role TEXT NOT NULL DEFAULT 'application'`,
+		`ALTER TABLE asset_fingerprint_conclusions ADD COLUMN exclusive_group TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE asset_fingerprint_conclusions ADD COLUMN product_status TEXT NOT NULL DEFAULT 'matched' CHECK (product_status IN ('matched', 'corroborated', 'conflicted'))`,
+		`ALTER TABLE asset_fingerprint_conclusions ADD COLUMN product_source_count INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE asset_fingerprint_conclusions ADD COLUMN version_status TEXT NOT NULL DEFAULT 'unobserved' CHECK (version_status IN ('unobserved', 'matched', 'corroborated', 'conflicted'))`,
+		`ALTER TABLE asset_fingerprint_conclusions ADD COLUMN version_source_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE asset_fingerprint_conclusions ADD COLUMN cpe_status TEXT NOT NULL DEFAULT 'unobserved' CHECK (cpe_status IN ('unobserved', 'matched', 'corroborated', 'conflicted'))`,
+		`ALTER TABLE asset_fingerprint_conclusions ADD COLUMN cpe_source_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tasks ADD COLUMN report_error TEXT`,
 		`ALTER TABLE scan_task_runs ADD COLUMN report_error TEXT`,
+		`ALTER TABLE scan_task_runs ADD COLUMN audit_report_path TEXT`,
 		`ALTER TABLE scan_task_runs ADD COLUMN snapshot_written_at DATETIME`,
+		`ALTER TABLE scan_task_run_vulnerabilities ADD COLUMN description TEXT`,
+		`ALTER TABLE scan_task_run_protocol_evidence ADD COLUMN outcome TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE scan_task_run_protocol_evidence ADD COLUMN diagnostic TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE scan_task_run_template_candidates ADD COLUMN template_sha256 TEXT`,
+		`ALTER TABLE scan_task_run_template_candidates ADD COLUMN template_set_revision TEXT`,
+		`ALTER TABLE scan_task_run_template_candidates ADD COLUMN template_mapping_import_id INTEGER`,
+		`ALTER TABLE fingerprint_template_mappings ADD COLUMN source_key TEXT`,
 		`UPDATE domain_info SET last_seen = COALESCE(last_seen, first_seen, datetime('now'))`,
 		`UPDATE domain_info SET is_active = COALESCE(is_active, 1)`,
 		`UPDATE domain_ips SET first_seen = COALESCE(first_seen, datetime('now'))`,
 		`UPDATE domain_ips SET last_seen = COALESCE(last_seen, datetime('now'))`,
 		`UPDATE domain_ips SET is_active = COALESCE(is_active, 1)`,
+		`UPDATE fingerprint_imports SET upstream_content_sha256 = content_sha256 WHERE upstream_content_sha256 = ''`,
+		`UPDATE fingerprint_imports SET projection_sha256 = content_sha256 WHERE projection_sha256 = ''`,
+		`UPDATE scan_task_runs SET audit_report_path = CASE WHEN report_path LIKE '%.md' THEN SUBSTR(report_path, 1, LENGTH(report_path) - 3) || '-audit.md' ELSE report_path || '-audit.md' END WHERE COALESCE(report_path, '') <> '' AND COALESCE(audit_report_path, '') = ''`,
+		`UPDATE scan_task_run_protocol_evidence SET outcome = CASE WHEN responded = 1 THEN 'responded' ELSE 'no_response' END WHERE COALESCE(outcome, '') = ''`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_banner_service_pattern ON banner(service_name, banner_pattern)`,
 		`CREATE INDEX IF NOT EXISTS idx_domain_info_subdomain_active ON domain_info(subdomain, is_active)`,
 		`CREATE INDEX IF NOT EXISTS idx_domain_ips_ip_active ON domain_ips(ip, is_active)`,
@@ -224,9 +483,21 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_scan_task_runs_status_scheduled_for ON scan_task_runs(status, scheduled_for)`,
 		`CREATE INDEX IF NOT EXISTS idx_scan_task_run_hosts_run ON scan_task_run_hosts(scan_task_run_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_scan_task_run_ports_run ON scan_task_run_ports(scan_task_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_scan_task_run_protocol_evidence_run ON scan_task_run_protocol_evidence(scan_task_run_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_scan_task_run_vulnerabilities_run ON scan_task_run_vulnerabilities(scan_task_run_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_asset_fingerprints_ip_port ON asset_fingerprints(ip, port)`,
-		`CREATE INDEX IF NOT EXISTS idx_asset_fingerprints_product ON asset_fingerprints(product)`,
+		`CREATE INDEX IF NOT EXISTS idx_template_candidate_endpoints_run ON scan_task_run_template_candidate_endpoints(scan_task_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_fingerprint_imports_source_active ON fingerprint_imports(fingerprint_source_id, is_active)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_fingerprint_imports_one_active_per_source ON fingerprint_imports(fingerprint_source_id) WHERE is_active = 1`,
+		`CREATE INDEX IF NOT EXISTS idx_fingerprint_source_rules_import ON fingerprint_source_rules(fingerprint_import_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_fingerprint_rules_product ON fingerprint_rules(fingerprint_product_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_fingerprint_match_groups_rule ON fingerprint_match_groups(fingerprint_rule_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_fingerprint_matchers_group ON fingerprint_matchers(fingerprint_match_group_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_run_fingerprint_imports_import ON scan_task_run_fingerprint_imports(fingerprint_import_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_asset_fingerprint_matches_run ON asset_fingerprint_matches(scan_task_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_asset_fingerprint_match_evidence_match ON asset_fingerprint_match_evidence(asset_fingerprint_match_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_asset_fingerprint_conclusions_run ON asset_fingerprint_conclusions(scan_task_run_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_template_mapping_imports_one_active ON template_mapping_imports(is_active) WHERE is_active = 1`,
+		`CREATE INDEX IF NOT EXISTS idx_fingerprint_template_mappings_product ON fingerprint_template_mappings(product_key, enabled)`,
 	}
 
 	for _, stmt := range statements {
@@ -234,7 +505,290 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 			return err
 		}
 	}
-	return backfillLegacyHostInventoryScopes(db)
+	if err := migrateProtocolEvidenceSchema(db); err != nil {
+		return err
+	}
+	if err := migrateRunValidationSchema(db); err != nil {
+		return err
+	}
+	if !hadConclusionEvidenceStatus {
+		if err := backfillFingerprintConclusionEvidenceStatus(db); err != nil {
+			return err
+		}
+	}
+	if err := migrateFingerprintRuleProjectionRoles(db); err != nil {
+		return err
+	}
+	if err := backfillLegacyHostInventoryScopes(db); err != nil {
+		return err
+	}
+	return nil
+}
+
+func backfillFingerprintConclusionEvidenceStatus(db *sql.DB) error {
+	if _, err := db.Exec(`UPDATE asset_fingerprint_conclusions AS conclusion SET
+		product_source_count = MAX(1, (SELECT COUNT(DISTINCT fingerprint_import_id) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.product_key = conclusion.product_key AND match.is_soft = 0)),
+		version_source_count = (SELECT COUNT(DISTINCT fingerprint_import_id) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.product_key = conclusion.product_key AND match.is_soft = 0 AND COALESCE(match.version, '') <> ''),
+		cpe_source_count = (SELECT COUNT(DISTINCT fingerprint_import_id) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.product_key = conclusion.product_key AND match.is_soft = 0 AND COALESCE(match.cpe, '') <> ''),
+		version = CASE WHEN (SELECT COUNT(DISTINCT version) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.product_key = conclusion.product_key AND match.is_soft = 0 AND COALESCE(match.version, '') <> '') = 1 THEN (SELECT MIN(version) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.product_key = conclusion.product_key AND match.is_soft = 0 AND COALESCE(match.version, '') <> '') ELSE NULL END,
+		cpe = CASE WHEN (SELECT COUNT(DISTINCT cpe) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.product_key = conclusion.product_key AND match.is_soft = 0 AND COALESCE(match.cpe, '') <> '') = 1 THEN (SELECT MIN(cpe) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.product_key = conclusion.product_key AND match.is_soft = 0 AND COALESCE(match.cpe, '') <> '') ELSE NULL END`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`UPDATE asset_fingerprint_conclusions AS conclusion SET
+		product_status = CASE WHEN (SELECT COUNT(DISTINCT product_key) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.is_soft = 0) > 1 THEN 'conflicted' WHEN product_source_count > 1 THEN 'corroborated' ELSE 'matched' END,
+		version_status = CASE WHEN (SELECT COUNT(DISTINCT version) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.product_key = conclusion.product_key AND match.is_soft = 0 AND COALESCE(match.version, '') <> '') > 1 THEN 'conflicted' WHEN version_source_count > 1 THEN 'corroborated' WHEN version_source_count = 1 THEN 'matched' ELSE 'unobserved' END,
+		cpe_status = CASE WHEN (SELECT COUNT(DISTINCT cpe) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.product_key = conclusion.product_key AND match.is_soft = 0 AND COALESCE(match.cpe, '') <> '') > 1 THEN 'conflicted' WHEN cpe_source_count > 1 THEN 'corroborated' WHEN cpe_source_count = 1 THEN 'matched' ELSE 'unobserved' END`); err != nil {
+		return err
+	}
+	_, err := db.Exec(`UPDATE asset_fingerprint_conclusions SET conclusion_status = product_status`)
+	return err
+}
+
+func migrateFingerprintRuleProjectionRoles(db *sql.DB) error {
+	var applied int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE name = ?`, t320FrozenProductRolesMigration).Scan(&applied); err != nil {
+		return err
+	}
+	if applied > 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT rule.id, product.id, product.canonical_name, rule.tags_json,
+		COALESCE(rule.product_role, 'application'), COALESCE(rule.exclusive_group, '')
+		FROM fingerprint_rules AS rule
+		JOIN fingerprint_products AS product ON product.id = rule.fingerprint_product_id`)
+	if err != nil {
+		return err
+	}
+	type roleUpdate struct {
+		ruleID, productID int64
+		role, group       string
+	}
+	updates := make([]roleUpdate, 0)
+	for rows.Next() {
+		var update roleUpdate
+		var name, tagsJSON, currentRole, currentGroup string
+		if err := rows.Scan(&update.ruleID, &update.productID, &name, &tagsJSON, &currentRole, &currentGroup); err != nil {
+			rows.Close()
+			return err
+		}
+		var tags []string
+		_ = json.Unmarshal([]byte(tagsJSON), &tags)
+		classifiedRole, classifiedGroup := model.FingerprintProductClassification(name, tags)
+		update.role, update.group = strings.TrimSpace(currentRole), strings.TrimSpace(currentGroup)
+		if update.role == "" || (update.role == "application" && update.group == "") {
+			update.role, update.group = classifiedRole, classifiedGroup
+		}
+		updates = append(updates, update)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, update := range updates {
+		if _, err := tx.Exec(`UPDATE fingerprint_rules SET product_role = ?, exclusive_group = ? WHERE id = ?`, update.role, update.group, update.ruleID); err != nil {
+			return err
+		}
+		if update.role != "application" || update.group != "" {
+			if _, err := tx.Exec(`UPDATE fingerprint_products SET product_role = ?, exclusive_group = ?
+				WHERE id = ? AND product_role = 'application' AND exclusive_group = ''`, update.role, update.group, update.productID); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(`UPDATE asset_fingerprint_matches AS match SET
+		product_role = COALESCE((SELECT rule.product_role FROM fingerprint_rules AS rule WHERE rule.fingerprint_source_rule_id = match.fingerprint_source_rule_id), match.product_role),
+		exclusive_group = COALESCE((SELECT rule.exclusive_group FROM fingerprint_rules AS rule WHERE rule.fingerprint_source_rule_id = match.fingerprint_source_rule_id), match.exclusive_group)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE asset_fingerprint_conclusions AS conclusion SET
+		product_role = COALESCE((SELECT MIN(match.product_role) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.product_key = conclusion.product_key AND match.is_soft = 0), conclusion.product_role),
+		exclusive_group = COALESCE((SELECT MIN(match.exclusive_group) FROM asset_fingerprint_matches AS match WHERE match.scan_task_run_id = conclusion.scan_task_run_id AND match.ip = conclusion.ip AND match.port = conclusion.port AND match.protocol = conclusion.protocol AND match.product_key = conclusion.product_key AND match.is_soft = 0), conclusion.exclusive_group)`); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE asset_fingerprint_conclusions AS conclusion SET
+		product_status = CASE
+			WHEN conclusion.exclusive_group <> '' AND EXISTS (
+				SELECT 1 FROM asset_fingerprint_matches AS other
+				WHERE other.scan_task_run_id = conclusion.scan_task_run_id AND other.ip = conclusion.ip
+					AND other.port = conclusion.port AND other.protocol = conclusion.protocol AND other.is_soft = 0
+					AND other.exclusive_group = conclusion.exclusive_group AND other.product_key <> conclusion.product_key
+			) THEN 'conflicted'
+			WHEN conclusion.product_source_count > 1 THEN 'corroborated'
+			ELSE 'matched' END`)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE asset_fingerprint_conclusions SET conclusion_status = product_status`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO schema_migrations (name) VALUES (?)`, t320FrozenProductRolesMigration); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func sqliteTableHasColumn(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func migrateProtocolEvidenceSchema(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(scan_task_run_protocol_evidence)`)
+	if err != nil {
+		return err
+	}
+	columns := make(map[string]bool)
+	primaryKey := make(map[int]string)
+	for rows.Next() {
+		var cid, notNull, primaryKeyPosition int
+		var name, columnType string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKeyPosition); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+		if primaryKeyPosition > 0 {
+			primaryKey[primaryKeyPosition] = name
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	wantedPrimaryKey := []string{"scan_task_run_id", "ip", "port", "evidence_type", "protocol", "probe_name"}
+	current := columns["evidence_type"] && columns["probe_name"] && columns["outcome"] && columns["diagnostic"] && len(primaryKey) == len(wantedPrimaryKey)
+	for index, name := range wantedPrimaryKey {
+		current = current && primaryKey[index+1] == name
+	}
+	if current {
+		return nil
+	}
+
+	evidenceTypeExpression := `CASE WHEN protocol IN ('http', 'https') THEN 'web' ELSE 'passive_banner' END`
+	if columns["evidence_type"] {
+		evidenceTypeExpression = `COALESCE(NULLIF(evidence_type, ''), ` + evidenceTypeExpression + `)`
+	}
+	probeNameExpression := `''`
+	if columns["probe_name"] {
+		probeNameExpression = `COALESCE(probe_name, '')`
+	}
+	outcomeExpression := `CASE WHEN responded = 1 THEN 'responded' ELSE 'no_response' END`
+	if columns["outcome"] {
+		outcomeExpression = `COALESCE(NULLIF(outcome, ''), ` + outcomeExpression + `)`
+	}
+	diagnosticExpression := `''`
+	if columns["diagnostic"] {
+		diagnosticExpression = `COALESCE(diagnostic, '')`
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_scan_task_run_protocol_evidence_run`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE scan_task_run_protocol_evidence RENAME TO scan_task_run_protocol_evidence_t319_legacy`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE scan_task_run_protocol_evidence (
+		scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+		ip TEXT NOT NULL, port INTEGER NOT NULL, evidence_type TEXT NOT NULL,
+		probe_name TEXT NOT NULL DEFAULT '', protocol TEXT NOT NULL,
+		responded INTEGER NOT NULL DEFAULT 0 CHECK (responded IN (0, 1)), status_code INTEGER,
+		outcome TEXT NOT NULL DEFAULT '', diagnostic TEXT NOT NULL DEFAULT '',
+		server TEXT, title TEXT,
+		banner_captured_length INTEGER NOT NULL DEFAULT 0, banner_sha256 TEXT,
+		banner_truncated INTEGER NOT NULL DEFAULT 0 CHECK (banner_truncated IN (0, 1)),
+		header_captured_length INTEGER NOT NULL DEFAULT 0, header_sha256 TEXT,
+		header_truncated INTEGER NOT NULL DEFAULT 0 CHECK (header_truncated IN (0, 1)),
+		body_captured_length INTEGER NOT NULL DEFAULT 0, body_sha256 TEXT,
+		body_truncated INTEGER NOT NULL DEFAULT 0 CHECK (body_truncated IN (0, 1)),
+		PRIMARY KEY (scan_task_run_id, ip, port, evidence_type, protocol, probe_name)
+	)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO scan_task_run_protocol_evidence
+			(scan_task_run_id, ip, port, evidence_type, probe_name, protocol, responded, outcome, diagnostic, status_code, server, title,
+		 banner_captured_length, banner_sha256, banner_truncated, header_captured_length, header_sha256,
+		 header_truncated, body_captured_length, body_sha256, body_truncated)
+		SELECT scan_task_run_id, ip, port, ` + evidenceTypeExpression + `, ` + probeNameExpression + `, protocol, responded, ` + outcomeExpression + `, ` + diagnosticExpression + `, status_code, server, title,
+		       banner_captured_length, banner_sha256, banner_truncated, header_captured_length, header_sha256,
+		       header_truncated, body_captured_length, body_sha256, body_truncated
+		FROM scan_task_run_protocol_evidence_t319_legacy`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE scan_task_run_protocol_evidence_t319_legacy`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE INDEX idx_scan_task_run_protocol_evidence_run ON scan_task_run_protocol_evidence(scan_task_run_id)`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func migrateRunValidationSchema(db *sql.DB) error {
+	var definition string
+	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'scan_task_run_validation'`).Scan(&definition)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil || strings.Contains(definition, "'not_started'") {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`ALTER TABLE scan_task_run_validation RENAME TO scan_task_run_validation_t321_legacy`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE scan_task_run_validation (
+		scan_task_run_id INTEGER PRIMARY KEY REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+		status TEXT NOT NULL CHECK (status IN ('disabled', 'not_started', 'no_candidates', 'success', 'failed')),
+		candidate_endpoint_count INTEGER NOT NULL DEFAULT 0,
+		executed_endpoint_count INTEGER NOT NULL DEFAULT 0,
+		template_count INTEGER NOT NULL DEFAULT 0,
+		finding_count INTEGER NOT NULL DEFAULT 0,
+		started_at TEXT, finished_at TEXT, error_message TEXT
+	)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO scan_task_run_validation
+		(scan_task_run_id, status, candidate_endpoint_count, executed_endpoint_count, template_count, finding_count, started_at, finished_at, error_message)
+		SELECT scan_task_run_id, status, candidate_endpoint_count, executed_endpoint_count, template_count, finding_count, started_at, finished_at, error_message
+		FROM scan_task_run_validation_t321_legacy`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE scan_task_run_validation_t321_legacy`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // backfillLegacyHostInventoryScopes preserves the scope meaning of historical
@@ -293,6 +847,17 @@ CREATE TABLE IF NOT EXISTS scan_results (
     service_id   INTEGER,
     service_type TEXT    NOT NULL,
     scan_time    DATETIME NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ip, port)
+);
+
+-- v1 compatibility history. V2 current inventory deliberately uses the
+-- separate table below so stale legacy rows cannot affect asset views.
+CREATE TABLE IF NOT EXISTS current_port_inventory (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip           TEXT    NOT NULL,
+    port         INTEGER NOT NULL,
+    service_type TEXT    NOT NULL,
+    last_seen    DATETIME NOT NULL DEFAULT (datetime('now')),
     UNIQUE(ip, port)
 );
 
@@ -388,7 +953,8 @@ CREATE TABLE IF NOT EXISTS scan_task_runs (
     config_json   TEXT NOT NULL DEFAULT '{}',
 	config_hash   TEXT NOT NULL DEFAULT '',
 	error_message TEXT,
-	report_path   TEXT,
+    report_path   TEXT,
+    audit_report_path TEXT,
 	report_error  TEXT,
 	started_at    DATETIME,
     finished_at   DATETIME,
@@ -416,6 +982,34 @@ CREATE TABLE IF NOT EXISTS scan_task_run_ports (
     PRIMARY KEY (scan_task_run_id, ip, port)
 );
 
+CREATE TABLE IF NOT EXISTS scan_task_run_protocol_evidence (
+    scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+    ip TEXT NOT NULL, port INTEGER NOT NULL, evidence_type TEXT NOT NULL,
+	probe_name TEXT NOT NULL DEFAULT '', protocol TEXT NOT NULL,
+	responded INTEGER NOT NULL DEFAULT 0 CHECK (responded IN (0, 1)), status_code INTEGER,
+	outcome TEXT NOT NULL DEFAULT '', diagnostic TEXT NOT NULL DEFAULT '',
+    server TEXT, title TEXT,
+    banner_captured_length INTEGER NOT NULL DEFAULT 0, banner_sha256 TEXT,
+    banner_truncated INTEGER NOT NULL DEFAULT 0 CHECK (banner_truncated IN (0, 1)),
+    header_captured_length INTEGER NOT NULL DEFAULT 0, header_sha256 TEXT,
+    header_truncated INTEGER NOT NULL DEFAULT 0 CHECK (header_truncated IN (0, 1)),
+    body_captured_length INTEGER NOT NULL DEFAULT 0, body_sha256 TEXT,
+    body_truncated INTEGER NOT NULL DEFAULT 0 CHECK (body_truncated IN (0, 1)),
+    PRIMARY KEY (scan_task_run_id, ip, port, evidence_type, protocol, probe_name)
+);
+
+CREATE TABLE IF NOT EXISTS scan_task_run_validation (
+    scan_task_run_id INTEGER PRIMARY KEY REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+	status TEXT NOT NULL CHECK (status IN ('disabled', 'not_started', 'no_candidates', 'success', 'failed')),
+    candidate_endpoint_count INTEGER NOT NULL DEFAULT 0,
+    executed_endpoint_count INTEGER NOT NULL DEFAULT 0,
+    template_count INTEGER NOT NULL DEFAULT 0,
+    finding_count INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT,
+    finished_at TEXT,
+    error_message TEXT
+);
+
 CREATE TABLE IF NOT EXISTS scan_task_run_vulnerabilities (
     scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
     finding_key      TEXT NOT NULL,
@@ -426,6 +1020,7 @@ CREATE TABLE IF NOT EXISTS scan_task_run_vulnerabilities (
     target_ip        TEXT,
     target_port      INTEGER,
     matched_at       TEXT,
+    description      TEXT,
     evidence         TEXT,
     PRIMARY KEY (scan_task_run_id, finding_key)
 );
@@ -433,24 +1028,207 @@ CREATE TABLE IF NOT EXISTS scan_task_run_vulnerabilities (
 CREATE TABLE IF NOT EXISTS scan_task_run_template_candidates (
     scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
     template_id TEXT NOT NULL, path TEXT NOT NULL, source TEXT NOT NULL, reason TEXT NOT NULL,
+    template_sha256 TEXT, template_set_revision TEXT, template_mapping_import_id INTEGER,
     PRIMARY KEY (scan_task_run_id, template_id, path)
 );
 
-CREATE TABLE IF NOT EXISTS asset_fingerprints (
-    ip            TEXT NOT NULL,
-    port          INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
-    protocol      TEXT NOT NULL CHECK (protocol IN ('http', 'https', 'tcp', 'tls')),
-    rule_id       TEXT NOT NULL,
-    source_id     TEXT NOT NULL,
-    vendor        TEXT,
-    product       TEXT NOT NULL,
-    version       TEXT,
-    cpe           TEXT,
-    confidence    INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
-    evidence_json TEXT NOT NULL,
-    first_seen    DATETIME NOT NULL DEFAULT (datetime('now')),
-    last_seen     DATETIME NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (ip, port, protocol, rule_id, source_id)
+CREATE TABLE IF NOT EXISTS scan_task_run_template_candidate_endpoints (
+    scan_task_run_id INTEGER NOT NULL,
+    template_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    protocol TEXT NOT NULL,
+    PRIMARY KEY (scan_task_run_id, template_id, path, ip, port, protocol),
+    FOREIGN KEY (scan_task_run_id, template_id, path)
+        REFERENCES scan_task_run_template_candidates(scan_task_run_id, template_id, path) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS fingerprint_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_key TEXT NOT NULL UNIQUE,
+    repository_url TEXT NOT NULL,
+    license TEXT,
+    status TEXT NOT NULL DEFAULT 'enabled',
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS fingerprint_source_bootstrap_diagnostics (
+    source_key TEXT PRIMARY KEY,
+    last_error TEXT NOT NULL DEFAULT '',
+    last_failed_at DATETIME,
+    resolved_at DATETIME,
+    updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS fingerprint_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint_source_id INTEGER NOT NULL REFERENCES fingerprint_sources(id) ON DELETE CASCADE,
+    commit_hash TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    upstream_content_sha256 TEXT NOT NULL DEFAULT '',
+    adapter_version TEXT NOT NULL DEFAULT 'legacy-v1',
+    projection_sha256 TEXT NOT NULL DEFAULT '',
+    manifest_json TEXT NOT NULL,
+    rule_total INTEGER NOT NULL DEFAULT 0,
+    executable_total INTEGER NOT NULL DEFAULT 0,
+    unsupported_total INTEGER NOT NULL DEFAULT 0,
+    import_error_total INTEGER NOT NULL DEFAULT 0,
+    error_summary TEXT,
+    is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(fingerprint_source_id, commit_hash, content_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS fingerprint_source_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint_import_id INTEGER NOT NULL REFERENCES fingerprint_imports(id) ON DELETE CASCADE,
+    source_rule_id TEXT,
+    source_path TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    raw_content TEXT NOT NULL,
+    raw_structure TEXT,
+    import_status TEXT NOT NULL CHECK (import_status IN ('executable', 'unsupported', 'import_error')),
+    import_error TEXT,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(fingerprint_import_id, source_path, content_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS fingerprint_products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_name TEXT NOT NULL UNIQUE,
+    vendor TEXT,
+    aliases_json TEXT,
+    cpe TEXT,
+    product_role TEXT NOT NULL DEFAULT 'application',
+    exclusive_group TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS fingerprint_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint_source_rule_id INTEGER NOT NULL UNIQUE REFERENCES fingerprint_source_rules(id) ON DELETE CASCADE,
+    fingerprint_product_id INTEGER NOT NULL REFERENCES fingerprint_products(id),
+    source_product_name TEXT NOT NULL DEFAULT '',
+    protocol TEXT NOT NULL,
+    soft_match INTEGER NOT NULL DEFAULT 0 CHECK (soft_match IN (0, 1)),
+    version_template TEXT,
+    cpe TEXT,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    product_role TEXT NOT NULL DEFAULT 'application',
+    exclusive_group TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK (status IN ('executable', 'unsupported', 'disabled'))
+);
+
+CREATE TABLE IF NOT EXISTS fingerprint_match_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint_rule_id INTEGER NOT NULL REFERENCES fingerprint_rules(id) ON DELETE CASCADE,
+    parent_id INTEGER REFERENCES fingerprint_match_groups(id) ON DELETE CASCADE,
+    operator TEXT NOT NULL CHECK (operator IN ('all', 'any')),
+    position INTEGER NOT NULL,
+    UNIQUE(fingerprint_rule_id, parent_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS fingerprint_matchers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint_match_group_id INTEGER NOT NULL REFERENCES fingerprint_match_groups(id) ON DELETE CASCADE,
+    evidence_type TEXT NOT NULL,
+    target TEXT,
+    operator TEXT NOT NULL,
+    value TEXT NOT NULL,
+    version_capture TEXT,
+    position INTEGER NOT NULL,
+    UNIQUE(fingerprint_match_group_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS scan_task_run_fingerprint_imports (
+    scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+    fingerprint_import_id INTEGER NOT NULL REFERENCES fingerprint_imports(id),
+    PRIMARY KEY (scan_task_run_id, fingerprint_import_id)
+);
+
+CREATE TABLE IF NOT EXISTS asset_fingerprint_matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+    fingerprint_import_id INTEGER NOT NULL REFERENCES fingerprint_imports(id),
+    fingerprint_source_rule_id INTEGER NOT NULL REFERENCES fingerprint_source_rules(id),
+    ip TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    protocol TEXT NOT NULL,
+    product_key TEXT NOT NULL DEFAULT '',
+    source_product_name TEXT NOT NULL DEFAULT '',
+    product_role TEXT NOT NULL DEFAULT 'application',
+    exclusive_group TEXT NOT NULL DEFAULT '',
+    version TEXT,
+    cpe TEXT,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    is_soft INTEGER NOT NULL DEFAULT 0 CHECK (is_soft IN (0, 1)),
+    evidence_summary TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(scan_task_run_id, ip, port, fingerprint_source_rule_id, evidence_summary)
+);
+
+CREATE TABLE IF NOT EXISTS asset_fingerprint_match_evidence (
+    asset_fingerprint_match_id INTEGER NOT NULL REFERENCES asset_fingerprint_matches(id) ON DELETE CASCADE,
+    fingerprint_matcher_id INTEGER NOT NULL REFERENCES fingerprint_matchers(id),
+    evidence_type TEXT NOT NULL,
+    target TEXT,
+    operator TEXT NOT NULL,
+    observed_sha256 TEXT NOT NULL,
+    observed_length INTEGER NOT NULL,
+    truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
+    summary TEXT NOT NULL,
+    PRIMARY KEY (asset_fingerprint_match_id, fingerprint_matcher_id)
+);
+
+CREATE TABLE IF NOT EXISTS asset_fingerprint_conclusions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+    ip TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    protocol TEXT NOT NULL,
+    product_key TEXT NOT NULL,
+    product_role TEXT NOT NULL DEFAULT 'application',
+    exclusive_group TEXT NOT NULL DEFAULT '',
+    version TEXT,
+    cpe TEXT,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    conclusion_status TEXT NOT NULL CHECK (conclusion_status IN ('matched', 'corroborated', 'conflicted')),
+    product_status TEXT NOT NULL DEFAULT 'matched' CHECK (product_status IN ('matched', 'corroborated', 'conflicted')),
+    product_source_count INTEGER NOT NULL DEFAULT 1,
+    version_status TEXT NOT NULL DEFAULT 'unobserved' CHECK (version_status IN ('unobserved', 'matched', 'corroborated', 'conflicted')),
+    version_source_count INTEGER NOT NULL DEFAULT 0,
+    cpe_status TEXT NOT NULL DEFAULT 'unobserved' CHECK (cpe_status IN ('unobserved', 'matched', 'corroborated', 'conflicted')),
+    cpe_source_count INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(scan_task_run_id, ip, port, protocol, product_key)
+);
+
+CREATE TABLE IF NOT EXISTS template_mapping_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL UNIQUE,
+    manifest_json TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+    created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS fingerprint_template_mappings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_mapping_import_id INTEGER NOT NULL REFERENCES template_mapping_imports(id) ON DELETE CASCADE,
+    product_key TEXT NOT NULL,
+    source_key TEXT,
+    source_rule_id TEXT,
+    template_id TEXT NOT NULL,
+    template_path TEXT NOT NULL,
+    template_sha256 TEXT NOT NULL,
+    template_set_revision TEXT NOT NULL,
+    side_effect TEXT NOT NULL,
+    review_status TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    disabled_at DATETIME,
+    UNIQUE(template_mapping_import_id, product_key, source_rule_id, template_id, template_path)
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -510,9 +1288,21 @@ CREATE INDEX IF NOT EXISTS idx_scan_task_runs_task_sequence ON scan_task_runs(sc
 CREATE INDEX IF NOT EXISTS idx_scan_task_runs_status_scheduled_for ON scan_task_runs(status, scheduled_for);
 CREATE INDEX IF NOT EXISTS idx_scan_task_run_hosts_run ON scan_task_run_hosts(scan_task_run_id);
 CREATE INDEX IF NOT EXISTS idx_scan_task_run_ports_run ON scan_task_run_ports(scan_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_scan_task_run_protocol_evidence_run ON scan_task_run_protocol_evidence(scan_task_run_id);
 CREATE INDEX IF NOT EXISTS idx_scan_task_run_vulnerabilities_run ON scan_task_run_vulnerabilities(scan_task_run_id);
-CREATE INDEX IF NOT EXISTS idx_asset_fingerprints_ip_port ON asset_fingerprints(ip, port);
-CREATE INDEX IF NOT EXISTS idx_asset_fingerprints_product ON asset_fingerprints(product);
+CREATE INDEX IF NOT EXISTS idx_template_candidate_endpoints_run ON scan_task_run_template_candidate_endpoints(scan_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_imports_source_active ON fingerprint_imports(fingerprint_source_id, is_active);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fingerprint_imports_one_active_per_source ON fingerprint_imports(fingerprint_source_id) WHERE is_active = 1;
+CREATE INDEX IF NOT EXISTS idx_fingerprint_source_rules_import ON fingerprint_source_rules(fingerprint_import_id);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_rules_product ON fingerprint_rules(fingerprint_product_id);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_match_groups_rule ON fingerprint_match_groups(fingerprint_rule_id);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_matchers_group ON fingerprint_matchers(fingerprint_match_group_id);
+CREATE INDEX IF NOT EXISTS idx_run_fingerprint_imports_import ON scan_task_run_fingerprint_imports(fingerprint_import_id);
+CREATE INDEX IF NOT EXISTS idx_asset_fingerprint_matches_run ON asset_fingerprint_matches(scan_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_asset_fingerprint_match_evidence_match ON asset_fingerprint_match_evidence(asset_fingerprint_match_id);
+CREATE INDEX IF NOT EXISTS idx_asset_fingerprint_conclusions_run ON asset_fingerprint_conclusions(scan_task_run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_template_mapping_imports_one_active ON template_mapping_imports(is_active) WHERE is_active = 1;
+CREATE INDEX IF NOT EXISTS idx_fingerprint_template_mappings_product ON fingerprint_template_mappings(product_key, enabled);
 `
 	_, err := db.Exec(schema)
 	if err != nil {
@@ -523,7 +1313,10 @@ CREATE INDEX IF NOT EXISTS idx_asset_fingerprints_product ON asset_fingerprints(
 		return err
 	}
 
-	return seedBuiltinFingerprints(db)
+	if err := seedBuiltinFingerprints(db); err != nil {
+		return err
+	}
+	return MigrateLegacyBannerFingerprintRules(db)
 }
 
 func SaveNucleiFindings(db *sql.DB, taskID int64, findings []model.NucleiFinding) error {
@@ -1231,9 +2024,6 @@ func normalizeScanResult(db *sql.DB, result model.ScanResult) (scanResultRecord,
 	if serviceType == "" || serviceType == "none_unknown" {
 		serviceType = "unknown"
 	}
-	if strings.HasPrefix(serviceType, "http") {
-		serviceType = "http-unknown"
-	}
 	if len(serviceType) > 255 {
 		serviceType = serviceType[:255]
 	}
@@ -1257,12 +2047,49 @@ func upsertScanResult(execer sqlExecer, record scanResultRecord) error {
 	return err
 }
 
-// SyncOpenPorts updates one host's current port inventory and removes ports
-// that were not observed in the current scan.
-func SyncOpenPorts(db *sql.DB, ip string, results []model.ScanResult) error {
+func upsertCurrentPort(execer sqlExecer, record scanResultRecord) error {
+	_, err := execer.Exec(`
+		INSERT INTO current_port_inventory (ip, port, service_type, last_seen)
+		VALUES (?, ?, ?, datetime('now'))
+		ON CONFLICT(ip, port) DO UPDATE SET
+			service_type = excluded.service_type,
+			last_seen = datetime('now')`,
+		record.ip,
+		record.port,
+		record.serviceType,
+	)
+	return err
+}
+
+// PortScanCoverage describes exactly which ports a scan attempted. Full and
+// Ports are mutually exclusive; an empty selected set observes nothing.
+type PortScanCoverage struct {
+	Full  bool
+	Ports []int
+}
+
+func FullPortScanCoverage() PortScanCoverage {
+	return PortScanCoverage{Full: true}
+}
+
+func SelectedPortScanCoverage(ports []int) PortScanCoverage {
+	return PortScanCoverage{Ports: append([]int(nil), ports...)}
+}
+
+// SyncOpenPorts updates only the V2 ports covered by this scan. The optional
+// argument defaults to full coverage for compatibility with older callers.
+// Production workflows always pass their coverage explicitly.
+func SyncOpenPorts(db *sql.DB, ip string, results []model.ScanResult, values ...PortScanCoverage) error {
+	if err := ensureCurrentPortInventory(db); err != nil {
+		return err
+	}
 	ip = strings.TrimSpace(ip)
 	if net.ParseIP(ip) == nil {
 		return fmt.Errorf("invalid host IP: %s", ip)
+	}
+	coverage, coveredPorts, err := normalizePortScanCoverage(values)
+	if err != nil {
+		return err
 	}
 
 	recordsByPort := make(map[int]scanResultRecord)
@@ -1276,6 +2103,11 @@ func SyncOpenPorts(db *sql.DB, ip string, results []model.ScanResult) error {
 		}
 		if record.ip != ip {
 			return fmt.Errorf("scan result IP %s does not match host %s", record.ip, ip)
+		}
+		if !coverage.Full {
+			if _, covered := coveredPorts[record.port]; !covered {
+				return fmt.Errorf("scan result port %d is outside the declared coverage", record.port)
+			}
 		}
 		recordsByPort[record.port] = record
 	}
@@ -1297,19 +2129,12 @@ func SyncOpenPorts(db *sql.DB, ip string, results []model.ScanResult) error {
 	}()
 
 	for _, port := range ports {
-		if err = upsertScanResult(tx, recordsByPort[port]); err != nil {
+		if err = upsertCurrentPort(tx, recordsByPort[port]); err != nil {
 			return err
 		}
 	}
 
-	statement := `DELETE FROM scan_results WHERE ip = ?`
-	args := []interface{}{ip}
-	if len(ports) > 0 {
-		statement += ` AND port NOT IN (` + sqlPlaceholders(len(ports)) + `)`
-		for _, port := range ports {
-			args = append(args, port)
-		}
-	}
+	statement, args := coveredMissingPortsStatement(`DELETE FROM current_port_inventory WHERE ip = ?`, []interface{}{ip}, coverage, ports)
 	if _, err = tx.Exec(statement, args...); err != nil {
 		return err
 	}
@@ -1320,10 +2145,73 @@ func SyncOpenPorts(db *sql.DB, ip string, results []model.ScanResult) error {
 	return nil
 }
 
+func normalizePortScanCoverage(values []PortScanCoverage) (PortScanCoverage, map[int]struct{}, error) {
+	if len(values) > 1 {
+		return PortScanCoverage{}, nil, errors.New("only one port scan coverage value is allowed")
+	}
+	coverage := FullPortScanCoverage()
+	if len(values) == 1 {
+		coverage = values[0]
+	}
+	if coverage.Full && len(coverage.Ports) > 0 {
+		return PortScanCoverage{}, nil, errors.New("full port coverage cannot include selected ports")
+	}
+	covered := make(map[int]struct{}, len(coverage.Ports))
+	if coverage.Full {
+		return coverage, covered, nil
+	}
+	ports := make([]int, 0, len(coverage.Ports))
+	for _, port := range coverage.Ports {
+		if port < 1 || port > 65535 {
+			return PortScanCoverage{}, nil, fmt.Errorf("invalid covered port: %d", port)
+		}
+		if _, exists := covered[port]; exists {
+			continue
+		}
+		covered[port] = struct{}{}
+		ports = append(ports, port)
+	}
+	sort.Ints(ports)
+	coverage.Ports = ports
+	return coverage, covered, nil
+}
+
+func coveredMissingPortsStatement(statement string, args []interface{}, coverage PortScanCoverage, openPorts []int) (string, []interface{}) {
+	if !coverage.Full {
+		if len(coverage.Ports) == 0 {
+			return statement + ` AND 1 = 0`, args
+		}
+		statement += ` AND port IN (` + sqlPlaceholders(len(coverage.Ports)) + `)`
+		for _, port := range coverage.Ports {
+			args = append(args, port)
+		}
+	}
+	if len(openPorts) > 0 {
+		statement += ` AND port NOT IN (` + sqlPlaceholders(len(openPorts)) + `)`
+		for _, port := range openPorts {
+			args = append(args, port)
+		}
+	}
+	return statement, args
+}
+
+func ensureCurrentPortInventory(db *sql.DB) error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS current_port_inventory (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			ip           TEXT    NOT NULL,
+			port         INTEGER NOT NULL,
+			service_type TEXT    NOT NULL,
+			last_seen    DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(ip, port)
+		)`)
+	return err
+}
+
 // SyncScopeOpenPorts updates one host's port membership inside one scan scope.
 // It intentionally does not alter another scope's port rows or the global
-// scan_results cache used for latest service profiling.
-func SyncScopeOpenPorts(db *sql.DB, scope, ip string, results []model.ScanResult) error {
+// scope-port inventory used for latest service profiling.
+func SyncScopeOpenPorts(db *sql.DB, scope, ip string, results []model.ScanResult, values ...PortScanCoverage) error {
 	scope = strings.TrimSpace(scope)
 	ip = strings.TrimSpace(ip)
 	if scope == "" {
@@ -1331,6 +2219,10 @@ func SyncScopeOpenPorts(db *sql.DB, scope, ip string, results []model.ScanResult
 	}
 	if net.ParseIP(ip) == nil {
 		return fmt.Errorf("invalid host IP: %s", ip)
+	}
+	coverage, coveredPorts, err := normalizePortScanCoverage(values)
+	if err != nil {
+		return err
 	}
 
 	recordsByPort := make(map[int]scanResultRecord)
@@ -1344,6 +2236,11 @@ func SyncScopeOpenPorts(db *sql.DB, scope, ip string, results []model.ScanResult
 		}
 		if record.ip != ip {
 			return fmt.Errorf("scan result IP %s does not match host %s", record.ip, ip)
+		}
+		if !coverage.Full {
+			if _, covered := coveredPorts[record.port]; !covered {
+				return fmt.Errorf("scan result port %d is outside the declared coverage", record.port)
+			}
 		}
 		recordsByPort[record.port] = record
 	}
@@ -1383,13 +2280,7 @@ func SyncScopeOpenPorts(db *sql.DB, scope, ip string, results []model.ScanResult
 		UPDATE host_inventory_scope_ports
 		SET is_active = 0, last_checked = datetime('now')
 		WHERE scope = ? AND ip = ?`
-	args := []interface{}{scope, ip}
-	if len(ports) > 0 {
-		statement += ` AND port NOT IN (` + sqlPlaceholders(len(ports)) + `)`
-		for _, port := range ports {
-			args = append(args, port)
-		}
-	}
+	statement, args := coveredMissingPortsStatement(statement, []interface{}{scope, ip}, coverage, ports)
 	if _, err := tx.Exec(statement, args...); err != nil {
 		_ = tx.Rollback()
 		return err
@@ -1964,15 +2855,17 @@ func GetAssetDetail(db *sql.DB, ip string) (model.AssetDetail, error) {
 	}
 
 	rows, err := db.Query(`
-		SELECT port, service_type, scan_time
-		FROM scan_results
+		SELECT port, service_type, last_seen
+		FROM current_port_inventory
 		WHERE ip = ?
 		ORDER BY port ASC`, ip)
+	if isMissingCurrentPortInventory(err) {
+		detail.Ports = make([]model.AssetPort, 0)
+		return detail, nil
+	}
 	if err != nil {
 		return model.AssetDetail{}, err
 	}
-	defer rows.Close()
-
 	detail.Ports = make([]model.AssetPort, 0)
 	for rows.Next() {
 		var port model.AssetPort
@@ -1982,9 +2875,123 @@ func GetAssetDetail(db *sql.DB, ip string) (model.AssetDetail, error) {
 		detail.Ports = append(detail.Ports, port)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return model.AssetDetail{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return model.AssetDetail{}, err
+	}
+	if err := loadLatestAssetPortEvidenceSet(db, ip, detail.Ports); err != nil {
 		return model.AssetDetail{}, err
 	}
 	return detail, nil
+}
+
+func loadLatestAssetPortEvidenceSet(db *sql.DB, ip string, ports []model.AssetPort) error {
+	if len(ports) == 0 {
+		return nil
+	}
+	portIndexes := make(map[int]int, len(ports))
+	for index := range ports {
+		portIndexes[ports[index].Port] = index
+		ports[index].ProtocolEvidence = make([]model.ScanTaskRunProtocolEvidence, 0)
+	}
+	rows, err := db.Query(`
+		WITH latest_port_runs AS (
+			SELECT run_port.port, MAX(run_port.scan_task_run_id) AS scan_task_run_id
+			FROM scan_task_run_ports AS run_port
+			JOIN scan_task_runs AS port_run ON port_run.id = run_port.scan_task_run_id
+			WHERE run_port.ip = ? AND port_run.snapshot_written_at IS NOT NULL
+			GROUP BY run_port.port
+		)
+		SELECT evidence.port, evidence.evidence_type, evidence.probe_name, evidence.protocol, evidence.responded,
+			COALESCE(evidence.outcome, ''), COALESCE(evidence.diagnostic, ''),
+			COALESCE(evidence.status_code, 0), COALESCE(evidence.server, ''), COALESCE(evidence.title, ''),
+			evidence.banner_captured_length, COALESCE(evidence.banner_sha256, ''), evidence.banner_truncated,
+			evidence.header_captured_length, COALESCE(evidence.header_sha256, ''), evidence.header_truncated,
+			evidence.body_captured_length, COALESCE(evidence.body_sha256, ''), evidence.body_truncated
+		FROM scan_task_run_protocol_evidence AS evidence
+		JOIN latest_port_runs AS latest ON latest.port = evidence.port AND latest.scan_task_run_id = evidence.scan_task_run_id
+		WHERE evidence.ip = ?
+		ORDER BY evidence.port, evidence.evidence_type, evidence.protocol, evidence.probe_name`, ip, ip)
+	if err != nil {
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "no such table: scan_task_run_protocol_evidence") || strings.Contains(message, "no such column: evidence.evidence_type") {
+			return nil
+		}
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var evidence model.ScanTaskRunProtocolEvidence
+		var responded, bannerTruncated, headerTruncated, bodyTruncated int
+		if err := rows.Scan(&evidence.Port, &evidence.EvidenceType, &evidence.ProbeName, &evidence.Protocol, &responded, &evidence.Outcome, &evidence.Diagnostic,
+			&evidence.StatusCode, &evidence.Server, &evidence.Title,
+			&evidence.BannerCapturedLength, &evidence.BannerSHA256, &bannerTruncated,
+			&evidence.HeaderCapturedLength, &evidence.HeaderSHA256, &headerTruncated,
+			&evidence.BodyCapturedLength, &evidence.BodySHA256, &bodyTruncated); err != nil {
+			return err
+		}
+		index, ok := portIndexes[evidence.Port]
+		if !ok {
+			continue
+		}
+		evidence.IP = ip
+		evidence.Responded = responded != 0
+		evidence.BannerTruncated = bannerTruncated != 0
+		evidence.HeaderTruncated = headerTruncated != 0
+		evidence.BodyTruncated = bodyTruncated != 0
+		ports[index].ProtocolEvidence = append(ports[index].ProtocolEvidence, evidence)
+		applyAssetPortEvidenceCompatibility(&ports[index])
+	}
+	return rows.Err()
+}
+
+func applyAssetPortEvidenceCompatibility(port *model.AssetPort) {
+	if port == nil {
+		return
+	}
+	var evidence model.ScanTaskRunProtocolEvidence
+	priority := 0
+	for _, candidate := range port.ProtocolEvidence {
+		if !candidate.Responded {
+			continue
+		}
+		candidatePriority := 1
+		if candidate.EvidenceType == model.ProtocolEvidencePassiveBanner {
+			candidatePriority = 2
+		} else if candidate.EvidenceType == model.ProtocolEvidenceWeb {
+			candidatePriority = 3
+		}
+		if candidatePriority > priority {
+			evidence = candidate
+			priority = candidatePriority
+		}
+	}
+	if priority == 0 {
+		return
+	}
+	port.Protocol = evidence.Protocol
+	port.StatusCode = evidence.StatusCode
+	port.Server = evidence.Server
+	port.Title = evidence.Title
+	port.ResponseLength = evidence.BodyCapturedLength
+	port.ResponseSHA256 = evidence.BodySHA256
+	port.ResponseTruncated = evidence.BodyTruncated
+	if port.ResponseLength == 0 {
+		port.ResponseLength = evidence.HeaderCapturedLength
+		port.ResponseSHA256 = evidence.HeaderSHA256
+		port.ResponseTruncated = evidence.HeaderTruncated
+	}
+	if port.ResponseLength == 0 {
+		port.ResponseLength = evidence.BannerCapturedLength
+		port.ResponseSHA256 = evidence.BannerSHA256
+		port.ResponseTruncated = evidence.BannerTruncated
+	}
+}
+
+func isMissingCurrentPortInventory(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "no such table: current_port_inventory")
 }
 
 func SaveTaskChangeSummary(db *sql.DB, summary model.TaskChangeSummary) error {

@@ -7,10 +7,11 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"golandproject/yscan/internal/diff"
-	"golandproject/yscan/internal/fingerprint"
 	"golandproject/yscan/internal/model"
 	"golandproject/yscan/internal/pipeline"
 	"golandproject/yscan/internal/planner"
@@ -63,9 +64,10 @@ func (executor SubnetTaskRunExecutor) Execute(ctx context.Context, run model.Sca
 type subnetDependencies struct {
 	discover            func(context.Context, string, pipeline.SubnetDiscoveryOptions) ([]string, error)
 	scanHost            func(context.Context, string, string) ([]model.ScanResult, error)
+	scanSelected        func(context.Context, string, string, []int) ([]model.ScanResult, error)
+	collectFingerprints func(context.Context, *sql.DB, model.ScanTaskRun, string, []model.ScanResult) ([]model.ScanResult, []model.FingerprintRunMatch, error)
 	runNuclei           func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error)
-	runNucleiPaths      func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error)
-	collectFingerprints func(context.Context, *sql.DB, string, []model.ScanResult) ([]model.AssetFingerprint, error)
+	executeNuclei       func(context.Context, string, []model.ScanResult, string, []string) vuln.NucleiExecutionResult
 	saveFindings        func(*sql.DB, int64, []model.NucleiFinding) error
 }
 
@@ -73,12 +75,10 @@ type subnetDependencies struct {
 // validation, and persists a task-level change summary.
 func RunSubnet(ctx context.Context, options SubnetRunOptions) (model.TaskChangeSummary, error) {
 	return runSubnet(ctx, options, subnetDependencies{
-		discover:            pipeline.DiscoverAliveHosts,
-		scanHost:            scan.RunQuick,
-		runNuclei:           vuln.RunNucleiForOpenPortsWithTags,
-		runNucleiPaths:      vuln.RunNucleiForOpenPortsWithTemplatePaths,
-		collectFingerprints: collectRunFingerprints,
-		saveFindings:        storage.SaveNucleiFindings,
+		discover:     pipeline.DiscoverAliveHosts,
+		scanHost:     scan.RunQuick,
+		runNuclei:    vuln.RunNucleiForOpenPortsWithTags,
+		saveFindings: storage.SaveNucleiFindings,
 	})
 }
 
@@ -86,12 +86,23 @@ func RunSubnet(ctx context.Context, options SubnetRunOptions) (model.TaskChangeS
 // observations for that run. Inventory updates remain current-state data;
 // they are deliberately not used as the run Diff baseline.
 func RunSubnetTaskRun(ctx context.Context, options SubnetTaskRunOptions) (model.ScanTaskRunSnapshot, error) {
+	if options.DB == nil {
+		return model.ScanTaskRunSnapshot{}, errors.New("subnet task run database is required")
+	}
+	if options.Run.ID <= 0 || options.Run.ScanTaskID <= 0 || options.Run.ScanType != model.ScanTypeSubnet {
+		return model.ScanTaskRunSnapshot{}, errors.New("invalid subnet scan task run")
+	}
+	collector, err := newRunFingerprintCollector(options.DB, options.Run)
+	if err != nil {
+		return model.ScanTaskRunSnapshot{}, err
+	}
 	return runSubnetTaskRun(ctx, options, subnetDependencies{
 		discover:            pipeline.DiscoverAliveHosts,
-		scanHost:            scan.RunQuick,
+		scanHost:            scan.RunQuickDiscovery,
+		scanSelected:        scan.RunSelectedDiscovery,
+		collectFingerprints: collector,
 		runNuclei:           vuln.RunNucleiForOpenPortsWithTags,
-		runNucleiPaths:      vuln.RunNucleiForOpenPortsWithTemplatePaths,
-		collectFingerprints: collectRunFingerprints,
+		executeNuclei:       vuln.ExecuteNucleiForOpenPortsWithTags,
 	})
 }
 
@@ -109,13 +120,7 @@ func runSubnetTaskRun(ctx context.Context, options SubnetTaskRunOptions, depende
 	if strings.TrimSpace(options.Network) == "" {
 		options.Network = "tcp"
 	}
-	if dependencies.runNucleiPaths == nil {
-		dependencies.runNucleiPaths = vuln.RunNucleiForOpenPortsWithTemplatePaths
-	}
-	if dependencies.collectFingerprints == nil {
-		dependencies.collectFingerprints = collectRunFingerprints
-	}
-	if dependencies.discover == nil || dependencies.scanHost == nil || dependencies.runNuclei == nil {
+	if dependencies.discover == nil || dependencies.scanHost == nil || (dependencies.runNuclei == nil && dependencies.executeNuclei == nil) {
 		return model.ScanTaskRunSnapshot{}, errors.New("subnet task run dependencies are required")
 	}
 	if err := checkCanceled(ctx, options.CheckCanceled); err != nil {
@@ -129,237 +134,367 @@ func runSubnetTaskRun(ctx context.Context, options SubnetTaskRunOptions, depende
 	if err != nil {
 		return model.ScanTaskRunSnapshot{}, err
 	}
+	snapshot := model.ScanTaskRunSnapshot{
+		RunID:              options.Run.ID,
+		Hosts:              snapshotHosts(aliveHosts),
+		Ports:              make([]model.ScanTaskRunPort, 0),
+		ProtocolEvidence:   make([]model.ScanTaskRunProtocolEvidence, 0),
+		Vulnerabilities:    make([]model.ScanTaskRunVulnerability, 0),
+		FingerprintMatches: make([]model.FingerprintRunMatch, 0),
+		Validation:         initialRunValidation(options.Run.Config.VulnerabilityOn),
+	}
+	var validation *runValidationTracker
+	if options.Run.Config.VulnerabilityOn {
+		validation = newRunValidationTracker()
+	}
 	if err := checkCanceled(ctx, options.CheckCanceled); err != nil {
-		return model.ScanTaskRunSnapshot{}, err
+		return snapshot, err
 	}
 	scope := "subnet:" + cidr
 	if err := storage.SyncHostInventory(options.DB, scope, aliveHosts); err != nil {
-		return model.ScanTaskRunSnapshot{}, err
+		return snapshot, err
 	}
-
-	snapshot := model.ScanTaskRunSnapshot{
-		RunID:           options.Run.ID,
-		Hosts:           snapshotHosts(aliveHosts),
-		Ports:           make([]model.ScanTaskRunPort, 0),
-		Vulnerabilities: make([]model.ScanTaskRunVulnerability, 0),
+	configuredPorts, err := scan.ParsePortSpec(options.Run.Config.PortSpec)
+	if err != nil {
+		return snapshot, fmt.Errorf("invalid run port_spec: %w", err)
 	}
+	coveragePorts := scan.InternalBaselinePorts()
+	if len(configuredPorts) > 0 {
+		coveragePorts = configuredPorts
+	}
+	portCoverage := storage.SelectedPortScanCoverage(coveragePorts)
 	if len(aliveHosts) == 0 {
 		if err := storage.DeactivateScopePortsForInactiveHosts(options.DB, scope); err != nil {
-			return model.ScanTaskRunSnapshot{}, err
+			return snapshot, err
 		}
 		if err := updateProgress(options.UpdateProgress, 100); err != nil {
-			return model.ScanTaskRunSnapshot{}, err
+			return snapshot, err
+		}
+		if validation != nil {
+			validation.finish(&snapshot, nil)
 		}
 		return snapshot, nil
 	}
 
 	for index, ip := range aliveHosts {
 		if err := checkCanceled(ctx, options.CheckCanceled); err != nil {
-			return model.ScanTaskRunSnapshot{}, err
+			return snapshot, err
 		}
-		openPorts, err := dependencies.scanHost(ctx, ip, options.Network)
+		var openPorts []model.ScanResult
+		if len(configuredPorts) > 0 {
+			if dependencies.scanSelected == nil {
+				return snapshot, errors.New("selected port scan dependency is required")
+			}
+			openPorts, err = dependencies.scanSelected(ctx, ip, options.Network, configuredPorts)
+		} else {
+			openPorts, err = dependencies.scanHost(ctx, ip, options.Network)
+		}
 		if err != nil {
-			return model.ScanTaskRunSnapshot{}, err
+			snapshot.Ports = uniqueSnapshotPorts(append(snapshot.Ports, snapshotPorts(ip, openPorts)...))
+			snapshot.ProtocolEvidence = uniqueProtocolEvidence(append(snapshot.ProtocolEvidence, snapshotProtocolEvidence(ip, openPorts)...))
+			return snapshot, err
 		}
-		if err := storage.SyncOpenPorts(options.DB, ip, openPorts); err != nil {
-			return model.ScanTaskRunSnapshot{}, err
+		if dependencies.collectFingerprints != nil {
+			var matches []model.FingerprintRunMatch
+			openPorts, matches, err = dependencies.collectFingerprints(ctx, options.DB, options.Run, ip, openPorts)
+			snapshot.Ports = append(snapshot.Ports, snapshotPorts(ip, openPorts)...)
+			snapshot.ProtocolEvidence = append(snapshot.ProtocolEvidence, snapshotProtocolEvidence(ip, openPorts)...)
+			snapshot.FingerprintMatches = append(snapshot.FingerprintMatches, matches...)
+			if err != nil {
+				return snapshot, err
+			}
 		}
-		if err := storage.SyncScopeOpenPorts(options.DB, scope, ip, openPorts); err != nil {
-			return model.ScanTaskRunSnapshot{}, err
+		if err := storage.SyncOpenPorts(options.DB, ip, openPorts, portCoverage); err != nil {
+			return snapshot, err
 		}
-		// Fingerprint collection is best-effort; a failed probe must not fail the scan.
-		currentFingerprints, _ := dependencies.collectFingerprints(ctx, options.DB, ip, openPorts)
-		snapshot.Ports = append(snapshot.Ports, snapshotPorts(ip, openPorts)...)
+		if err := storage.SyncScopeOpenPorts(options.DB, scope, ip, openPorts, portCoverage); err != nil {
+			return snapshot, err
+		}
+		if dependencies.collectFingerprints == nil {
+			snapshot.Ports = append(snapshot.Ports, snapshotPorts(ip, openPorts)...)
+			snapshot.ProtocolEvidence = append(snapshot.ProtocolEvidence, snapshotProtocolEvidence(ip, openPorts)...)
+		}
 
 		if options.Run.Config.VulnerabilityOn {
-			findings, candidates, err := runPlannedValidation(ctx, ip, openPorts, currentFingerprints, options.Run.Config.NucleiTemplates, dependencies.runNuclei, dependencies.runNucleiPaths)
-			if err != nil {
-				return model.ScanTaskRunSnapshot{}, err
+			mappingResult := runFingerprintMappingValidation(ctx, options.DB, options.Run, ip, openPorts, snapshot.FingerprintMatches, options.Run.Config.NucleiTemplates)
+			validation.observe(mappingResult)
+			snapshot.TemplateCandidates = uniqueTemplateCandidates(append(snapshot.TemplateCandidates, mappingResult.candidates...))
+			snapshot.Vulnerabilities = uniqueSnapshotVulnerabilities(append(snapshot.Vulnerabilities, snapshotVulnerabilities(mappingResult.findings)...))
+			if mappingResult.err != nil && !errors.Is(mappingResult.err, vuln.ErrNoTemplates) {
+				validation.finish(&snapshot, mappingResult.err)
+				return snapshot, mappingResult.err
 			}
-			snapshot.TemplateCandidates = append(snapshot.TemplateCandidates, candidates...)
-			snapshot.Vulnerabilities = append(snapshot.Vulnerabilities, snapshotVulnerabilities(findings)...)
+			fallbackResult := runServiceTagValidation(ctx, ip, portsWithoutFingerprintMappings(openPorts, mappingResult.candidates), options.Run.Config.NucleiTemplates, nucleiExecutionDependency(dependencies.executeNuclei, dependencies.runNuclei))
+			validation.observe(fallbackResult)
+			allCandidates := append(mappingResult.candidates, fallbackResult.candidates...)
+			allFindings := append(mappingResult.findings, fallbackResult.findings...)
+			snapshot.TemplateCandidates = uniqueTemplateCandidates(append(snapshot.TemplateCandidates, allCandidates...))
+			snapshot.Vulnerabilities = uniqueSnapshotVulnerabilities(append(snapshot.Vulnerabilities, snapshotVulnerabilities(allFindings)...))
+			if fallbackResult.err != nil && !errors.Is(fallbackResult.err, vuln.ErrNoTemplates) {
+				validation.finish(&snapshot, fallbackResult.err)
+				return snapshot, fallbackResult.err
+			}
 		}
 		progress := 20 + int(float64(index+1)/float64(len(aliveHosts))*80)
 		if err := updateProgress(options.UpdateProgress, progress); err != nil {
-			return model.ScanTaskRunSnapshot{}, err
+			return snapshot, err
 		}
 	}
 	if err := storage.DeactivateScopePortsForInactiveHosts(options.DB, scope); err != nil {
-		return model.ScanTaskRunSnapshot{}, err
+		return snapshot, err
 	}
 	snapshot.Ports = uniqueSnapshotPorts(snapshot.Ports)
+	snapshot.ProtocolEvidence = uniqueProtocolEvidence(snapshot.ProtocolEvidence)
 	snapshot.Vulnerabilities = uniqueSnapshotVulnerabilities(snapshot.Vulnerabilities)
 	snapshot.TemplateCandidates = uniqueTemplateCandidates(snapshot.TemplateCandidates)
+	if validation != nil {
+		validation.finish(&snapshot, nil)
+	}
 	return snapshot, nil
 }
 
-func collectRunFingerprints(ctx context.Context, db *sql.DB, ip string, ports []model.ScanResult) ([]model.AssetFingerprint, error) {
-	return collectRunFingerprintsWith(ctx, db, ip, ports, fingerprint.CollectHTTPEvidence)
+// runFingerprintMappingValidation executes only approved, content-pinned
+// templates justified by this run's endpoint conclusions. It deliberately
+// does not read historical fingerprint results.
+type validationExecutionResult struct {
+	findings          []model.NucleiFinding
+	candidates        []model.ScanTaskRunTemplateCandidate
+	executedEndpoints map[string]struct{}
+	err               error
 }
 
-type httpEvidenceCollector func(context.Context, string, fingerprint.HTTPEvidenceOptions) (fingerprint.HTTPEvidence, error)
-
-func collectRunFingerprintsWith(ctx context.Context, db *sql.DB, ip string, ports []model.ScanResult, collectHTTP httpEvidenceCollector) ([]model.AssetFingerprint, error) {
-	compilation, err := fingerprint.LoadReviewedRules("data/fingerprints")
-	if err != nil {
-		return nil, err
+func (result *validationExecutionResult) markExecuted(candidates []model.ScanTaskRunTemplateCandidate) {
+	if result.executedEndpoints == nil {
+		result.executedEndpoints = make(map[string]struct{})
 	}
-	return collectRunFingerprintsWithRules(ctx, db, ip, ports, compilation.Rules, collectHTTP)
+	for _, candidate := range candidates {
+		if endpoint := validationEndpointKey(candidate); endpoint != "" {
+			result.executedEndpoints[endpoint] = struct{}{}
+		}
+	}
 }
 
-func collectRunFingerprintsWithRules(ctx context.Context, db *sql.DB, ip string, ports []model.ScanResult, rules []fingerprint.Rule, collectHTTP httpEvidenceCollector) ([]model.AssetFingerprint, error) {
-	current := make([]model.AssetFingerprint, 0)
-	for _, port := range ports {
-		if !port.Open {
+func runFingerprintMappingValidation(ctx context.Context, db *sql.DB, run model.ScanTaskRun, ip string, ports []model.ScanResult, matches []model.FingerprintRunMatch, templatesRoot string) validationExecutionResult {
+	result := validationExecutionResult{}
+	noTemplates := false
+	for _, portResult := range ports {
+		if !portResult.Open {
 			continue
 		}
-		_, portText, err := net.SplitHostPort(port.Address)
+		_, portText, err := net.SplitHostPort(portResult.Address)
 		if err != nil {
 			continue
 		}
-		var number int
-		if _, err := fmt.Sscanf(portText, "%d", &number); err != nil {
-			continue
-		}
-		// Banner is independently useful TCP evidence. A failed optional web
-		// probe must never erase it.
-		evidence := fingerprint.ServiceEvidence{Protocol: fingerprint.ProtocolTCP, Banner: port.Banner}
-		if shouldCollectHTTPEvidence(number, port.Service) {
-			protocol := fingerprintProtocol(number, port.Service)
-			if protocol != fingerprint.ProtocolHTTPS {
-				protocol = fingerprint.ProtocolHTTP
-			}
-			httpEvidence, err := collectHTTP(ctx, fmt.Sprintf("%s://%s:%d", protocol, ip, number), fingerprint.DefaultHTTPEvidenceOptions())
-			if err == nil {
-				fav, _ := fingerprint.CollectFaviconEvidence(ctx, httpEvidence.FinalURL, fingerprint.DefaultHTTPEvidenceOptions())
-				evidence = fingerprint.ServiceEvidence{Protocol: protocol, Headers: httpEvidence.Headers, HeaderText: httpEvidence.HeaderText, Body: httpEvidence.BodySummary, Favicon: fav}
-			}
-		}
-		matches, err := fingerprint.MatchRules(rules, evidence)
+		port, err := strconv.Atoi(portText)
 		if err != nil {
 			continue
 		}
-		records := make([]model.AssetFingerprint, 0, len(matches))
-		for _, match := range matches {
-			if record, err := match.ToAssetFingerprint(ip, number); err == nil {
-				records = append(records, record)
-			}
-		}
-		if err := storage.UpsertAssetFingerprints(db, records); err != nil {
-			return nil, err
-		}
-		current = append(current, records...)
-	}
-	return current, nil
-}
-
-// Unknown services receive one bounded HTTP GET probe so a web product on a
-// non-standard port can be fingerprinted. Probe failure is deliberately
-// non-blocking and the TCP banner path remains available.
-func shouldCollectHTTPEvidence(port int, service string) bool {
-	service = strings.ToLower(strings.TrimSpace(service))
-	return port == 80 || port == 443 || strings.Contains(service, "http") || service == "" || service == "unknown"
-}
-
-func fingerprintProtocol(port int, service string) fingerprint.Protocol {
-	service = strings.ToLower(strings.TrimSpace(service))
-	if port == 443 || strings.Contains(service, "https") {
-		return fingerprint.ProtocolHTTPS
-	}
-	if port == 80 || strings.Contains(service, "http") {
-		return fingerprint.ProtocolHTTP
-	}
-	return fingerprint.ProtocolTCP
-}
-
-func runPlannedValidation(ctx context.Context, ip string, ports []model.ScanResult, currentFingerprints []model.AssetFingerprint, templates string, runFallback func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error), runPaths func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error)) ([]model.NucleiFinding, []model.ScanTaskRunTemplateCandidate, error) {
-	var root string
-	var index planner.TemplateIndex
-	var err error
-	indexLoaded := false
-	findings := make([]model.NucleiFinding, 0)
-	candidates := make([]model.ScanTaskRunTemplateCandidate, 0)
-	for _, port := range ports {
-		if !port.Open {
-			continue
-		}
-		number, protocol, ok := fingerprintPort(port)
-		if !ok {
-			continue
-		}
-		fingerprints := currentPortFingerprints(currentFingerprints, ip, number, protocol)
-		if len(fingerprints) > 0 && !indexLoaded {
-			root, err = vuln.ResolveNucleiTemplatesPath(templates)
+		for _, protocol := range []string{"https", "http", "tcp"} {
+			mappings, err := storage.ListApprovedTemplateMappingsForMatches(db, run.ID, ip, port, protocol, matches)
 			if err != nil {
-				return nil, nil, err
+				result.err = err
+				return result
 			}
-			index, err = planner.BuildNucleiTemplateIndex(root)
-			if err != nil {
-				return nil, nil, err
-			}
-			indexLoaded = true
-		}
-		if indexLoaded {
-			planned := planner.PlanFingerprintCandidates(fingerprints, index, planner.DefaultTemplateSafetyPolicy(), planner.DefaultFingerprintConfidenceThreshold)
-			if len(planned) > 0 {
-				paths := make([]string, 0, len(planned))
-				for _, item := range planned {
-					paths = append(paths, item.Path)
-					candidates = append(candidates, model.ScanTaskRunTemplateCandidate{TemplateID: item.TemplateID, Path: item.Path, Source: item.Source, Reason: item.FingerprintSource + ":" + item.FingerprintRule + " product=" + item.Product})
-				}
-				matched, err := runPaths(ctx, ip, []model.ScanResult{port}, root, paths)
-				if err != nil {
-					return nil, nil, err
-				}
-				findings = append(findings, matched...)
+			if len(mappings) == 0 {
 				continue
 			}
+			resolved, err := planner.ResolveReviewedTemplateCandidates(templatesRoot, mappings)
+			if err != nil {
+				result.err = err
+				return result
+			}
+			paths := make([]string, 0, len(resolved))
+			invocationCandidates := make([]model.ScanTaskRunTemplateCandidate, 0, len(resolved))
+			for _, candidate := range resolved {
+				paths = append(paths, candidate.AbsolutePath)
+				invocationCandidates = append(invocationCandidates, model.ScanTaskRunTemplateCandidate{TemplateID: candidate.Mapping.TemplateID, Path: candidate.Mapping.TemplatePath, Source: "fingerprint_mapping", Reason: fmt.Sprintf("approved fingerprint mapping %s", candidate.Mapping.ProductKey), TemplateSHA256: candidate.Mapping.TemplateSHA256, TemplateSetRevision: candidate.Mapping.TemplateSetRevision, MappingImportID: candidate.Mapping.TemplateMappingImportID, IP: ip, Port: port, Protocol: protocol})
+			}
+			result.candidates = append(result.candidates, invocationCandidates...)
+			if len(paths) > 0 {
+				execution := vuln.ExecuteNucleiForOpenPortsWithTemplatePaths(ctx, ip, []model.ScanResult{portResult}, paths)
+				result.findings = append(result.findings, execution.Findings...)
+				if execution.Executed {
+					result.markExecuted(invocationCandidates)
+				}
+				err := execution.Err
+				if err == nil {
+					continue
+				}
+				if errors.Is(err, vuln.ErrNoTemplates) {
+					noTemplates = true
+					continue
+				}
+				if err != nil {
+					result.err = err
+					return result
+				}
+			}
+		}
+	}
+	if noTemplates {
+		result.err = vuln.ErrNoTemplates
+	}
+	return result
+}
+
+func portsWithoutFingerprintMappings(ports []model.ScanResult, candidates []model.ScanTaskRunTemplateCandidate) []model.ScanResult {
+	covered := make(map[string]struct{})
+	for _, candidate := range candidates {
+		if candidate.Source != "fingerprint_mapping" {
+			continue
+		}
+		if candidate.IP != "" && candidate.Port > 0 && candidate.Protocol != "" {
+			covered[fmt.Sprintf("%s:%d:%s", candidate.IP, candidate.Port, candidate.Protocol)] = struct{}{}
+		}
+	}
+	result := make([]model.ScanResult, 0, len(ports))
+	for _, port := range ports {
+		host, value, err := net.SplitHostPort(port.Address)
+		if err == nil {
+			portNumber, _ := strconv.Atoi(value)
+			if _, ok := covered[fmt.Sprintf("%s:%d:%s", host, portNumber, candidateProtocolForService(port.Service))]; ok {
+				continue
+			}
+		}
+		result = append(result, port)
+	}
+	return result
+}
+
+func runServiceTagValidation(ctx context.Context, ip string, ports []model.ScanResult, templates string, runNuclei func(context.Context, string, []model.ScanResult, string, []string) vuln.NucleiExecutionResult) validationExecutionResult {
+	result := validationExecutionResult{}
+	noTemplates := false
+	for _, port := range ports {
+		if !port.Open {
+			continue
 		}
 		groups := planner.TemplateGroupsForScanResults([]model.ScanResult{port})
 		if len(groups) == 0 {
 			continue
 		}
-		matched, err := runFallback(ctx, ip, []model.ScanResult{port}, templates, groups)
-		if err != nil {
-			return nil, nil, err
+		_, portText, _ := net.SplitHostPort(port.Address)
+		portNumber, _ := strconv.Atoi(portText)
+		invocationCandidates := serviceFallbackCandidates(ip, portNumber, candidateProtocolForService(port.Service), groups)
+		result.candidates = append(result.candidates, invocationCandidates...)
+		execution := runNuclei(ctx, ip, []model.ScanResult{port}, templates, groups)
+		result.findings = append(result.findings, execution.Findings...)
+		if execution.Executed {
+			result.markExecuted(invocationCandidates)
 		}
-		findings = append(findings, matched...)
-		candidates = append(candidates, serviceFallbackCandidates(groups)...)
-	}
-	return findings, candidates, nil
-}
-
-func currentPortFingerprints(records []model.AssetFingerprint, ip string, port int, protocol string) []model.AssetFingerprint {
-	result := make([]model.AssetFingerprint, 0)
-	for _, record := range records {
-		if record.IP != ip || record.Port != port || (protocol != "" && record.Protocol != protocol) {
+		err := execution.Err
+		if err == nil {
 			continue
 		}
-		result = append(result, record)
+		if errors.Is(err, vuln.ErrNoTemplates) {
+			noTemplates = true
+			continue
+		}
+		if err != nil {
+			result.err = err
+			return result
+		}
+	}
+	if noTemplates {
+		result.err = vuln.ErrNoTemplates
 	}
 	return result
 }
 
-func fingerprintPort(port model.ScanResult) (int, string, bool) {
-	_, portText, err := net.SplitHostPort(port.Address)
-	if err != nil {
-		return 0, "", false
+func nucleiExecutionDependency(
+	execute func(context.Context, string, []model.ScanResult, string, []string) vuln.NucleiExecutionResult,
+	legacy func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error),
+) func(context.Context, string, []model.ScanResult, string, []string) vuln.NucleiExecutionResult {
+	if execute != nil {
+		return execute
 	}
-	var number int
-	if _, err := fmt.Sscanf(portText, "%d", &number); err != nil || number <= 0 {
-		return 0, "", false
+	return func(ctx context.Context, ip string, ports []model.ScanResult, templates string, tags []string) vuln.NucleiExecutionResult {
+		findings, err := legacy(ctx, ip, ports, templates, tags)
+		return vuln.NucleiExecutionResult{Findings: findings, Started: true, Executed: err == nil || len(findings) > 0, Err: err}
 	}
-	service := strings.ToLower(strings.TrimSpace(port.Service))
-	if service == "" || service == "unknown" {
-		return number, "", true
-	}
-	return number, string(fingerprintProtocol(number, service)), true
 }
 
-func serviceFallbackCandidates(groups []string) []model.ScanTaskRunTemplateCandidate {
+type runValidationTracker struct {
+	startedAt  time.Time
+	candidates map[string]struct{}
+	templates  map[string]struct{}
+	executed   map[string]struct{}
+}
+
+func initialRunValidation(enabled bool) model.ScanTaskRunValidation {
+	status := model.ScanTaskRunValidationDisabled
+	if enabled {
+		status = model.ScanTaskRunValidationNotStarted
+	}
+	return model.ScanTaskRunValidation{Status: status}
+}
+
+func newRunValidationTracker() *runValidationTracker {
+	return &runValidationTracker{
+		startedAt: time.Now().UTC(), candidates: make(map[string]struct{}),
+		templates: make(map[string]struct{}), executed: make(map[string]struct{}),
+	}
+}
+
+func (tracker *runValidationTracker) observe(result validationExecutionResult) {
+	if tracker == nil {
+		return
+	}
+	for _, candidate := range result.candidates {
+		endpoint := validationEndpointKey(candidate)
+		if endpoint != "" {
+			tracker.candidates[endpoint] = struct{}{}
+		}
+		tracker.templates[candidate.TemplateID+"\x00"+candidate.Path] = struct{}{}
+	}
+	for endpoint := range result.executedEndpoints {
+		tracker.executed[endpoint] = struct{}{}
+	}
+}
+
+func (tracker *runValidationTracker) finish(snapshot *model.ScanTaskRunSnapshot, executionErr error) {
+	if tracker == nil || snapshot == nil {
+		return
+	}
+	validation := model.ScanTaskRunValidation{
+		Status:                 model.ScanTaskRunValidationNoCandidates,
+		CandidateEndpointCount: len(tracker.candidates),
+		ExecutedEndpointCount:  len(tracker.executed),
+		TemplateCount:          len(tracker.templates),
+		FindingCount:           len(snapshot.Vulnerabilities),
+		StartedAt:              tracker.startedAt.Format(time.RFC3339Nano),
+		FinishedAt:             time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if executionErr != nil && !errors.Is(executionErr, vuln.ErrNoTemplates) {
+		validation.Status = model.ScanTaskRunValidationFailed
+		validation.Error = safeValidationError(executionErr)
+	} else if len(tracker.executed) > 0 {
+		validation.Status = model.ScanTaskRunValidationSuccess
+	}
+	snapshot.Validation = validation
+}
+
+func validationEndpointKey(candidate model.ScanTaskRunTemplateCandidate) string {
+	if net.ParseIP(candidate.IP) == nil || candidate.Port < 1 || candidate.Protocol == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d/%s", candidate.IP, candidate.Port, strings.ToLower(candidate.Protocol))
+}
+
+func safeValidationError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.Join(strings.Fields(err.Error()), " ")
+	if len(message) > 512 {
+		message = message[:512]
+	}
+	return message
+}
+
+func serviceFallbackCandidates(ip string, port int, protocol string, groups []string) []model.ScanTaskRunTemplateCandidate {
 	result := make([]model.ScanTaskRunTemplateCandidate, 0, len(groups))
 	for _, group := range groups {
-		result = append(result, model.ScanTaskRunTemplateCandidate{TemplateID: "tag:" + group, Path: "service-tag", Source: "service_tag", Reason: "v1 service label fallback"})
+		result = append(result, model.ScanTaskRunTemplateCandidate{TemplateID: "tag:" + group, Path: "service-tag", Source: "service_tag", Reason: "v1 service label fallback", IP: ip, Port: port, Protocol: protocol})
 	}
 	return result
 }
@@ -367,7 +502,7 @@ func serviceFallbackCandidates(groups []string) []model.ScanTaskRunTemplateCandi
 func uniqueTemplateCandidates(input []model.ScanTaskRunTemplateCandidate) []model.ScanTaskRunTemplateCandidate {
 	seen := map[string]model.ScanTaskRunTemplateCandidate{}
 	for _, item := range input {
-		seen[item.TemplateID+"\x00"+item.Path] = item
+		seen[fmt.Sprintf("%s\x00%s\x00%s\x00%d\x00%s", item.TemplateID, item.Path, item.IP, item.Port, item.Protocol)] = item
 	}
 	result := make([]model.ScanTaskRunTemplateCandidate, 0, len(seen))
 	for _, item := range seen {
@@ -375,6 +510,17 @@ func uniqueTemplateCandidates(input []model.ScanTaskRunTemplateCandidate) []mode
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].TemplateID < result[j].TemplateID })
 	return result
+}
+
+func candidateProtocolForService(service string) string {
+	switch strings.ToLower(strings.TrimSpace(service)) {
+	case "http", "http-unknown":
+		return "http"
+	case "https":
+		return "https"
+	default:
+		return "tcp"
+	}
 }
 
 func runSubnet(ctx context.Context, options SubnetRunOptions, dependencies subnetDependencies) (model.TaskChangeSummary, error) {
@@ -432,6 +578,7 @@ func runSubnet(ctx context.Context, options SubnetRunOptions, dependencies subne
 		HostChanges: diff.CompareScopeMembers(beforeHosts, afterHosts),
 		PortChanges: model.PortChanges{Opened: []model.PortChange{}, Closed: []model.PortChange{}},
 	}
+	portCoverage := storage.SelectedPortScanCoverage(scan.InternalBaselinePorts())
 	if len(aliveHosts) == 0 {
 		if err := storage.DeactivateScopePortsForInactiveHosts(options.DB, scope); err != nil {
 			return model.TaskChangeSummary{}, err
@@ -459,10 +606,10 @@ func runSubnet(ctx context.Context, options SubnetRunOptions, dependencies subne
 		if err != nil {
 			return model.TaskChangeSummary{}, err
 		}
-		if err := storage.SyncOpenPorts(options.DB, ip, openPorts); err != nil {
+		if err := storage.SyncOpenPorts(options.DB, ip, openPorts, portCoverage); err != nil {
 			return model.TaskChangeSummary{}, err
 		}
-		if err := storage.SyncScopeOpenPorts(options.DB, scope, ip, openPorts); err != nil {
+		if err := storage.SyncScopeOpenPorts(options.DB, scope, ip, openPorts, portCoverage); err != nil {
 			return model.TaskChangeSummary{}, err
 		}
 
@@ -583,10 +730,67 @@ func snapshotPorts(ip string, results []model.ScanResult) []model.ScanTaskRunPor
 			Port:        port,
 			ServiceType: serviceType,
 			Product:     strings.TrimSpace(result.Product),
-			Banner:      result.Banner,
 		})
 	}
 	return ports
+}
+
+func snapshotProtocolEvidence(ip string, results []model.ScanResult) []model.ScanTaskRunProtocolEvidence {
+	observations := make([]model.ScanTaskRunProtocolEvidence, 0)
+	for _, result := range results {
+		port, ok := scanResultPort(ip, result)
+		if !ok {
+			continue
+		}
+		for _, observation := range result.ProtocolEvidence {
+			observation.IP = ip
+			observation.Port = port
+			observation.Protocol = strings.ToLower(strings.TrimSpace(observation.Protocol))
+			observation.EvidenceType = strings.ToLower(strings.TrimSpace(observation.EvidenceType))
+			observation.ProbeName = strings.TrimSpace(observation.ProbeName)
+			if observation.EvidenceType == "" {
+				if observation.Protocol == "http" || observation.Protocol == "https" {
+					observation.EvidenceType = model.ProtocolEvidenceWeb
+				} else {
+					observation.EvidenceType = model.ProtocolEvidencePassiveBanner
+				}
+			}
+			if observation.Protocol != "" {
+				observations = append(observations, observation)
+			}
+		}
+	}
+	return observations
+}
+
+func uniqueProtocolEvidence(observations []model.ScanTaskRunProtocolEvidence) []model.ScanTaskRunProtocolEvidence {
+	byKey := make(map[string]model.ScanTaskRunProtocolEvidence, len(observations))
+	for _, observation := range observations {
+		key := fmt.Sprintf("%s:%d/%s/%s/%s", observation.IP, observation.Port, observation.EvidenceType, observation.Protocol, observation.ProbeName)
+		if existing, found := byKey[key]; !found || (!existing.Responded && observation.Responded) {
+			byKey[key] = observation
+		}
+	}
+	result := make([]model.ScanTaskRunProtocolEvidence, 0, len(byKey))
+	for _, observation := range byKey {
+		result = append(result, observation)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].IP != result[j].IP {
+			return result[i].IP < result[j].IP
+		}
+		if result[i].Port != result[j].Port {
+			return result[i].Port < result[j].Port
+		}
+		if result[i].EvidenceType != result[j].EvidenceType {
+			return result[i].EvidenceType < result[j].EvidenceType
+		}
+		if result[i].Protocol != result[j].Protocol {
+			return result[i].Protocol < result[j].Protocol
+		}
+		return result[i].ProbeName < result[j].ProbeName
+	})
+	return result
 }
 
 func uniqueSnapshotPorts(ports []model.ScanTaskRunPort) []model.ScanTaskRunPort {
@@ -619,15 +823,16 @@ func snapshotVulnerabilities(findings []model.NucleiFinding) []model.ScanTaskRun
 		}
 		key := fmt.Sprintf("%s|%s|%s|%d", finding.TemplateID, target, finding.TargetIP, finding.TargetPort)
 		vulnerabilities = append(vulnerabilities, model.ScanTaskRunVulnerability{
-			FindingKey: key,
-			TemplateID: strings.TrimSpace(finding.TemplateID),
-			Name:       strings.TrimSpace(finding.Name),
-			Severity:   strings.TrimSpace(finding.Severity),
-			Target:     target,
-			TargetIP:   strings.TrimSpace(finding.TargetIP),
-			TargetPort: finding.TargetPort,
-			MatchedAt:  strings.TrimSpace(finding.MatchedAt),
-			Evidence:   finding.Evidence,
+			FindingKey:  key,
+			TemplateID:  strings.TrimSpace(finding.TemplateID),
+			Name:        strings.TrimSpace(finding.Name),
+			Severity:    strings.TrimSpace(finding.Severity),
+			Target:      target,
+			TargetIP:    strings.TrimSpace(finding.TargetIP),
+			TargetPort:  finding.TargetPort,
+			MatchedAt:   strings.TrimSpace(finding.MatchedAt),
+			Description: safeProtocolLabel(finding.Description, 1024),
+			Evidence:    finding.Evidence,
 		})
 	}
 	return vulnerabilities

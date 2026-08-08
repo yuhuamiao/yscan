@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,6 +30,8 @@ type ScanTaskCreator interface {
 }
 
 type ScanTaskRunStarter func(context.Context, model.ScanTaskRun)
+
+type AccessPolicy struct{ TrustedCIDRs []string }
 
 type createTaskRequest struct {
 	Type   string `json:"type"`
@@ -55,23 +58,86 @@ type createScanTaskResponse struct {
 }
 
 func StartServer(db *sql.DB, addr string, runTask TaskRunner) error {
+	return StartServerWithAccessPolicy(db, addr, runTask, AccessPolicy{})
+}
+
+func StartServerWithAccessPolicy(db *sql.DB, addr string, runTask TaskRunner, policy AccessPolicy) error {
 	handler, err := newHandler(db, runTask)
 	if err != nil {
 		return err
 	}
-
-	log.Printf("API server listening on %s", addr)
-	return http.ListenAndServe(addr, handler)
-}
-
-func StartServerWithScanTasks(db *sql.DB, addr string, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter) error {
-	handler, err := newHandlerWithScanTasks(db, runTask, creator, startRun)
-	if err != nil {
+	if err := policy.Validate(addr); err != nil {
 		return err
 	}
 
 	log.Printf("API server listening on %s", addr)
-	return http.ListenAndServe(addr, handler)
+	return http.ListenAndServe(addr, policy.Wrap(handler))
+}
+
+func StartServerWithScanTasks(db *sql.DB, addr string, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter) error {
+	return StartServerWithScanTasksAndAccessPolicy(db, addr, runTask, creator, startRun, AccessPolicy{})
+}
+
+func StartServerWithScanTasksAndAccessPolicy(db *sql.DB, addr string, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter, policy AccessPolicy) error {
+	handler, err := newHandlerWithScanTasks(db, runTask, creator, startRun)
+	if err != nil {
+		return err
+	}
+	if err := policy.Validate(addr); err != nil {
+		return err
+	}
+
+	log.Printf("API server listening on %s", addr)
+	return http.ListenAndServe(addr, policy.Wrap(handler))
+}
+
+func (policy AccessPolicy) Validate(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid API listen address: %w", err)
+	}
+	for _, cidr := range policy.TrustedCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid trusted client CIDR %q", cidr)
+		}
+	}
+	if host == "localhost" || net.ParseIP(host).IsLoopback() {
+		return nil
+	}
+	// An empty host (":8080") is a wildcard listener, just like 0.0.0.0
+	// and [::], and therefore must never inherit the loopback exception.
+	if len(policy.TrustedCIDRs) == 0 {
+		return errors.New("non-loopback API listener requires at least one trusted client CIDR")
+	}
+	return nil
+}
+
+func (policy AccessPolicy) Wrap(next http.Handler) http.Handler {
+	if len(policy.TrustedCIDRs) == 0 {
+		return next
+	}
+	networks := make([]*net.IPNet, 0, len(policy.TrustedCIDRs))
+	for _, cidr := range policy.TrustedCIDRs {
+		if _, network, err := net.ParseCIDR(cidr); err == nil {
+			networks = append(networks, network)
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		ip := net.ParseIP(host)
+		allowed := false
+		for _, network := range networks {
+			if network.Contains(ip) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func newHandler(db *sql.DB, runTask TaskRunner) (http.Handler, error) {
@@ -390,6 +456,113 @@ func newHandlerWithScanTasks(db *sql.DB, runTask TaskRunner, creator ScanTaskCre
 		writeJSON(w, http.StatusOK, assets)
 	})
 
+	// Fingerprint catalog endpoints are intentionally read-only. Mutating
+	// imports and review mappings remains a local CLI operation with an
+	// auditable manifest, rather than a broadly exposed network API.
+	mux.HandleFunc("/api/fingerprints/sources", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		sources, err := storage.ListFingerprintSources(db)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, sources)
+	})
+	mux.HandleFunc("/api/fingerprints/imports", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		page, pageSize, err := fingerprintPageParams(r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		imports, total, err := storage.ListFingerprintImportSummariesPage(db, page, pageSize)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"items": imports, "page": page, "page_size": pageSize, "total": total})
+	})
+	mux.HandleFunc("/api/fingerprints/imports/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		id, err := strconv.ParseInt(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/fingerprints/imports/"), "/"), 10, 64)
+		if err != nil || id <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid fingerprint import id"})
+			return
+		}
+		value, err := storage.GetFingerprintImport(db, id)
+		if errors.Is(err, storage.ErrFingerprintImportNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "fingerprint import not found"})
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, value)
+	})
+	mux.HandleFunc("/api/fingerprints/sources/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/fingerprints/sources/"), "/"), "/")
+		if len(parts) != 2 || parts[1] != "rules" || strings.TrimSpace(parts[0]) == "" {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		page, err := optionalPositiveInt(r.URL.Query().Get("page"), 1)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "page must be a positive integer"})
+			return
+		}
+		pageSizeText := r.URL.Query().Get("page_size")
+		if pageSizeText == "" {
+			pageSizeText = r.URL.Query().Get("limit")
+		}
+		pageSize, err := optionalPositiveInt(pageSizeText, 50)
+		if err != nil || pageSize > 200 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "page_size must be between 1 and 200"})
+			return
+		}
+		importID, err := optionalPositiveInt64(r.URL.Query().Get("import_id"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "import_id must be a positive integer"})
+			return
+		}
+		status := strings.TrimSpace(r.URL.Query().Get("status"))
+		if status != "" && status != "executable" && status != "unsupported" && status != "import_error" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid fingerprint rule status"})
+			return
+		}
+		rules, err := storage.ListFingerprintSourceRulesPage(db, storage.FingerprintSourceRuleQuery{SourceKey: parts[0], ImportID: importID, RuleID: r.URL.Query().Get("rule_id"), Product: r.URL.Query().Get("product"), Status: status, Page: page, PageSize: pageSize})
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, rules)
+	})
+	mux.HandleFunc("/api/fingerprints/template-mappings", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		mappings, err := storage.ListFingerprintTemplateMappings(db)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, mappings)
+	})
+
 	mux.HandleFunc("/api/assets/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -418,11 +591,45 @@ func newHandlerWithScanTasks(db *sql.DB, runTask TaskRunner, creator ScanTaskCre
 	return mux, nil
 }
 
+func optionalPositiveInt(value string, fallback int) (int, error) {
+	if strings.TrimSpace(value) == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return 0, errors.New("not a positive integer")
+	}
+	return parsed, nil
+}
+
+func optionalPositiveInt64(value string) (int64, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0, errors.New("not a positive integer")
+	}
+	return parsed, nil
+}
+
+func fingerprintPageParams(r *http.Request) (int, int, error) {
+	page, err := optionalPositiveInt(r.URL.Query().Get("page"), 1)
+	if err != nil {
+		return 0, 0, errors.New("page must be a positive integer")
+	}
+	pageSize, err := optionalPositiveInt(r.URL.Query().Get("page_size"), 50)
+	if err != nil || pageSize > 200 {
+		return 0, 0, errors.New("page_size must be between 1 and 200")
+	}
+	return page, pageSize, nil
+}
+
 // handleScanTaskRunRoute exposes immutable run state and its task-local Diff.
 // A run ID is always checked against the parent logical task before returning
 // data, so callers cannot accidentally compare results across tasks.
 func handleScanTaskRunRoute(db *sql.DB, w http.ResponseWriter, r *http.Request, taskID int64, parts []string) {
-	if len(parts) < 3 || len(parts) > 4 {
+	if len(parts) < 3 || len(parts) > 5 || (len(parts) == 5 && parts[3] != "fingerprints") {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
@@ -477,6 +684,91 @@ func handleScanTaskRunRoute(db *sql.DB, w http.ResponseWriter, r *http.Request, 
 		}
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 		_, _ = w.Write(content)
+		return
+	}
+	if parts[3] == "audit-report" {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		content, err := report.ReadScanTaskRunAuditReport(report.DefaultDirectory, taskID, runID)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "scan task run audit report not found"})
+			} else {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		_, _ = w.Write(content)
+		return
+	}
+	if parts[3] == "findings" {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		page, pageSize, err := fingerprintPageParams(r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		snapshot, err := storage.GetScanTaskRunSnapshot(db, runID)
+		if errors.Is(err, storage.ErrScanTaskRunSnapshotUnavailable) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "scan task run snapshot is not available"})
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		total := len(snapshot.Vulnerabilities)
+		start := (page - 1) * pageSize
+		if start > total {
+			start = total
+		}
+		end := start + pageSize
+		if end > total {
+			end = total
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"validation": snapshot.Validation, "items": snapshot.Vulnerabilities[start:end], "page": page, "page_size": pageSize, "total": total})
+		return
+	}
+	if parts[3] == "fingerprints" {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		if len(parts) == 4 {
+			writeJSON(w, http.StatusOK, map[string]interface{}{"resources": []string{"imports", "matches", "evidence", "conclusions"}})
+			return
+		}
+		page, pageSize, err := fingerprintPageParams(r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		var items interface{}
+		var total int
+		switch parts[4] {
+		case "imports":
+			items, total, err = storage.ListFingerprintImportsForRunPage(db, runID, page, pageSize)
+		case "matches":
+			items, total, err = storage.ListFingerprintRunMatchesPage(db, runID, page, pageSize)
+		case "evidence":
+			items, total, err = storage.ListFingerprintRunEvidencePage(db, runID, page, pageSize)
+		case "conclusions":
+			items, total, err = storage.ListFingerprintRunConclusionsPage(db, runID, page, pageSize)
+		default:
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"items": items, "page": page, "page_size": pageSize, "total": total})
 		return
 	}
 	if parts[3] != "changes" {

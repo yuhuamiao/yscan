@@ -46,6 +46,22 @@ func TestTaskTypeForSubnet(t *testing.T) {
 	}
 }
 
+func TestCommandNeedsLegacyBannerMatcher(t *testing.T) {
+	for _, command := range []string{"scan", "subnet", "vuln", "domain", "api"} {
+		if !commandNeedsLegacyBannerMatcher([]string{command}) {
+			t.Fatalf("%s must retain v1 banner compatibility", command)
+		}
+	}
+	for _, command := range []string{"status", "list", "cancel", "findings", "schedule", "fingerprint"} {
+		if commandNeedsLegacyBannerMatcher([]string{command}) {
+			t.Fatalf("management command %s must not load a matcher engine", command)
+		}
+	}
+	if !commandNeedsLegacyBannerMatcher(nil) {
+		t.Fatal("interactive mode must retain v1 banner compatibility")
+	}
+}
+
 func TestLogicalScanTaskRunExecutorRoutesIPRuns(t *testing.T) {
 	originalTargetRun := runTargetTaskRun
 	t.Cleanup(func() { runTargetTaskRun = originalTargetRun })
@@ -266,7 +282,7 @@ func openLogicalScanTaskRunTestDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { _ = db.Close() })
 	for _, statement := range []string{
 		`CREATE TABLE scan_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, scan_type TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, cron TEXT, timezone TEXT, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT (datetime('now')), updated_at DATETIME NOT NULL DEFAULT (datetime('now')), archived_at DATETIME)`,
-		`CREATE TABLE scan_task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_task_id INTEGER NOT NULL, sequence INTEGER NOT NULL, scheduled_for DATETIME NOT NULL, status TEXT NOT NULL, target TEXT NOT NULL, scan_type TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', error_message TEXT, report_path TEXT, report_error TEXT, started_at DATETIME, finished_at DATETIME, snapshot_written_at DATETIME, created_at DATETIME NOT NULL DEFAULT (datetime('now')), updated_at DATETIME NOT NULL DEFAULT (datetime('now')), UNIQUE(scan_task_id, sequence), UNIQUE(scan_task_id, scheduled_for))`,
+		`CREATE TABLE scan_task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_task_id INTEGER NOT NULL, sequence INTEGER NOT NULL, scheduled_for DATETIME NOT NULL, status TEXT NOT NULL, target TEXT NOT NULL, scan_type TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', error_message TEXT, report_path TEXT, audit_report_path TEXT, report_error TEXT, started_at DATETIME, finished_at DATETIME, snapshot_written_at DATETIME, created_at DATETIME NOT NULL DEFAULT (datetime('now')), updated_at DATETIME NOT NULL DEFAULT (datetime('now')), UNIQUE(scan_task_id, sequence), UNIQUE(scan_task_id, scheduled_for))`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatalf("create scan task run test schema: %v", err)

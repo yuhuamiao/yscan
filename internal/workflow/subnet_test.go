@@ -4,17 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
-	"net"
-	"net/http"
-	"os"
-	"path/filepath"
 	"reflect"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
 
-	"golandproject/yscan/internal/fingerprint"
 	"golandproject/yscan/internal/model"
 	"golandproject/yscan/internal/pipeline"
 	"golandproject/yscan/internal/storage"
@@ -35,7 +29,6 @@ func openWorkflowDB(t *testing.T) *sql.DB {
 		`CREATE TABLE host_inventory_scopes (scope TEXT NOT NULL, ip TEXT NOT NULL, first_seen DATETIME NOT NULL, last_seen DATETIME NOT NULL, last_checked DATETIME NOT NULL, is_active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (scope, ip))`,
 		`CREATE TABLE host_inventory_scope_ports (scope TEXT NOT NULL, ip TEXT NOT NULL, port INTEGER NOT NULL, service_type TEXT NOT NULL, first_seen DATETIME NOT NULL, last_seen DATETIME NOT NULL, last_checked DATETIME NOT NULL, is_active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (scope, ip, port))`,
 		`CREATE TABLE task_change_summaries (task_id INTEGER PRIMARY KEY, target TEXT NOT NULL, summary_json TEXT NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)`,
-		`CREATE TABLE asset_fingerprints (ip TEXT NOT NULL, port INTEGER NOT NULL, protocol TEXT NOT NULL, rule_id TEXT NOT NULL, source_id TEXT NOT NULL, vendor TEXT, product TEXT NOT NULL, version TEXT, cpe TEXT, confidence INTEGER NOT NULL, evidence_json TEXT NOT NULL, first_seen DATETIME, last_seen DATETIME, PRIMARY KEY (ip, port, protocol, rule_id, source_id))`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
@@ -397,9 +390,6 @@ func TestRunSubnetTaskRunBuildsImmutableSnapshotWithoutScopeBaseline(t *testing.
 				TargetPort: 443,
 			}}, nil
 		},
-		collectFingerprints: func(context.Context, *sql.DB, string, []model.ScanResult) ([]model.AssetFingerprint, error) {
-			return nil, nil
-		},
 	})
 	if err != nil {
 		t.Fatalf("run subnet task run: %v", err)
@@ -418,212 +408,145 @@ func TestRunSubnetTaskRunBuildsImmutableSnapshotWithoutScopeBaseline(t *testing.
 	}
 }
 
-func TestPlannedValidationKeepsFingerprintCandidatesOnMatchedPort(t *testing.T) {
+func TestRunSubnetTaskRunUsesConfiguredPortSpecAndReturnsPartialOnCancel(t *testing.T) {
 	db := openWorkflowDB(t)
-	const ip = "192.168.71.1"
-	if err := storage.UpsertAssetFingerprints(db, []model.AssetFingerprint{{IP: ip, Port: 443, Protocol: "https", RuleID: "nginx-rule", SourceID: "test", Product: "nginx", Confidence: 90, Evidence: []model.FingerprintEvidence{{Target: "header", Operator: "contains", Pattern: "nginx", Summary: "server contains nginx"}}}}); err != nil {
-		t.Fatalf("seed fingerprint: %v", err)
-	}
-	root := t.TempDir()
-	data := "id: nginx-test\ninfo:\n  name: nginx test\n  severity: medium\n  tags: nginx\nhttp:\n  - method: GET\n    path:\n      - '{{BaseURL}}'\n"
-	if err := os.WriteFile(filepath.Join(root, "nginx.yaml"), []byte(data), 0600); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
-	ports := []model.ScanResult{{Address: ip + ":80", Open: true, Service: "http"}, {Address: ip + ":443", Open: true, Service: "https"}}
-	var exactPorts, fallbackPorts []int
-	current := []model.AssetFingerprint{{IP: ip, Port: 443, Protocol: "https", RuleID: "nginx-rule", SourceID: "test", Product: "nginx", Confidence: 90, Evidence: []model.FingerprintEvidence{{Target: "header", Operator: "contains", Pattern: "nginx", Summary: "server contains nginx"}}}}
-	_, candidates, err := runPlannedValidation(context.Background(), ip, ports, current, root,
-		func(_ context.Context, _ string, received []model.ScanResult, _ string, _ []string) ([]model.NucleiFinding, error) {
-			fallbackPorts = append(fallbackPorts, portNumber(t, received))
+	canceled := false
+	selectedHosts := make([]string, 0, 1)
+	snapshot, err := runSubnetTaskRun(context.Background(), SubnetTaskRunOptions{
+		DB:            db,
+		Run:           model.ScanTaskRun{ID: 72, ScanTaskID: 8, ScanType: model.ScanTypeSubnet, Target: "192.168.72.0/24", Config: model.ScanTaskConfig{PortSpec: "80,443"}},
+		CheckCanceled: func() (bool, error) { return canceled, nil },
+	}, subnetDependencies{
+		discover: func(context.Context, string, pipeline.SubnetDiscoveryOptions) ([]string, error) {
+			return []string{"192.168.72.1", "192.168.72.2"}, nil
+		},
+		scanHost: func(context.Context, string, string) ([]model.ScanResult, error) {
+			t.Fatal("baseline scan must not run for explicit port_spec")
 			return nil, nil
 		},
-		func(_ context.Context, _ string, received []model.ScanResult, _ string, _ []string) ([]model.NucleiFinding, error) {
-			exactPorts = append(exactPorts, portNumber(t, received))
+		scanSelected: func(_ context.Context, ip, _ string, ports []int) ([]model.ScanResult, error) {
+			if !reflect.DeepEqual(ports, []int{80, 443}) {
+				t.Fatalf("selected ports=%v", ports)
+			}
+			selectedHosts = append(selectedHosts, ip)
+			canceled = true
+			return []model.ScanResult{{Address: ip + ":443", Open: true, Service: "https"}}, nil
+		},
+		runNuclei: func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
 			return nil, nil
 		},
-	)
-	if err != nil {
-		t.Fatalf("planned validation: %v", err)
+	})
+	if !errors.Is(err, ErrCanceled) || !reflect.DeepEqual(selectedHosts, []string{"192.168.72.1"}) {
+		t.Fatalf("selected hosts=%v err=%v", selectedHosts, err)
 	}
-	if !reflect.DeepEqual(exactPorts, []int{443}) || !reflect.DeepEqual(fallbackPorts, []int{80}) {
-		t.Fatalf("exact ports=%v fallback ports=%v", exactPorts, fallbackPorts)
-	}
-	matched := false
-	for _, candidate := range candidates {
-		if candidate.TemplateID == "nginx-test" {
-			matched = true
-		}
-	}
-	if !matched {
-		t.Fatalf("fingerprint candidate missing: %#v", candidates)
-	}
-	_, staleCandidates, err := runPlannedValidation(context.Background(), ip, ports, nil, root,
-		func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
-			return nil, nil
-		},
-		func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
-			t.Fatal("historical fingerprint must not execute exact template")
-			return nil, nil
-		},
-	)
-	if err != nil {
-		t.Fatalf("plan without current evidence: %v", err)
-	}
-	for _, candidate := range staleCandidates {
-		if candidate.TemplateID == "nginx-test" {
-			t.Fatalf("historical candidate leaked: %#v", staleCandidates)
-		}
+	if len(snapshot.Ports) != 1 || snapshot.Ports[0].IP != "192.168.72.1" || snapshot.Ports[0].Port != 443 {
+		t.Fatalf("partial snapshot=%#v", snapshot)
 	}
 }
 
-func TestCollectRunFingerprintsPersistsCurrentPortEvidence(t *testing.T) {
+func TestRunSubnetTaskRunReturnsCurrentHostFingerprintPartialOnCancellation(t *testing.T) {
 	db := openWorkflowDB(t)
-	const ip = "192.168.72.1"
-	ports := []model.ScanResult{{Address: ip + ":6379", Open: true, Service: "redis", Banner: "-ERR operation not permitted\r\n"}}
-	if _, err := collectRunFingerprints(context.Background(), db, ip, ports); err != nil {
-		t.Fatalf("collect fingerprints: %v", err)
-	}
-	fingerprints, err := storage.ListAssetFingerprints(db, storage.AssetFingerprintQuery{IP: ip, Port: 6379, Protocol: "tcp"})
-	if err != nil || len(fingerprints) != 1 || fingerprints[0].Product != "redis" {
-		t.Fatalf("fingerprints=%#v err=%v", fingerprints, err)
-	}
-}
-
-func TestRunSubnetTaskRunUsesFingerprintForUnknownService(t *testing.T) {
-	db := openWorkflowDB(t)
-	root := t.TempDir()
-	data := "id: nginx-network\ninfo:\n  name: nginx network\n  severity: medium\n  tags: nginx\ntcp:\n  - host:\n      - '{{Hostname}}'\n    port: 8443\n"
-	if err := os.WriteFile(filepath.Join(root, "nginx.yaml"), []byte(data), 0600); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
-	const ip = "192.168.73.1"
-	var exactPorts []int
-	fallbackCalls := 0
-	_, err := runSubnetTaskRun(context.Background(), SubnetTaskRunOptions{DB: db, Run: model.ScanTaskRun{ID: 73, ScanTaskID: 7, ScanType: model.ScanTypeSubnet, Target: "192.168.73.0/24", Config: model.ScanTaskConfig{VulnerabilityOn: true, NucleiTemplates: root}}}, subnetDependencies{
+	const ip = "192.168.74.1"
+	snapshot, err := runSubnetTaskRun(context.Background(), SubnetTaskRunOptions{
+		DB:  db,
+		Run: model.ScanTaskRun{ID: 74, ScanTaskID: 8, ScanType: model.ScanTypeSubnet, Target: "192.168.74.0/24"},
+	}, subnetDependencies{
 		discover: func(context.Context, string, pipeline.SubnetDiscoveryOptions) ([]string, error) {
 			return []string{ip}, nil
 		},
 		scanHost: func(context.Context, string, string) ([]model.ScanResult, error) {
-			return []model.ScanResult{{Address: ip + ":8443", Open: true, Service: "unknown"}}, nil
+			return []model.ScanResult{{Address: ip + ":9090", Open: true, Service: "unknown"}}, nil
 		},
-		collectFingerprints: func(_ context.Context, database *sql.DB, _ string, _ []model.ScanResult) ([]model.AssetFingerprint, error) {
-			records := []model.AssetFingerprint{{IP: ip, Port: 8443, Protocol: "tcp", RuleID: "nginx-rule", SourceID: "test", Product: "nginx", Confidence: 90, Evidence: []model.FingerprintEvidence{{Target: "banner", Operator: "contains", Pattern: "nginx", Summary: "nginx banner"}}}}
-			return records, storage.UpsertAssetFingerprints(database, records)
+		collectFingerprints: func(_ context.Context, _ *sql.DB, _ model.ScanTaskRun, _ string, results []model.ScanResult) ([]model.ScanResult, []model.FingerprintRunMatch, error) {
+			results[0].Service = "http"
+			results[0].Product = "partial-subnet-product"
+			return results, []model.FingerprintRunMatch{{IP: ip, Port: 9090, Protocol: "http", Product: "partial-subnet-product"}}, context.Canceled
 		},
 		runNuclei: func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
-			fallbackCalls++
-			return nil, nil
-		},
-		runNucleiPaths: func(_ context.Context, _ string, ports []model.ScanResult, _ string, _ []string) ([]model.NucleiFinding, error) {
-			exactPorts = append(exactPorts, portNumber(t, ports))
 			return nil, nil
 		},
 	})
-	if err != nil {
-		t.Fatalf("run subnet task run: %v", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want context.Canceled", err)
 	}
-	if !reflect.DeepEqual(exactPorts, []int{8443}) || fallbackCalls != 0 {
-		t.Fatalf("exact ports=%v fallback calls=%d", exactPorts, fallbackCalls)
-	}
-}
-
-func TestShouldCollectHTTPEvidenceForUnknownNonStandardPort(t *testing.T) {
-	if !shouldCollectHTTPEvidence(8443, "unknown") {
-		t.Fatal("unknown non-standard service must receive bounded HTTP probe")
-	}
-	if shouldCollectHTTPEvidence(6379, "redis") {
-		t.Fatal("identified non-HTTP service must not receive HTTP probe")
+	if len(snapshot.Hosts) != 1 || snapshot.Hosts[0].IP != ip || len(snapshot.Ports) != 1 || snapshot.Ports[0].Port != 9090 || snapshot.Ports[0].Product != "partial-subnet-product" || len(snapshot.FingerprintMatches) != 1 {
+		t.Fatalf("subnet fingerprint cancellation partial snapshot=%#v", snapshot)
 	}
 }
 
-func TestHTTPS8443EvidenceFlowsToExactTemplateCandidate(t *testing.T) {
+func TestRunSubnetTaskRunKeepsCurrentHostPortsWhenScannerFails(t *testing.T) {
 	db := openWorkflowDB(t)
-	root := t.TempDir()
-	data := "id: thinkphp-test\ninfo:\n  name: thinkphp test\n  severity: medium\n  tags: thinkphp\nhttp:\n  - method: GET\n    path:\n      - '{{BaseURL}}'\n"
-	if err := os.WriteFile(filepath.Join(root, "thinkphp.yaml"), []byte(data), 0600); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
-	const ip = "192.168.74.1"
-	ports := []model.ScanResult{{Address: ip + ":8443", Open: true, Service: "https"}}
-	collector := func(_ context.Context, target string, _ fingerprint.HTTPEvidenceOptions) (fingerprint.HTTPEvidence, error) {
-		if target != "https://"+ip+":8443" {
-			t.Fatalf("HTTPS target = %q", target)
-		}
-		return fingerprint.HTTPEvidence{Headers: http.Header{"X-Powered-By": []string{"thinkphp"}}, HeaderText: "X-Powered-By: thinkphp\n", BodySummary: "thinkphp"}, nil
-	}
-	rules := []fingerprint.Rule{{ID: "https-test", SourceID: "test", Product: fingerprint.ProductIdentity{Name: "thinkphp"}, Protocols: []fingerprint.Protocol{fingerprint.ProtocolHTTPS}, MatchMode: fingerprint.MatchAll, Matchers: []fingerprint.Matcher{{Target: fingerprint.EvidenceHeader, Operator: fingerprint.MatchContains, Pattern: "thinkphp", CaseInsensitive: true}, {Target: fingerprint.EvidenceBody, Operator: fingerprint.MatchContains, Pattern: "thinkphp", CaseInsensitive: true}}}}
-	current, err := collectRunFingerprintsWithRules(context.Background(), db, ip, ports, rules, collector)
-	if err != nil {
-		t.Fatalf("collect fingerprints: %v", err)
-	}
-	fingerprints, err := storage.ListAssetFingerprints(db, storage.AssetFingerprintQuery{IP: ip, Port: 8443, Protocol: "https"})
-	if err != nil || len(fingerprints) == 0 || fingerprints[0].Product != "thinkphp" {
-		t.Fatalf("HTTPS fingerprints=%#v err=%v", fingerprints, err)
-	}
-	var exactPorts []int
-	_, candidates, err := runPlannedValidation(context.Background(), ip, ports, current, root,
-		func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
-			t.Fatal("service fallback must not run")
-			return nil, nil
-		},
-		func(_ context.Context, _ string, received []model.ScanResult, _ string, _ []string) ([]model.NucleiFinding, error) {
-			exactPorts = append(exactPorts, portNumber(t, received))
-			return nil, nil
-		},
-	)
-	if err != nil || !reflect.DeepEqual(exactPorts, []int{8443}) || len(candidates) != 1 || candidates[0].TemplateID != "thinkphp-test" {
-		t.Fatalf("ports=%v candidates=%#v err=%v", exactPorts, candidates, err)
-	}
-}
-
-func TestHTTPFailureRetainsUnknownServiceBannerForExactCandidate(t *testing.T) {
-	db := openWorkflowDB(t)
-	root := t.TempDir()
-	data := "id: redis-network\ninfo:\n  name: redis network\n  severity: medium\n  tags: redis\ntcp:\n  - host:\n      - '{{Hostname}}'\n    port: 6379\n"
-	if err := os.WriteFile(filepath.Join(root, "redis.yaml"), []byte(data), 0600); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
 	const ip = "192.168.75.1"
-	ports := []model.ScanResult{{Address: ip + ":6379", Open: true, Service: "unknown", Banner: "redis_version:7.2"}}
-	rules := []fingerprint.Rule{{ID: "redis-banner", SourceID: "test", Product: fingerprint.ProductIdentity{Name: "redis"}, Protocols: []fingerprint.Protocol{fingerprint.ProtocolTCP}, Matchers: []fingerprint.Matcher{{Target: fingerprint.EvidenceBanner, Operator: fingerprint.MatchContains, Pattern: "redis"}}}}
-	current, err := collectRunFingerprintsWithRules(context.Background(), db, ip, ports, rules, func(context.Context, string, fingerprint.HTTPEvidenceOptions) (fingerprint.HTTPEvidence, error) {
-		return fingerprint.HTTPEvidence{}, errors.New("HTTP probe unavailable")
+	scanErr := errors.New("scanner stopped after partial read")
+	snapshot, err := runSubnetTaskRun(context.Background(), SubnetTaskRunOptions{
+		DB: db, Run: model.ScanTaskRun{ID: 75, ScanTaskID: 8, ScanType: model.ScanTypeSubnet, Target: "192.168.75.0/24"},
+	}, subnetDependencies{
+		discover: func(context.Context, string, pipeline.SubnetDiscoveryOptions) ([]string, error) {
+			return []string{ip}, nil
+		},
+		scanHost: func(context.Context, string, string) ([]model.ScanResult, error) {
+			return []model.ScanResult{{Address: ip + ":3306", Open: true, Service: "mysql"}}, scanErr
+		},
+		runNuclei: func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
+			return nil, nil
+		},
 	})
-	if err != nil {
-		t.Fatalf("collect banner fallback: %v", err)
+	if !errors.Is(err, scanErr) {
+		t.Fatalf("error=%v, want %v", err, scanErr)
 	}
-	fingerprints, err := storage.ListAssetFingerprints(db, storage.AssetFingerprintQuery{IP: ip, Port: 6379, Protocol: "tcp"})
-	if err != nil || len(fingerprints) != 1 || fingerprints[0].Confidence != 70 {
-		t.Fatalf("banner fingerprints=%#v err=%v", fingerprints, err)
-	}
-	var exactPorts []int
-	_, candidates, err := runPlannedValidation(context.Background(), ip, ports, current, root,
-		func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
-			t.Fatal("service fallback must not run")
-			return nil, nil
-		},
-		func(_ context.Context, _ string, received []model.ScanResult, _ string, _ []string) ([]model.NucleiFinding, error) {
-			exactPorts = append(exactPorts, portNumber(t, received))
-			return nil, nil
-		},
-	)
-	if err != nil || !reflect.DeepEqual(exactPorts, []int{6379}) || len(candidates) != 1 || candidates[0].TemplateID != "redis-network" {
-		t.Fatalf("ports=%v candidates=%#v err=%v", exactPorts, candidates, err)
+	if len(snapshot.Hosts) != 1 || snapshot.Hosts[0].IP != ip || len(snapshot.Ports) != 1 || snapshot.Ports[0].Port != 3306 {
+		t.Fatalf("scanner partial snapshot=%#v", snapshot)
 	}
 }
 
-func portNumber(t *testing.T, ports []model.ScanResult) int {
-	t.Helper()
-	if len(ports) != 1 {
-		t.Fatalf("received ports = %#v", ports)
+func TestRunSubnetTaskRunKeepsObservationsWhenNucleiFails(t *testing.T) {
+	db := openWorkflowDB(t)
+	const ip = "192.168.76.1"
+	nucleiErr := errors.New("nuclei fixture failed")
+	snapshot, err := runSubnetTaskRun(context.Background(), SubnetTaskRunOptions{
+		DB:  db,
+		Run: model.ScanTaskRun{ID: 76, ScanTaskID: 8, ScanType: model.ScanTypeSubnet, Target: "192.168.76.0/24", Config: model.ScanTaskConfig{VulnerabilityOn: true}},
+	}, subnetDependencies{
+		discover: func(context.Context, string, pipeline.SubnetDiscoveryOptions) ([]string, error) {
+			return []string{ip, "192.168.76.2"}, nil
+		},
+		scanHost: func(_ context.Context, host, _ string) ([]model.ScanResult, error) {
+			return []model.ScanResult{{Address: host + ":6379", Open: true, Service: "redis"}}, nil
+		},
+		collectFingerprints: func(_ context.Context, _ *sql.DB, _ model.ScanTaskRun, host string, results []model.ScanResult) ([]model.ScanResult, []model.FingerprintRunMatch, error) {
+			results[0].Product = "redis"
+			return results, []model.FingerprintRunMatch{{IP: host, Port: 6379, Protocol: "tcp", Product: "redis", Soft: true}}, nil
+		},
+		runNuclei: func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
+			return []model.NucleiFinding{{TemplateID: "redis-partial", TargetIP: ip, TargetPort: 6379}}, nucleiErr
+		},
+	})
+	if !errors.Is(err, nucleiErr) {
+		t.Fatalf("error=%v, want %v", err, nucleiErr)
 	}
-	_, port, err := net.SplitHostPort(ports[0].Address)
-	if err != nil {
-		t.Fatalf("split port: %v", err)
+	if len(snapshot.Ports) != 1 || snapshot.Ports[0].IP != ip || len(snapshot.FingerprintMatches) != 1 {
+		t.Fatalf("nuclei failure lost observations: %#v", snapshot)
 	}
-	var number int
-	if _, err := fmt.Sscanf(port, "%d", &number); err != nil {
-		t.Fatalf("parse port: %v", err)
+	if len(snapshot.Vulnerabilities) != 1 || snapshot.Vulnerabilities[0].TemplateID != "redis-partial" || len(snapshot.TemplateCandidates) == 0 {
+		t.Fatalf("nuclei failure lost validation partials: %#v", snapshot)
 	}
-	return number
+	if snapshot.Validation.Status != model.ScanTaskRunValidationFailed || snapshot.Validation.Error == "" || snapshot.Validation.FindingCount != 1 {
+		t.Fatalf("nuclei failure validation state=%#v", snapshot.Validation)
+	}
+}
+
+func TestTemplateCandidateCoverageUsesStructuredProtocolNotReason(t *testing.T) {
+	port := model.ScanResult{Address: "192.168.73.1:443", Open: true, Service: "https"}
+	tcpCandidate := model.ScanTaskRunTemplateCandidate{TemplateID: "fixture", Path: "fixture.yaml", Source: "fingerprint_mapping", Reason: "arbitrary changed display text", IP: "192.168.73.1", Port: 443, Protocol: "tcp"}
+	if remaining := portsWithoutFingerprintMappings([]model.ScanResult{port}, []model.ScanTaskRunTemplateCandidate{tcpCandidate}); len(remaining) != 1 {
+		t.Fatal("TCP candidate must not suppress HTTPS fallback on the same port")
+	}
+	httpsCandidate := tcpCandidate
+	httpsCandidate.Protocol = "https"
+	if remaining := portsWithoutFingerprintMappings([]model.ScanResult{port}, []model.ScanTaskRunTemplateCandidate{httpsCandidate}); len(remaining) != 0 {
+		t.Fatal("structured HTTPS candidate did not suppress its own endpoint fallback")
+	}
+	if unique := uniqueTemplateCandidates([]model.ScanTaskRunTemplateCandidate{tcpCandidate, httpsCandidate}); len(unique) != 2 {
+		t.Fatalf("same template on distinct protocols collapsed: %#v", unique)
+	}
 }

@@ -86,7 +86,7 @@ func TestExecutorCancellationRequestWinsBeforeTerminalUpdate(t *testing.T) {
 		if _, err := db.Exec(`UPDATE scan_task_runs SET status = ? WHERE id = ?`, model.ScanTaskRunStatusCancelRequested, received.ID); err != nil {
 			t.Fatalf("request cancellation: %v", err)
 		}
-		return model.ScanTaskRunSnapshot{}, nil
+		return model.ScanTaskRunSnapshot{Hosts: []model.ScanTaskRunHost{{IP: "192.168.10.8", IsActive: true}}}, nil
 	}))
 
 	if err := executor.ExecuteRun(context.Background(), run.ID); err != nil {
@@ -95,6 +95,10 @@ func TestExecutorCancellationRequestWinsBeforeTerminalUpdate(t *testing.T) {
 	completed, err := storage.GetScanTaskRun(db, run.ID)
 	if err != nil || completed.Status != model.ScanTaskRunStatusCanceled {
 		t.Fatalf("canceled run = %#v, error = %v", completed, err)
+	}
+	snapshot, err := storage.GetScanTaskRunSnapshot(db, run.ID)
+	if err != nil || len(snapshot.Hosts) != 1 || snapshot.Hosts[0].IP != "192.168.10.8" {
+		t.Fatalf("canceled snapshot = %#v, error = %v", snapshot, err)
 	}
 }
 
@@ -183,13 +187,36 @@ func TestExecutorKeepsQueuedRunWhenGlobalSlotIsOccupied(t *testing.T) {
 	}
 }
 
+func TestExecutorPersistsPartialSnapshotBeforeFailedTerminalState(t *testing.T) {
+	db := openExecutorTestDB(t)
+	task := createRunnerTask(t, db, "192.168.10.0/24", "2026-07-24 00:00:00")
+	run, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-07-24T02:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := NewExecutor(db, ScanTaskRunExecutorFunc(func(context.Context, model.ScanTaskRun) (model.ScanTaskRunSnapshot, error) {
+		return model.ScanTaskRunSnapshot{Hosts: []model.ScanTaskRunHost{{IP: "192.168.10.7", IsActive: true}}}, errors.New("nuclei failed")
+	}))
+	if err := executor.ExecuteRun(context.Background(), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := storage.GetScanTaskRun(db, run.ID)
+	if err != nil || completed.Status != model.ScanTaskRunStatusFailed || completed.SnapshotWrittenAt == "" {
+		t.Fatalf("completed=%#v err=%v", completed, err)
+	}
+	snapshot, err := storage.GetScanTaskRunSnapshot(db, run.ID)
+	if err != nil || len(snapshot.Hosts) != 1 || snapshot.Hosts[0].IP != "192.168.10.7" {
+		t.Fatalf("partial snapshot=%#v err=%v", snapshot, err)
+	}
+}
+
 func openExecutorTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db := openRunnerTestDB(t)
 	for _, statement := range []string{
 		`CREATE TABLE scan_task_run_hosts (scan_task_run_id INTEGER NOT NULL, ip TEXT NOT NULL, is_active INTEGER NOT NULL, PRIMARY KEY(scan_task_run_id, ip))`,
 		`CREATE TABLE scan_task_run_ports (scan_task_run_id INTEGER NOT NULL, ip TEXT NOT NULL, port INTEGER NOT NULL, service_type TEXT NOT NULL, product TEXT, banner TEXT, PRIMARY KEY(scan_task_run_id, ip, port))`,
-		`CREATE TABLE scan_task_run_vulnerabilities (scan_task_run_id INTEGER NOT NULL, finding_key TEXT NOT NULL, template_id TEXT, name TEXT, severity TEXT, target TEXT NOT NULL, target_ip TEXT, target_port INTEGER, matched_at TEXT, evidence TEXT, PRIMARY KEY(scan_task_run_id, finding_key))`,
+		`CREATE TABLE scan_task_run_vulnerabilities (scan_task_run_id INTEGER NOT NULL, finding_key TEXT NOT NULL, template_id TEXT, name TEXT, severity TEXT, target TEXT NOT NULL, target_ip TEXT, target_port INTEGER, matched_at TEXT, description TEXT, evidence TEXT, PRIMARY KEY(scan_task_run_id, finding_key))`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatalf("create executor schema: %v", err)

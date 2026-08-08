@@ -33,3 +33,15 @@ go.work.sum
 
 # Linux build artifacts
 yscan
+
+# Local runtime state
+/asm.db
+/reports/
+
+# Local agent and design documents
+/AGENTS.md
+/产品调研.md
+/技术设计方案.md
+/技术设计方案-v2.md
+/指纹规则基线-fixtures-v2.md
+/项目评审准则.md

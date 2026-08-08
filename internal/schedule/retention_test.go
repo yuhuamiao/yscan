@@ -50,7 +50,7 @@ func TestRetentionPrunesExpiredTerminalRunsAndKeepsBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prune retention: %v", err)
 	}
-	if result != (RetentionResult{DeletedRuns: 4, DeletedReports: 3}) {
+	if result != (RetentionResult{DeletedRuns: 4, DeletedReports: 6}) {
 		t.Fatalf("retention result = %#v", result)
 	}
 
@@ -69,12 +69,12 @@ func TestRetentionPrunesExpiredTerminalRunsAndKeepsBaseline(t *testing.T) {
 			t.Fatalf("logical task %d was deleted: %v", taskID, err)
 		}
 	}
-	for _, path := range []string{oldSuccessReport, oldFailedReport, oldCanceledReport} {
+	for _, path := range retentionReportPairs(oldSuccessReport, oldFailedReport, oldCanceledReport) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("expired report %s remains, error = %v", path, err)
 		}
 	}
-	for _, path := range []string{oldBaselineReport, freshReport, activeReport} {
+	for _, path := range retentionReportPairs(oldBaselineReport, freshReport, activeReport) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("protected report %s missing: %v", path, err)
 		}
@@ -170,16 +170,31 @@ func createRetentionRun(t *testing.T, db *sql.DB, taskID int64, scheduledFor, st
 			t.Fatalf("save retention snapshot: %v", err)
 		}
 	}
+	auditReportPath := ""
+	if reportPath != "" {
+		auditReportPath = reportPath + ".audit"
+		if err := os.WriteFile(auditReportPath, []byte("retention audit report\n"), 0600); err != nil {
+			t.Fatalf("write retention audit report: %v", err)
+		}
+	}
 	if status == model.ScanTaskRunStatusRunning {
-		if _, err := db.Exec(`UPDATE scan_task_runs SET report_path = ? WHERE id = ?`, reportPath, run.ID); err != nil {
+		if _, err := db.Exec(`UPDATE scan_task_runs SET report_path = ?, audit_report_path = ? WHERE id = ?`, reportPath, auditReportPath, run.ID); err != nil {
 			t.Fatalf("set active report path: %v", err)
 		}
 		return run
 	}
-	if _, err := db.Exec(`UPDATE scan_task_runs SET status = ?, finished_at = ?, report_path = ? WHERE id = ?`, status, scheduledFor, reportPath, run.ID); err != nil {
+	if _, err := db.Exec(`UPDATE scan_task_runs SET status = ?, finished_at = ?, report_path = ?, audit_report_path = ? WHERE id = ?`, status, scheduledFor, reportPath, auditReportPath, run.ID); err != nil {
 		t.Fatalf("finish retention run: %v", err)
 	}
 	return run
+}
+
+func retentionReportPairs(paths ...string) []string {
+	result := make([]string, 0, len(paths)*2)
+	for _, path := range paths {
+		result = append(result, path, path+".audit")
+	}
+	return result
 }
 
 func writeRetentionReport(t *testing.T, directory, name string) string {

@@ -16,7 +16,7 @@ func Handler() http.Handler {
 			return
 		}
 		switch r.URL.Path {
-		case "/", "/tasks", "/executions", "/assets", "/reports":
+		case "/", "/tasks", "/executions", "/assets", "/reports", "/fingerprints":
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-store")
 			_, _ = w.Write(indexHTML)

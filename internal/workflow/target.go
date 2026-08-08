@@ -40,20 +40,32 @@ func (executor TargetTaskRunExecutor) Execute(ctx context.Context, run model.Sca
 }
 
 type targetDependencies struct {
-	scanHost            func(context.Context, string, string) ([]model.ScanResult, error)
+	scanHost            func(context.Context, string, string) (scan.PortScanOutcome, error)
+	scanSelected        func(context.Context, string, string, []int) (scan.PortScanOutcome, error)
+	collectFingerprints func(context.Context, *sql.DB, model.ScanTaskRun, string, []model.ScanResult) ([]model.ScanResult, []model.FingerprintRunMatch, error)
 	runNuclei           func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error)
-	runNucleiPaths      func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error)
-	collectFingerprints func(context.Context, *sql.DB, string, []model.ScanResult) ([]model.AssetFingerprint, error)
+	executeNuclei       func(context.Context, string, []model.ScanResult, string, []string) vuln.NucleiExecutionResult
 }
 
 // RunTargetTaskRun collects the observations for one IP run without reading
 // inventory state as a Diff baseline.
 func RunTargetTaskRun(ctx context.Context, options TargetTaskRunOptions) (model.ScanTaskRunSnapshot, error) {
+	if options.DB == nil {
+		return model.ScanTaskRunSnapshot{}, errors.New("target task run database is required")
+	}
+	if options.Run.ID <= 0 || options.Run.ScanTaskID <= 0 || options.Run.ScanType != model.ScanTypeIP {
+		return model.ScanTaskRunSnapshot{}, errors.New("invalid IP scan task run")
+	}
+	collector, err := newRunFingerprintCollector(options.DB, options.Run)
+	if err != nil {
+		return model.ScanTaskRunSnapshot{}, err
+	}
 	return runTargetTaskRun(ctx, options, targetDependencies{
-		scanHost:            scan.RunQuick,
+		scanHost:            scan.RunDiscoveryWithOutcome,
+		scanSelected:        scan.RunSelectedDiscoveryWithOutcome,
+		collectFingerprints: collector,
 		runNuclei:           vuln.RunNucleiForOpenPortsWithTags,
-		runNucleiPaths:      vuln.RunNucleiForOpenPortsWithTemplatePaths,
-		collectFingerprints: collectRunFingerprints,
+		executeNuclei:       vuln.ExecuteNucleiForOpenPortsWithTags,
 	})
 }
 
@@ -71,13 +83,7 @@ func runTargetTaskRun(ctx context.Context, options TargetTaskRunOptions, depende
 	if strings.TrimSpace(options.Network) == "" {
 		options.Network = "tcp"
 	}
-	if dependencies.runNucleiPaths == nil {
-		dependencies.runNucleiPaths = vuln.RunNucleiForOpenPortsWithTemplatePaths
-	}
-	if dependencies.collectFingerprints == nil {
-		dependencies.collectFingerprints = collectRunFingerprints
-	}
-	if dependencies.scanHost == nil || dependencies.runNuclei == nil {
+	if dependencies.scanHost == nil || (dependencies.runNuclei == nil && dependencies.executeNuclei == nil) {
 		return model.ScanTaskRunSnapshot{}, errors.New("target task run dependencies are required")
 	}
 	if err := checkCanceled(ctx, options.CheckCanceled); err != nil {
@@ -88,52 +94,104 @@ func runTargetTaskRun(ctx context.Context, options TargetTaskRunOptions, depende
 	}
 
 	target := ip.String()
-	openPorts, err := dependencies.scanHost(ctx, target, options.Network)
+	configuredPorts, err := scan.ParsePortSpec(options.Run.Config.PortSpec)
 	if err != nil {
-		return model.ScanTaskRunSnapshot{}, err
+		return model.ScanTaskRunSnapshot{}, fmt.Errorf("invalid run port_spec: %w", err)
 	}
+	budget := scan.FullPortScanWorstCaseBudget()
+	if len(configuredPorts) > 0 {
+		budget = scan.SelectedPortScanWorstCaseBudget(len(configuredPorts))
+	}
+	discoveryCtx, cancelDiscovery := context.WithTimeout(ctx, budget)
+	var outcome scan.PortScanOutcome
+	if len(configuredPorts) > 0 {
+		if dependencies.scanSelected == nil {
+			cancelDiscovery()
+			return model.ScanTaskRunSnapshot{}, errors.New("selected port scan dependency is required")
+		}
+		outcome, err = dependencies.scanSelected(discoveryCtx, target, options.Network, configuredPorts)
+	} else {
+		outcome, err = dependencies.scanHost(discoveryCtx, target, options.Network)
+	}
+	cancelDiscovery()
+	if err != nil {
+		return partialTargetSnapshot(options.Run.ID, target, outcome.Results, options.Run.Config.VulnerabilityOn), err
+	}
+	if !outcome.Complete() {
+		return partialTargetSnapshot(options.Run.ID, target, outcome.Results, options.Run.Config.VulnerabilityOn), fmt.Errorf("incomplete port scan: attempted %d of %d ports", outcome.AttemptedPorts, outcome.TotalPorts)
+	}
+	openPorts := outcome.Results
 	if err := checkCanceled(ctx, options.CheckCanceled); err != nil {
-		return model.ScanTaskRunSnapshot{}, err
+		return partialTargetSnapshot(options.Run.ID, target, openPorts, options.Run.Config.VulnerabilityOn), err
+	}
+	fingerprintMatches := make([]model.FingerprintRunMatch, 0)
+	if dependencies.collectFingerprints != nil {
+		openPorts, fingerprintMatches, err = dependencies.collectFingerprints(ctx, options.DB, options.Run, target, openPorts)
+		if err != nil {
+			snapshot := partialTargetSnapshot(options.Run.ID, target, openPorts, options.Run.Config.VulnerabilityOn)
+			snapshot.FingerprintMatches = fingerprintMatches
+			return snapshot, err
+		}
 	}
 	active := len(snapshotPorts(target, openPorts)) > 0
+	snapshot := partialTargetSnapshot(options.Run.ID, target, openPorts, options.Run.Config.VulnerabilityOn)
+	snapshot.FingerprintMatches = fingerprintMatches
 	scope := "ip:" + target
 	if err := storage.SyncHostInventory(options.DB, scope, activeTargets(target, active)); err != nil {
-		return model.ScanTaskRunSnapshot{}, err
+		return snapshot, err
 	}
-	if err := storage.SyncOpenPorts(options.DB, target, openPorts); err != nil {
-		return model.ScanTaskRunSnapshot{}, err
+	coverage := storage.FullPortScanCoverage()
+	if len(configuredPorts) > 0 {
+		coverage = storage.SelectedPortScanCoverage(configuredPorts)
 	}
-	if err := storage.SyncScopeOpenPorts(options.DB, scope, target, openPorts); err != nil {
-		return model.ScanTaskRunSnapshot{}, err
+	if err := storage.SyncOpenPorts(options.DB, target, openPorts, coverage); err != nil {
+		return snapshot, err
+	}
+	if err := storage.SyncScopeOpenPorts(options.DB, scope, target, openPorts, coverage); err != nil {
+		return snapshot, err
 	}
 	if err := storage.DeactivateScopePortsForInactiveHosts(options.DB, scope); err != nil {
-		return model.ScanTaskRunSnapshot{}, err
-	}
-	// Evidence collection is intentionally non-blocking. A failed web probe
-	// leaves the existing service-tag validation path available for this port.
-	currentFingerprints, _ := dependencies.collectFingerprints(ctx, options.DB, target, openPorts)
-
-	snapshot := model.ScanTaskRunSnapshot{
-		RunID:           options.Run.ID,
-		Hosts:           make([]model.ScanTaskRunHost, 0, 1),
-		Ports:           uniqueSnapshotPorts(snapshotPorts(target, openPorts)),
-		Vulnerabilities: make([]model.ScanTaskRunVulnerability, 0),
-	}
-	if active {
-		snapshot.Hosts = append(snapshot.Hosts, model.ScanTaskRunHost{IP: target, IsActive: true})
+		return snapshot, err
 	}
 	if options.Run.Config.VulnerabilityOn {
-		findings, candidates, err := runPlannedValidation(ctx, target, openPorts, currentFingerprints, options.Run.Config.NucleiTemplates, dependencies.runNuclei, dependencies.runNucleiPaths)
-		if err != nil {
-			return model.ScanTaskRunSnapshot{}, err
+		validation := newRunValidationTracker()
+		mappingResult := runFingerprintMappingValidation(ctx, options.DB, options.Run, target, openPorts, fingerprintMatches, options.Run.Config.NucleiTemplates)
+		validation.observe(mappingResult)
+		snapshot.Vulnerabilities = uniqueSnapshotVulnerabilities(snapshotVulnerabilities(mappingResult.findings))
+		snapshot.TemplateCandidates = uniqueTemplateCandidates(mappingResult.candidates)
+		if mappingResult.err != nil && !errors.Is(mappingResult.err, vuln.ErrNoTemplates) {
+			validation.finish(&snapshot, mappingResult.err)
+			return snapshot, mappingResult.err
 		}
-		snapshot.Vulnerabilities = uniqueSnapshotVulnerabilities(snapshotVulnerabilities(findings))
-		snapshot.TemplateCandidates = uniqueTemplateCandidates(candidates)
+		fallbackResult := runServiceTagValidation(ctx, target, portsWithoutFingerprintMappings(openPorts, mappingResult.candidates), options.Run.Config.NucleiTemplates, nucleiExecutionDependency(dependencies.executeNuclei, dependencies.runNuclei))
+		validation.observe(fallbackResult)
+		allFindings := append(mappingResult.findings, fallbackResult.findings...)
+		allCandidates := append(mappingResult.candidates, fallbackResult.candidates...)
+		snapshot.Vulnerabilities = uniqueSnapshotVulnerabilities(snapshotVulnerabilities(allFindings))
+		snapshot.TemplateCandidates = uniqueTemplateCandidates(allCandidates)
+		if fallbackResult.err != nil && !errors.Is(fallbackResult.err, vuln.ErrNoTemplates) {
+			validation.finish(&snapshot, fallbackResult.err)
+			return snapshot, fallbackResult.err
+		}
+		validation.finish(&snapshot, nil)
 	}
 	if err := updateProgress(options.UpdateProgress, 100); err != nil {
-		return model.ScanTaskRunSnapshot{}, err
+		return snapshot, err
 	}
 	return snapshot, nil
+}
+
+func partialTargetSnapshot(runID int64, ip string, results []model.ScanResult, vulnerabilityOn ...bool) model.ScanTaskRunSnapshot {
+	ports := uniqueSnapshotPorts(snapshotPorts(ip, results))
+	snapshot := model.ScanTaskRunSnapshot{
+		RunID: runID, Ports: ports, ProtocolEvidence: uniqueProtocolEvidence(snapshotProtocolEvidence(ip, results)), Hosts: make([]model.ScanTaskRunHost, 0, 1),
+		Vulnerabilities: make([]model.ScanTaskRunVulnerability, 0), FingerprintMatches: make([]model.FingerprintRunMatch, 0),
+	}
+	snapshot.Validation = initialRunValidation(len(vulnerabilityOn) > 0 && vulnerabilityOn[0])
+	if len(ports) > 0 {
+		snapshot.Hosts = []model.ScanTaskRunHost{{IP: ip, IsActive: true}}
+	}
+	return snapshot
 }
 
 func activeTargets(ip string, active bool) []string {

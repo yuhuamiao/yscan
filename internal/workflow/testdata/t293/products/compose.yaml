@@ -1,0 +1,48 @@
+services:
+  jenkins:
+    image: jenkins/jenkins:2.452.1-lts-jdk17
+    environment:
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+    ports:
+      - "127.0.0.1:80:8080"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+
+  nginx:
+    image: nginx:1.27.5-alpine
+    ports:
+      - "127.0.0.1:443:443"
+      - "127.0.0.1:8080:80"
+    volumes:
+      - "${YSCAN_T293_FIXTURE_DIR}/nginx.conf:/etc/nginx/conf.d/default.conf:ro"
+      - "${YSCAN_T293_FIXTURE_DIR}/index.html:/usr/share/nginx/html/index.html:ro"
+      - "${YSCAN_T293_CERT_DIR}/cert.pem:/etc/nginx/tls/cert.pem:ro"
+      - "${YSCAN_T293_CERT_DIR}/key.pem:/etc/nginx/tls/key.pem:ro"
+
+  mysql:
+    image: mysql:8.0.41
+    environment:
+      MYSQL_ROOT_PASSWORD: caasm-t293-local
+    ports:
+      - "127.0.0.1:3306:3306"
+
+  openssh:
+    image: lscr.io/linuxserver/openssh-server:9.7_p1-r4-ls181
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Etc/UTC
+      PASSWORD_ACCESS: "true"
+      USER_NAME: caasm
+      USER_PASSWORD: caasm-t293-local
+      LOG_STDOUT: "true"
+    ports:
+      - "127.0.0.1:22:2222"
+
+  redis:
+    image: redis:7.4.2-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+
+volumes:
+  jenkins_home:

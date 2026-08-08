@@ -21,3 +21,20 @@ func TestHostScopeMembershipValid(t *testing.T) {
 		})
 	}
 }
+
+func TestFingerprintProductClassificationSeparatesWebStackLayers(t *testing.T) {
+	for _, test := range []struct {
+		name, role, group string
+	}{
+		{name: "nginx", role: "web_server", group: "web_server"},
+		{name: "Apache HTTP Server", role: "web_server", group: "web_server"},
+		{name: "宝塔-BT.cn", role: "control_panel"},
+		{name: "HTML5", role: "markup"},
+		{name: "script", role: "web_primitive"},
+	} {
+		role, group := FingerprintProductClassification(test.name, nil)
+		if role != test.role || group != test.group {
+			t.Fatalf("classification(%q)=%q/%q want %q/%q", test.name, role, group, test.role, test.group)
+		}
+	}
+}

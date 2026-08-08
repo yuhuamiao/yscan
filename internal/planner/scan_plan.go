@@ -19,6 +19,7 @@ var serviceTemplateGroups = map[string][]string{
 
 var serviceAliases = map[string]string{
 	"http-unknown": "http",
+	"https":        "http",
 	"nginx":        "http",
 	"apache":       "http",
 	"iis":          "http",

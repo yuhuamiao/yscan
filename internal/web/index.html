@@ -50,9 +50,13 @@
     .stat strong { display: block; margin-top: 8px; font-family: "IBM Plex Mono", monospace; font-size: 22px; }
     .split { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; margin-top: 20px; align-items: start; }
     .panel { border: 1px solid var(--line); background: var(--surface); box-shadow: var(--shadow); }
-    .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 16px; border-bottom: 1px solid var(--line); }
+    .panel-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 16px; border-bottom: 1px solid var(--line); }
     .panel-heading h2 { margin: 0; font-size: 14px; font-weight: 650; }
     .panel-heading > select { width: auto; min-width: 0; max-width: 620px; flex: 1; }
+    .panel-heading > input { width: auto; min-width: 120px; max-width: 220px; flex: 1 1 140px; }
+    .rule-toolbar { flex-wrap: wrap; justify-content: flex-start; }
+    .rule-toolbar h2 { margin-right: auto; }
+    .rule-toolbar > select, .rule-toolbar > input { width: auto; min-width: 120px; max-width: 220px; flex: 1 1 140px; }
     .panel-body { padding: 16px; }
     .form-grid { display: grid; gap: 12px; }
     label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
@@ -101,6 +105,10 @@
     .finding:last-child { border-bottom: 0; }
     .finding strong { overflow-wrap: anywhere; }
     .finding small { color: var(--muted); overflow-wrap: anywhere; }
+    .fingerprint-stack { display: grid; gap: 20px; }
+    .rule-raw { margin: 8px 0 0; max-width: 760px; max-height: 220px; overflow: auto; padding: 10px; border: 1px solid var(--line); background: #f8faf8; color: #304038; font: 11px/1.55 "IBM Plex Mono", "SFMono-Regular", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .evidence-list { display: grid; gap: 4px; min-width: 300px; color: var(--muted); font: 11px/1.45 "IBM Plex Mono", "SFMono-Regular", monospace; white-space: normal; overflow-wrap: anywhere; }
+    .mono { font-family: "IBM Plex Mono", "SFMono-Regular", monospace; font-size: 11px; }
     @media (max-width: 900px) {
       .shell { grid-template-columns: 1fr; }
       .sidebar { position: sticky; top: 0; z-index: 2; flex-direction: row; align-items: center; padding: 10px 14px; border-right: 0; border-bottom: 1px solid var(--line); gap: 20px; }
@@ -125,6 +133,7 @@
         <a href="/tasks" data-route="/tasks">持续任务</a>
         <a href="/executions" data-route="/executions">即时执行</a>
         <a href="/assets" data-route="/assets">资产</a>
+		<a href="/fingerprints" data-route="/fingerprints">指纹库</a>
         <a href="/reports" data-route="/reports">漏洞与报告</a>
       </nav>
       <div class="sidebar-footer">LOCAL / SQLITE / INCREMENTAL</div>
@@ -158,17 +167,6 @@
       const node = document.getElementById('status-line');
       if (node) { node.textContent = value; node.style.color = error ? 'var(--danger)' : 'var(--muted)'; }
     }
-    function typeForForm(type, vuln) {
-      if (!vuln) return type;
-      if (type === 'scan_subnet') return 'scan_subnet_vuln';
-      if (type === 'scan_ip') return 'scan_ip_vuln';
-      return type;
-    }
-    function renderTaskStats(tasks) {
-      const counts = {all: tasks.length, running: 0, success: 0, failed: 0};
-      tasks.forEach(task => { if (task.status in counts) counts[task.status]++; });
-      return `<div class="stat-row"><div class="stat"><span>任务总数</span><strong>${counts.all}</strong></div><div class="stat"><span>运行中</span><strong>${counts.running}</strong></div><div class="stat"><span>已完成</span><strong>${counts.success}</strong></div><div class="stat"><span>失败或取消</span><strong>${counts.failed + tasks.filter(t => t.status === 'canceled').length}</strong></div></div>`;
-    }
     function scanTaskSchedule(task) {
       return task.mode === 'scheduled' ? `${esc(task.cron || '-')} · ${esc(task.timezone || '-')}` : '一次性';
     }
@@ -187,7 +185,7 @@
       }).join('') || '<tr><td colspan="7" class="empty">暂无持续任务</td></tr>';
     }
     function scanTaskForm() {
-      return `<form class="panel-body form-grid" id="scan-task-form"><label>扫描类型<select name="scan_type"><option value="subnet">网段扫描</option><option value="ip">单 IP 扫描</option></select></label><label>内网目标<input name="target" placeholder="192.168.10.0/24" required></label><label>执行方式<div class="segmented"><label><input type="radio" name="mode" value="scheduled" checked><span>定期执行</span></label><label><input type="radio" name="mode" value="once"><span>一次执行</span></label></div></label><div id="schedule-fields" class="form-grid"><label>Cron 表达式<input name="cron" value="0 2 * * *" placeholder="0 2 * * *"></label><label>时区<input name="timezone" value="Asia/Shanghai" placeholder="Asia/Shanghai"></label></div><label>模板目录<input name="templates" placeholder="留空则自动发现"></label><label class="check"><input type="checkbox" name="vuln">启用漏洞验证</label><button class="button" type="submit">创建持续任务</button></form>`;
+      return `<form class="panel-body form-grid" id="scan-task-form"><label>扫描类型<select name="scan_type"><option value="subnet">网段扫描</option><option value="ip">单 IP 扫描</option></select></label><label>内网目标<input name="target" placeholder="192.168.10.0/24" required></label><label>Cron 表达式<input name="cron" value="0 2 * * *" placeholder="0 2 * * *" required></label><label>时区<input name="timezone" value="Asia/Shanghai" placeholder="Asia/Shanghai" required></label><label>模板目录<input name="templates" placeholder="留空则自动发现"></label><label class="check"><input type="checkbox" name="vuln">启用漏洞验证</label><button class="button" type="submit">创建定期任务</button></form>`;
     }
     async function renderScanTasks() {
       shell('持续任务', '以逻辑任务管理一次性验证和周期巡检，每轮执行保留独立快照。', '<div class="empty">正在加载持续任务...</div>');
@@ -204,20 +202,15 @@
     }
     function bindScanTaskForm() {
       const form = document.getElementById('scan-task-form');
-      const scheduleFields = document.getElementById('schedule-fields');
-      const syncMode = () => { scheduleFields.classList.toggle('hidden', form.elements.mode.value !== 'scheduled'); };
-      form.querySelectorAll('input[name="mode"]').forEach(input => input.onchange = syncMode);
-      syncMode();
       form.onsubmit = async event => {
         event.preventDefault();
         const values = new FormData(form);
-        const mode = values.get('mode');
         const payload = {
           target: String(values.get('target') || '').trim(),
           scan_type: values.get('scan_type'),
-          mode,
-          cron: mode === 'scheduled' ? String(values.get('cron') || '').trim() : '',
-          timezone: mode === 'scheduled' ? String(values.get('timezone') || '').trim() : '',
+          mode: 'scheduled',
+          cron: String(values.get('cron') || '').trim(),
+          timezone: String(values.get('timezone') || '').trim(),
           config: {
             vulnerability_on: values.get('vuln') === 'on',
             nuclei_templates: String(values.get('templates') || '').trim()
@@ -225,7 +218,7 @@
         };
         try {
           const created = await request('/api/scan-tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
-          message(`持续任务 #${created.task.id} 已创建`);
+          message(`定期任务 #${created.task.id} 已创建`);
           await renderScanTasks();
         } catch (error) { message(error.message, true); }
       };
@@ -290,21 +283,20 @@
         changesHost.innerHTML = `<p class="section-note" style="color:var(--danger)">${esc(error.message)}</p>`;
       }
     }
-    async function renderLegacyTasks() {
-      shell('任务', '创建扫描任务并查看执行状态', '<div class="empty">正在加载任务...</div>');
+    async function renderImmediateExecutions() {
+      shell('即时执行', '创建一次性内网扫描，使用 V2 指纹、资产和运行快照链路。', '<div class="empty">正在加载任务...</div>');
       try {
-        const tasks = await request('/api/tasks');
-        shell('任务', '创建扫描任务并查看执行状态', `${renderTaskStats(tasks)}<div class="split"><section class="panel"><div class="panel-heading"><h2>任务列表</h2><button class="button secondary" id="refresh-tasks">刷新</button></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>状态</th><th>类型</th><th>目标</th><th>进度</th><th>创建时间</th></tr></thead><tbody>${tasks.map(task => `<tr data-task-id="${task.id}"><td>${task.id}</td><td>${status(task.status)}</td><td>${esc(task.task_type)}</td><td>${esc(task.target)}</td><td>${task.progress}%</td><td>${time(task.created_at)}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">暂无任务</td></tr>'}</tbody></table></div></section><aside class="panel"><div class="panel-heading"><h2>新建任务</h2></div><form class="panel-body form-grid" id="task-form"><label>类型<select name="type"><option value="scan_subnet">网段扫描</option><option value="scan_ip">单 IP 扫描</option><option value="collect_domain">域名收集</option></select></label><label>目标<input name="target" placeholder="192.168.10.0/24" required></label><label class="check"><input type="checkbox" name="vuln">启用漏洞验证</label><button class="button" type="submit">创建任务</button></form></aside></div>`);
-        document.getElementById('refresh-tasks').onclick = renderLegacyTasks;
-        document.querySelectorAll('[data-task-id]').forEach(row => row.onclick = () => showLegacyTaskDetail(row.dataset.taskId));
+        const tasks = (await request('/api/scan-tasks')).filter(task => task.mode === 'once');
+        const rows = await Promise.all(tasks.map(async task => ({task, runs: await request(`/api/scan-tasks/${task.id}/runs`)})));
+        shell('即时执行', '创建一次性内网扫描，使用 V2 指纹、资产和运行快照链路。', `${renderScanTaskStats(rows)}<div class="split"><section class="panel"><div class="panel-heading"><h2>一次性运行</h2><button class="button secondary" id="refresh-tasks">刷新</button></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>状态</th><th>类型</th><th>目标</th><th>运行</th><th>最近一轮</th></tr></thead><tbody>${rows.map(({task, runs}) => { const latest = runs[runs.length - 1]; return `<tr data-scan-task-id="${task.id}"><td>${task.id}</td><td>${status(task.status)}</td><td>${esc(task.scan_type)}</td><td>${esc(task.target)}</td><td>${runs.length}</td><td>${latest ? `${esc(latest.status)} · ${time(latest.finished_at || latest.scheduled_for)}` : '-'}</td></tr>`; }).join('') || '<tr><td colspan="6" class="empty">暂无一次性运行</td></tr>'}</tbody></table></div></section><aside class="panel"><div class="panel-heading"><h2>新建一次性扫描</h2></div><form class="panel-body form-grid" id="task-form"><label>扫描类型<select name="scan_type"><option value="ip">单 IP 扫描</option><option value="subnet">网段扫描</option></select></label><label>内网目标<input name="target" placeholder="192.168.10.10" required></label><label>模板目录<input name="templates" placeholder="留空则自动发现"></label><label class="check"><input type="checkbox" name="vuln">启用漏洞验证</label><button class="button" type="submit">立即执行</button></form></aside></div>`);
+        document.getElementById('refresh-tasks').onclick = renderImmediateExecutions;
+        document.querySelectorAll('[data-scan-task-id]').forEach(row => row.onclick = () => showScanTaskDetail(row.dataset.scanTaskId));
         document.getElementById('task-form').onsubmit = async event => {
           event.preventDefault(); const form = new FormData(event.currentTarget);
-          try { const task = await request('/api/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:typeForForm(form.get('type'), form.get('vuln') === 'on'), target:form.get('target')})}); message(`任务 #${task.task_id} 已创建`); setTimeout(renderLegacyTasks, 450); } catch (error) { message(error.message, true); }
+          const payload = {target: String(form.get('target') || '').trim(), scan_type: form.get('scan_type'), mode: 'once', config: {vulnerability_on: form.get('vuln') === 'on', nuclei_templates: String(form.get('templates') || '').trim()}};
+          try { const created = await request('/api/scan-tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)}); message(`一次性运行 #${created.run ? created.run.id : created.task.id} 已创建`); setTimeout(renderImmediateExecutions, 450); } catch (error) { message(error.message, true); }
         };
-      } catch (error) { shell('任务', '创建扫描任务并查看执行状态', `<div class="empty">${esc(error.message)}</div>`); }
-    }
-    async function showLegacyTaskDetail(id) {
-      try { const task = await request(`/api/tasks/${id}`); const host = document.querySelector('.split aside'); if (!host) return; host.innerHTML = `<div class="panel-heading"><h2>任务 #${task.id}</h2></div><div class="panel-body detail"><dl><dt>状态</dt><dd>${status(task.status)}</dd><dt>类型</dt><dd>${esc(task.task_type)}</dd><dt>目标</dt><dd>${esc(task.target)}</dd><dt>进度</dt><dd>${task.progress}%</dd><dt>错误</dt><dd>${esc(task.error_msg || '-')}</dd></dl>${['queued','running'].includes(task.status) ? `<button class="button danger" id="cancel-task">取消任务</button>` : ''}</div>`; const cancel = document.getElementById('cancel-task'); if (cancel) cancel.onclick = async () => { await request(`/api/tasks/${id}/cancel`, {method:'POST'}); renderLegacyTasks(); }; } catch (error) { message(error.message, true); }
+      } catch (error) { shell('即时执行', '创建一次性内网扫描，使用 V2 指纹、资产和运行快照链路。', `<div class="empty">${esc(error.message)}</div>`); }
     }
     async function renderAssets() {
       shell('资产', '查看存活主机、关键端口和服务画像', '<div class="empty">正在加载资产...</div>');
@@ -315,14 +307,85 @@
         document.querySelectorAll('[data-asset-ip]').forEach(row => row.onclick = () => showAssetDetail(row.dataset.assetIp));
       } catch (error) { shell('资产', '查看存活主机、关键端口和服务画像', `<div class="empty">${esc(error.message)}</div>`); }
     }
+
+    let fingerprintRulePage = 1;
+    let fingerprintImportHistory = [];
+    let fingerprintSourceIndex = {};
+    function updateFingerprintImportOptions(sourceKey) {
+      const select = document.getElementById('fingerprint-import-select');
+      if (!select) return;
+      const source = Object.values(fingerprintSourceIndex).find(item => item.source_key === sourceKey);
+      const options = fingerprintImportHistory.filter(item => source && item.fingerprint_source_id === source.id);
+      select.innerHTML = `<option value="">活动修订</option>${options.map(item => `<option value="${item.id}">#${item.id} · ${esc(item.commit)} · ${esc(item.adapter_version || 'legacy-v1')}</option>`).join('')}`;
+    }
+    async function renderFingerprints(importPage = 1) {
+      shell('指纹库', '来源版本、规则投影和运行证据', '<div class="empty">正在加载指纹库...</div>');
+      try {
+        const [sources, importResult, mappings, tasks] = await Promise.all([request('/api/fingerprints/sources'), request(`/api/fingerprints/imports?page=${importPage}&page_size=50`), request('/api/fingerprints/template-mappings'), request('/api/scan-tasks')]);
+        const imports = importResult.items || [];
+        const sourceByID = Object.fromEntries(sources.map(source => [source.id, source]));
+        fingerprintImportHistory = imports; fingerprintSourceIndex = sourceByID;
+        const runGroups = await Promise.all(tasks.map(async task => ({task, runs: await request(`/api/scan-tasks/${task.id}/runs`)})));
+        const runOptions = runGroups.flatMap(group => group.runs.map(run => ({task: group.task, run}))).sort((left, right) => right.run.id - left.run.id);
+        const ruleTotal = imports.filter(item => item.is_active).reduce((sum, item) => sum + Number(item.rule_total || 0), 0);
+        const executableTotal = imports.filter(item => item.is_active).reduce((sum, item) => sum + Number(item.executable_total || 0), 0);
+        shell('指纹库', '来源版本、规则投影和运行证据', `<div class="stat-row"><div class="stat"><span>来源</span><strong>${sources.length}</strong></div><div class="stat"><span>活动原始规则</span><strong>${ruleTotal}</strong></div><div class="stat"><span>可执行投影</span><strong>${executableTotal}</strong></div><div class="stat"><span>异常来源</span><strong>${sources.filter(item => item.catalog_status !== 'active').length}</strong></div></div><div class="fingerprint-stack" style="margin-top:20px"><section class="panel"><div class="panel-heading"><h2>来源状态</h2><button class="button secondary" id="refresh-fingerprints">刷新</button></div><div class="table-wrap"><table><thead><tr><th>来源</th><th>状态</th><th>最后错误</th></tr></thead><tbody>${sources.map(item => `<tr><td>${esc(item.source_key)}</td><td>${status(item.catalog_status || 'missing')}</td><td>${esc(item.last_error || '-')}</td></tr>`).join('')}</tbody></table></div><div class="panel-heading"><h2>导入批次</h2></div><div class="table-wrap"><table><thead><tr><th>Import</th><th>来源</th><th>上游 Revision</th><th>适配器</th><th>投影 SHA-256</th><th>规则</th><th>可执行</th><th>不支持</th><th>错误</th><th>状态</th><th>导入时间</th></tr></thead><tbody>${imports.map(item => `<tr><td>#${item.id}</td><td>${esc(sourceByID[item.fingerprint_source_id]?.source_key || item.fingerprint_source_id)}</td><td class="mono">${esc(item.commit)}</td><td>${esc(item.adapter_version || 'legacy-v1')}</td><td class="mono">${esc(item.projection_sha256 || '-')}</td><td>${item.rule_total}</td><td>${item.executable_total}</td><td>${item.unsupported_total}</td><td>${item.import_error_total}</td><td>${status(item.is_active ? 'active' : 'inactive')}</td><td>${time(item.created_at)}</td></tr>`).join('') || '<tr><td colspan="11" class="empty">暂无导入批次</td></tr>'}</tbody></table></div><div class="panel-heading"><span>第 ${importResult.page} 页 · ${importResult.total} 批</span><div><button class="button secondary" id="fingerprint-import-prev" title="上一页" aria-label="上一页">&#8592;</button><button class="button secondary" id="fingerprint-import-next" title="下一页" aria-label="下一页">&#8594;</button></div></div></section><section class="panel"><div class="panel-heading"><h2>原始规则</h2><select id="fingerprint-source-select">${sources.filter(source => source.has_active_import).map(source => `<option value="${esc(source.source_key)}">${esc(source.source_key)}</option>`).join('')}</select><select id="fingerprint-import-select"></select><input id="fingerprint-rule-id" placeholder="规则 ID"><input id="fingerprint-product" placeholder="产品"><select id="fingerprint-rule-status"><option value="">全部状态</option><option value="executable">executable</option><option value="unsupported">unsupported</option><option value="import_error">import_error</option></select><button class="button secondary" id="fingerprint-rule-search">查询</button></div><div class="table-wrap" id="fingerprint-rules"><div class="empty">暂无规则来源</div></div></section><section class="panel"><div class="panel-heading"><h2>运行冻结与结论</h2><select id="fingerprint-run-select"><option value="">选择运行</option>${runOptions.map(({task, run}) => `<option value="${task.id}:${run.id}">#${run.id} · ${esc(task.target)} · ${esc(run.status)}</option>`).join('')}</select></div><div id="fingerprint-run-detail"><div class="empty">选择一轮运行</div></div></section><section class="panel"><div class="panel-heading"><h2>审核模板映射</h2></div><div class="table-wrap"><table><thead><tr><th>产品</th><th>来源规则</th><th>模板</th><th>内容 SHA-256</th><th>状态</th></tr></thead><tbody>${mappings.map(mapping => `<tr><td>${esc(mapping.product_key)}</td><td>${esc(mapping.source_key || '-')} · ${esc(mapping.source_rule_id || '-')}</td><td>${esc(mapping.template_id)}</td><td class="mono">${esc(mapping.template_sha256)}</td><td>${status(mapping.enabled ? 'approved' : 'inactive')}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">暂无已审核映射</td></tr>'}</tbody></table></div></section></div>`);
+        document.getElementById('refresh-fingerprints').onclick = () => renderFingerprints(importResult.page);
+        document.getElementById('fingerprint-import-prev').disabled = importResult.page <= 1; document.getElementById('fingerprint-import-prev').onclick = () => renderFingerprints(importResult.page - 1);
+        document.getElementById('fingerprint-import-next').disabled = importResult.page * importResult.page_size >= importResult.total; document.getElementById('fingerprint-import-next').onclick = () => renderFingerprints(importResult.page + 1);
+        const sourceSelect = document.getElementById('fingerprint-source-select');
+        if (sourceSelect && sourceSelect.value) { updateFingerprintImportOptions(sourceSelect.value); sourceSelect.onchange = () => { fingerprintRulePage = 1; updateFingerprintImportOptions(sourceSelect.value); loadFingerprintRules(sourceSelect.value, 1); }; loadFingerprintRules(sourceSelect.value, 1); }
+        document.getElementById('fingerprint-import-select').onchange = () => loadFingerprintRules(sourceSelect.value, 1);
+        document.getElementById('fingerprint-rule-status').onchange = () => loadFingerprintRules(sourceSelect.value, 1);
+        document.getElementById('fingerprint-rule-search').onclick = () => loadFingerprintRules(sourceSelect.value, 1);
+        const runSelect = document.getElementById('fingerprint-run-select');
+        if (runSelect) runSelect.onchange = () => loadFingerprintRun(runSelect.value, sourceByID);
+      } catch (error) { shell('指纹库', '来源版本、规则投影和运行证据', `<div class="empty">${esc(error.message)}</div>`); }
+    }
+    async function loadFingerprintRules(sourceKey, page = fingerprintRulePage) {
+      const host = document.getElementById('fingerprint-rules');
+      host.innerHTML = '<div class="empty">正在加载规则...</div>';
+      try {
+        const query = new URLSearchParams({page: String(page), page_size: '50'});
+        const importID = document.getElementById('fingerprint-import-select')?.value || '';
+        const ruleID = document.getElementById('fingerprint-rule-id')?.value.trim() || '';
+        const product = document.getElementById('fingerprint-product')?.value.trim() || '';
+        const ruleStatus = document.getElementById('fingerprint-rule-status')?.value || '';
+        if (importID) query.set('import_id', importID); if (ruleID) query.set('rule_id', ruleID); if (product) query.set('product', product); if (ruleStatus) query.set('status', ruleStatus);
+        const result = await request(`/api/fingerprints/sources/${encodeURIComponent(sourceKey)}/rules?${query}`); fingerprintRulePage = result.page;
+        const rules = result.items || [], start = result.total ? (result.page - 1) * result.page_size + 1 : 0, end = Math.min(result.total, result.page * result.page_size);
+        host.innerHTML = `<table><thead><tr><th>规则 ID</th><th>产品</th><th>路径</th><th>状态</th><th>内容 SHA-256</th><th>原始规则</th></tr></thead><tbody>${rules.map(rule => `<tr><td>${esc(rule.source_rule_id || '-')}</td><td>${esc(rule.product || '-')}</td><td>${esc(rule.source_path)}</td><td>${status(rule.import_status)}</td><td class="mono">${esc(rule.content_sha256)}</td><td><details><summary>查看</summary><pre class="rule-raw">${esc(rule.raw_content)}</pre></details></td></tr>`).join('') || '<tr><td colspan="6" class="empty">暂无规则</td></tr>'}</tbody></table><div class="panel-heading"><span>${start}-${end} / ${result.total}</span><div><button class="button secondary" id="fingerprint-page-prev" title="上一页" aria-label="上一页">&#8592;</button><button class="button secondary" id="fingerprint-page-next" title="下一页" aria-label="下一页">&#8594;</button></div></div>`;
+        document.getElementById('fingerprint-page-prev').disabled = result.page <= 1; document.getElementById('fingerprint-page-prev').onclick = () => loadFingerprintRules(sourceKey, result.page - 1);
+        document.getElementById('fingerprint-page-next').disabled = end >= result.total; document.getElementById('fingerprint-page-next').onclick = () => loadFingerprintRules(sourceKey, result.page + 1);
+      } catch (error) { host.innerHTML = `<div class="empty">${esc(error.message)}</div>`; }
+    }
+    async function loadFingerprintRun(value, sourceByID, page = 1) {
+      const host = document.getElementById('fingerprint-run-detail');
+      if (!value) { host.innerHTML = '<div class="empty">选择一轮运行</div>'; return; }
+      const [taskID, runID] = value.split(':');
+      host.innerHTML = '<div class="empty">正在加载运行指纹...</div>';
+      try {
+        const query = `?page=${page}&page_size=50`;
+        const [frozenResult, matchResult, evidenceResult, conclusionResult] = await Promise.all(['imports', 'matches', 'evidence', 'conclusions'].map(resource => request(`/api/scan-tasks/${taskID}/runs/${runID}/fingerprints/${resource}${query}`)));
+        const frozen = frozenResult.items || [], matches = matchResult.items || [], evidence = evidenceResult.items || [], conclusions = conclusionResult.items || [];
+        const maxTotal = Math.max(frozenResult.total, matchResult.total, evidenceResult.total, conclusionResult.total);
+        host.innerHTML = `<div class="table-wrap"><table><thead><tr><th>冻结 Import</th><th>来源</th><th>Revision</th><th>规则统计</th></tr></thead><tbody>${frozen.map(item => `<tr><td>#${item.id}</td><td>${esc(sourceByID[item.fingerprint_source_id]?.source_key || item.fingerprint_source_id)}</td><td class="mono">${esc(item.commit)}</td><td>${item.rule_total} / ${item.executable_total} executable</td></tr>`).join('') || '<tr><td colspan="4" class="empty">本页无冻结版本</td></tr>'}</tbody></table></div><div class="table-wrap"><table><thead><tr><th>端点</th><th>产品</th><th>来源规则</th><th>类型</th><th>证据摘要</th></tr></thead><tbody>${matches.map(match => `<tr><td>${esc(match.ip)}:${match.port}/${esc(match.protocol)}</td><td>${esc(match.product_key)}${match.version ? ` · ${esc(match.version)}` : ''}</td><td>${esc(match.source_key)} · ${esc(match.source_rule_id || '-')}</td><td>${status(match.soft_match ? 'soft' : 'matched')}</td><td>${esc(match.evidence_summary)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">本页无规则命中</td></tr>'}</tbody></table></div><div class="table-wrap"><table><thead><tr><th>命中 / Matcher</th><th>证据类型</th><th>目标</th><th>操作符</th><th>脱敏摘要</th></tr></thead><tbody>${evidence.map(item => `<tr><td>#${item.match_id} / #${item.matcher_id}</td><td>${esc(item.evidence_type)}</td><td>${esc(item.target || '-')}</td><td>${esc(item.operator)}</td><td>${esc(item.summary)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">本页无 Matcher 证据</td></tr>'}</tbody></table></div><div class="table-wrap"><table><thead><tr><th>端点</th><th>产品结论</th><th>角色 / 互斥组</th><th>版本结论</th><th>CPE 结论</th><th>标签</th></tr></thead><tbody>${conclusions.map(item => `<tr><td>${esc(item.ip)}:${item.port}/${esc(item.protocol)}</td><td>${esc(item.product_key)} · ${status(item.product_status)} · ${item.product_source_count} 来源</td><td>${esc(item.product_role || '-')} · ${esc(item.exclusive_group || '可共存')}</td><td>${esc(item.version || '-')} · ${status(item.version_status)} · ${item.version_source_count} 来源</td><td>${esc(item.cpe || '-')} · ${status(item.cpe_status)} · ${item.cpe_source_count} 来源</td><td>${esc((item.tags || []).join(', ') || '-')}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">本页无确定结论</td></tr>'}</tbody></table></div><div class="panel-heading"><span>第 ${page} 页 · ${matchResult.total} 命中 / ${evidenceResult.total} 证据 / ${conclusionResult.total} 结论</span><div><button class="button secondary" id="fingerprint-run-prev" title="上一页" aria-label="上一页">&#8592;</button><button class="button secondary" id="fingerprint-run-next" title="下一页" aria-label="下一页">&#8594;</button></div></div>`;
+        document.getElementById('fingerprint-run-prev').disabled = page <= 1; document.getElementById('fingerprint-run-prev').onclick = () => loadFingerprintRun(value, sourceByID, page - 1);
+        document.getElementById('fingerprint-run-next').disabled = page * 50 >= maxTotal; document.getElementById('fingerprint-run-next').onclick = () => loadFingerprintRun(value, sourceByID, page + 1);
+      } catch (error) { host.innerHTML = `<div class="empty">${esc(error.message)}</div>`; }
+    }
     async function showAssetDetail(ip) {
-      try { const asset = await request(`/api/assets/${encodeURIComponent(ip)}`); const host = document.getElementById('asset-detail'); host.className = 'panel-body detail'; host.innerHTML = `<dl><dt>IP</dt><dd>${esc(asset.host.ip)}</dd><dt>扫描范围</dt><dd>${Number(asset.host.scope_count || 0)} 个</dd><dt>状态</dt><dd>${status(asset.host.is_active ? 'success' : 'inactive')}</dd></dl><div class="table-wrap"><table><thead><tr><th>范围</th><th>状态</th><th>首次发现</th><th>最后发现</th><th>最近检查</th></tr></thead><tbody>${(asset.scopes || []).map(scope => `<tr><td>${esc(scope.scope)}</td><td>${status(scope.is_active ? 'success' : 'inactive')}</td><td>${time(scope.first_seen)}</td><td>${time(scope.last_seen)}</td><td>${time(scope.last_checked)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">暂无范围成员</td></tr>'}</tbody></table></div><div class="table-wrap"><table><thead><tr><th>端口</th><th>服务</th><th>最后发现</th></tr></thead><tbody>${asset.ports.map(port => `<tr><td>${port.port}</td><td>${esc(port.service)}</td><td>${time(port.last_seen_at)}</td></tr>`).join('') || '<tr><td colspan="3" class="empty">暂无端口结果</td></tr>'}</tbody></table></div>`; } catch (error) { message(error.message, true); }
+      try {
+        const asset = await request(`/api/assets/${encodeURIComponent(ip)}`); const host = document.getElementById('asset-detail'); host.className = 'panel-body detail';
+	        const response = port => { const evidence = port.protocol_evidence || []; const summaries = evidence.map(item => { if (item.evidence_type === 'passive_banner') return item.responded ? `TCP 被动 Banner · ${item.banner_captured_length || 0} B` : 'TCP 被动 Banner · 未收到字节'; if (item.evidence_type === 'active_probe') return item.responded ? `TCP 主动 Probe ${esc(item.probe_name || '-')} · ${item.banner_captured_length || 0} B` : `TCP 主动 Probe ${esc(item.probe_name || '-')} · ${esc(item.outcome || item.diagnostic || 'no_response')}`; return item.responded ? `${String(item.protocol || '').toUpperCase()}${item.status_code ? ` ${item.status_code}` : ''}${item.server ? ` · ${esc(item.server)}` : ''}${item.title ? ` · ${esc(item.title)}` : ''} · ${item.body_captured_length || item.header_captured_length || 0} B` : `${String(item.protocol || '').toUpperCase()} · ${esc(item.outcome || 'no_response')}`; }); if (summaries.length) return summaries.join('<br>'); return '未保存协议响应摘要'; };
+        host.innerHTML = `<dl><dt>IP</dt><dd>${esc(asset.host.ip)}</dd><dt>扫描范围</dt><dd>${Number(asset.host.scope_count || 0)} 个</dd><dt>状态</dt><dd>${status(asset.host.is_active ? 'success' : 'inactive')}</dd></dl><div class="table-wrap"><table><thead><tr><th>范围</th><th>状态</th><th>首次发现</th><th>最后发现</th><th>最近检查</th></tr></thead><tbody>${(asset.scopes || []).map(scope => `<tr><td>${esc(scope.scope)}</td><td>${status(scope.is_active ? 'success' : 'inactive')}</td><td>${time(scope.first_seen)}</td><td>${time(scope.last_seen)}</td><td>${time(scope.last_checked)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">暂无范围成员</td></tr>'}</tbody></table></div><div class="table-wrap"><table><thead><tr><th>端口</th><th>服务</th><th>协议响应</th><th>最后发现</th></tr></thead><tbody>${asset.ports.map(port => `<tr><td>${port.port}</td><td>${esc(port.service)}</td><td>${response(port)}</td><td>${time(port.last_seen_at)}</td></tr>`).join('') || '<tr><td colspan="4" class="empty">暂无端口结果</td></tr>'}</tbody></table></div>`;
+      } catch (error) { message(error.message, true); }
     }
     async function renderReports() {
       shell('漏洞与报告', '查看任务变化、漏洞结果和 Markdown 报告', '<div class="empty">正在加载任务...</div>');
       try {
         const tasks = await request('/api/scan-tasks');
-        shell('漏洞与报告', '查看逻辑任务各轮的 Markdown 报告与漏洞结果', `<section class="panel"><div class="panel-heading"><h2>逻辑任务</h2><select id="report-task">${tasks.map(task => `<option value="${task.id}">#${task.id} ${esc(task.scan_type)} · ${esc(task.target)}</option>`).join('')}</select><select id="report-run"></select></div></section><div class="report-grid" style="margin-top:20px"><section class="panel"><div class="panel-heading"><h2>Markdown 报告</h2></div><pre class="markdown" id="markdown-report">选择运行查看报告。</pre></section><section class="panel"><div class="panel-heading"><h2>本轮漏洞结果</h2></div><div class="panel-body" id="finding-list"></div></section></div>`);
+        shell('漏洞与报告', '查看逻辑任务各轮的验证状态、漏洞结果和报告', `<section class="panel"><div class="panel-heading"><h2>逻辑任务</h2><select id="report-task">${tasks.map(task => `<option value="${task.id}">#${task.id} ${esc(task.scan_type)} · ${esc(task.target)}</option>`).join('')}</select><select id="report-run"></select></div></section><div class="report-grid" style="margin-top:20px"><section class="panel"><div class="panel-heading"><h2>用户报告</h2><button class="button secondary" id="audit-report-button">查看审计报告</button></div><pre class="markdown" id="markdown-report">选择运行查看报告。</pre></section><section class="panel"><div class="panel-heading"><h2>本轮漏洞结果</h2></div><div class="panel-body" id="finding-list"></div></section></div>`);
         const taskSelect = document.getElementById('report-task'); if (taskSelect && tasks.length) { taskSelect.onchange = () => loadReportRuns(taskSelect.value); loadReportRuns(taskSelect.value); }
       } catch (error) { shell('漏洞与报告', '查看任务变化、漏洞结果和 Markdown 报告', `<div class="empty">${esc(error.message)}</div>`); }
     }
@@ -339,9 +402,14 @@
     async function loadReport(taskID, runID) {
       const report = document.getElementById('markdown-report'); const findings = document.getElementById('finding-list'); report.textContent = '正在加载...'; findings.innerHTML = '';
       try { report.textContent = await request(`/api/scan-tasks/${taskID}/runs/${runID}/report`); } catch (error) { report.textContent = `报告不可用\n${error.message}`; }
-      try { const run = await request(`/api/scan-tasks/${taskID}/runs/${runID}`); findings.innerHTML = run.report_error ? `<div class="empty">报告错误：${esc(run.report_error)}</div>` : '<div class="empty">本轮漏洞详情包含在 Markdown 报告中。</div>'; } catch (error) { findings.innerHTML = `<div class="empty">${esc(error.message)}</div>`; }
+      const auditButton = document.getElementById('audit-report-button'); if (auditButton) auditButton.onclick = async () => { try { report.textContent = await request(`/api/scan-tasks/${taskID}/runs/${runID}/audit-report`); } catch (error) { report.textContent = `审计报告不可用\n${error.message}`; } };
+      try {
+        const result = await request(`/api/scan-tasks/${taskID}/runs/${runID}/findings?page=1&page_size=100`); const validation = result.validation || {};
+	        const labels = {disabled:'未启用漏洞验证', not_started:'漏洞验证尚未开始', no_candidates:'无可用端点或模板', success:result.total ? '已发现漏洞' : '验证成功，未发现漏洞', failed:'漏洞验证失败'};
+        findings.innerHTML = `<dl><dt>验证状态</dt><dd>${status(validation.status || 'unavailable')} · ${esc(labels[validation.status] || '状态不可用')}</dd><dt>覆盖</dt><dd>${validation.executed_endpoint_count || 0} / ${validation.candidate_endpoint_count || 0} 个端点 · ${validation.template_count || 0} 个模板</dd><dt>发现</dt><dd>${result.total || 0}</dd>${validation.error ? `<dt>错误</dt><dd>${esc(validation.error)}</dd>` : ''}</dl>${(result.items || []).map(item => `<section class="change-group"><h3>${esc(item.name || item.template_id || '未命名漏洞')}</h3><p>${status(item.severity || 'unknown')} · ${esc(item.target)}</p><p class="section-note">${esc(item.template_id || '-')} · ${esc(item.matched_at || '-')}</p>${item.description ? `<p>${esc(item.description)}</p>` : ''}</section>`).join('') || ''}`;
+      } catch (error) { findings.innerHTML = `<div class="empty">${esc(error.message)}</div>`; }
     }
-    function route() { ({'/assets':renderAssets, '/reports':renderReports, '/executions':renderLegacyTasks, '/tasks':renderScanTasks}[location.pathname] || renderScanTasks)(); }
+    function route() { ({'/assets':renderAssets, '/fingerprints':renderFingerprints, '/reports':renderReports, '/executions':renderImmediateExecutions, '/tasks':renderScanTasks}[location.pathname] || renderScanTasks)(); }
     document.addEventListener('click', event => { const link = event.target.closest('a[data-route]'); if (link) { event.preventDefault(); history.pushState({}, '', link.href); route(); } });
     window.addEventListener('popstate', route); route();
   </script>

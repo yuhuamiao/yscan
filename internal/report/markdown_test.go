@@ -2,6 +2,7 @@ package report
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -66,6 +67,128 @@ func TestWriteAndReadScanTaskRunReport(t *testing.T) {
 	if !strings.Contains(string(content), "yscan CAASM Scan Task Run Report") {
 		t.Fatalf("unexpected report content: %s", content)
 	}
+	audit, err := ReadScanTaskRunAuditReport(directory, 7, 9)
+	if err != nil || !strings.Contains(string(audit), "yscan CAASM Scan Task Run Audit Report") {
+		t.Fatalf("unexpected audit report content=%s err=%v", audit, err)
+	}
+}
+
+func TestWriteScanTaskRunReportDoesNotLeaveOrphanWhenPairCommitFails(t *testing.T) {
+	directory := t.TempDir()
+	originalRename := renameScanTaskRunReportFile
+	t.Cleanup(func() { renameScanTaskRunReportFile = originalRename })
+	renameScanTaskRunReportFile = func(oldPath, newPath string) error {
+		if strings.HasSuffix(newPath, "-audit.md") {
+			return errors.New("forced audit rename failure")
+		}
+		return os.Rename(oldPath, newPath)
+	}
+	_, err := WriteScanTaskRunReport(directory, ScanTaskRunReport{Task: model.ScanTask{ID: 7}, Run: model.ScanTaskRun{ID: 9, ScanTaskID: 7}})
+	if err == nil {
+		t.Fatal("paired report write must fail")
+	}
+	for _, path := range []string{ScanTaskRunReportPath(directory, 7, 9), ScanTaskRunAuditReportPath(directory, 7, 9)} {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("orphan report remains at %s: %v", path, statErr)
+		}
+	}
+}
+
+func TestWriteScanTaskRunReportRestoresExistingPairWhenAuditCommitFails(t *testing.T) {
+	directory := t.TempDir()
+	oldReport := ScanTaskRunReport{Task: model.ScanTask{ID: 7, Target: "old-target"}, Run: model.ScanTaskRun{ID: 9, ScanTaskID: 7}}
+	paths, err := WriteScanTaskRunReport(directory, oldReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldUser, _ := os.ReadFile(paths.User)
+	oldAudit, _ := os.ReadFile(paths.Audit)
+	originalRename := renameScanTaskRunReportFile
+	t.Cleanup(func() { renameScanTaskRunReportFile = originalRename })
+	renameScanTaskRunReportFile = func(oldPath, newPath string) error {
+		if strings.HasSuffix(newPath, "-audit.md") {
+			return errors.New("forced audit overwrite failure")
+		}
+		return os.Rename(oldPath, newPath)
+	}
+	_, err = WriteScanTaskRunReport(directory, ScanTaskRunReport{Task: model.ScanTask{ID: 7, Target: "new-target"}, Run: model.ScanTaskRun{ID: 9, ScanTaskID: 7}})
+	if err == nil {
+		t.Fatal("overwriting pair must fail")
+	}
+	user, userErr := os.ReadFile(paths.User)
+	audit, auditErr := os.ReadFile(paths.Audit)
+	if userErr != nil || auditErr != nil || string(user) != string(oldUser) || string(audit) != string(oldAudit) {
+		t.Fatalf("old pair was not restored user_err=%v audit_err=%v", userErr, auditErr)
+	}
+}
+
+func TestReadRecoversInterruptedReportPair(t *testing.T) {
+	directory := t.TempDir()
+	oldReport := ScanTaskRunReport{Task: model.ScanTask{ID: 7, Target: "old-target"}, Run: model.ScanTaskRun{ID: 9, ScanTaskID: 7}}
+	paths, err := WriteScanTaskRunReport(directory, oldReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldUser, _ := os.ReadFile(paths.User)
+	oldAudit, _ := os.ReadFile(paths.Audit)
+	if _, err := prepareScanTaskRunReport(directory, ScanTaskRunReport{Task: model.ScanTask{ID: 7, Target: "new-target"}, Run: model.ScanTaskRun{ID: 9, ScanTaskID: 7}}); err != nil {
+		t.Fatal(err)
+	}
+	user, userErr := ReadScanTaskRunReport(directory, 7, 9)
+	audit, auditErr := ReadScanTaskRunAuditReport(directory, 7, 9)
+	if userErr != nil || auditErr != nil || string(user) != string(oldUser) || string(audit) != string(oldAudit) {
+		t.Fatalf("interrupted pair recovery user_err=%v audit_err=%v", userErr, auditErr)
+	}
+}
+
+func TestRunReportRendersFrozenRevisionConclusionsEvidenceAndMapping(t *testing.T) {
+	content := RenderScanTaskRunAuditMarkdown(ScanTaskRunReport{
+		Task: model.ScanTask{ID: 7}, Run: model.ScanTaskRun{ID: 9, ScanTaskID: 7},
+		FingerprintImports:     []model.FingerprintImport{{ID: 11, FingerprintSourceID: 3, Commit: "upstream-r1", AdapterVersion: "adapter-v2", ProjectionSHA256: "projection-sha"}},
+		FingerprintConclusions: []map[string]interface{}{{"ip": "192.168.75.1", "port": 443, "protocol": "https", "product_key": "openssh", "version": "9.6", "cpe": "cpe:/a:openbsd:openssh:9.6", "tags": []string{"ssh"}, "conclusion_status": "corroborated", "product_status": "corroborated", "product_source_count": 2, "version_status": "matched", "version_source_count": 1, "cpe_status": "matched", "cpe_source_count": 1}},
+		FingerprintMatches:     []map[string]interface{}{{"ip": "192.168.75.1", "port": 443, "protocol": "https", "product_key": "openssh", "source_key": "nmap", "source_rule_id": "fixture", "matcher_evidence": []map[string]interface{}{{"summary": "tcp_banner banner bytes=16 sha256=redacted"}}}},
+		Snapshot:               model.ScanTaskRunSnapshot{TemplateCandidates: []model.ScanTaskRunTemplateCandidate{{TemplateID: "openssh-check", Path: "tcp/openssh.yaml", Source: "fingerprint_mapping", Reason: "approved mapping", IP: "192.168.75.1", Port: 443, Protocol: "https", TemplateSetRevision: "templates-r1", TemplateSHA256: "template-sha"}}},
+	})
+	for _, expected := range []string{"## Frozen Fingerprint Revisions", "adapter-v2", "projection-sha", "## Fingerprint Conclusions", "Product evidence status", "Version evidence status", "CPE evidence status", "corroborated (2 sources)", "9.6 / matched (1 sources)", "cpe:/a:openbsd:openssh:9.6 / matched (1 sources)", "## Fingerprint Evidence", "tcp_banner banner bytes=16 sha256=redacted", "192.168.75.1:443/https", "templates-r1", "template-sha"} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("report missing %q:\n%s", expected, content)
+		}
+	}
+	if strings.Contains(content, "confidence") {
+		t.Fatalf("report must use categorical evidence status terminology:\n%s", content)
+	}
+	if strings.Contains(content, "raw response") {
+		t.Fatal("report exposed raw response")
+	}
+}
+
+func TestRunUserReportLeadsWithValidationAndKeepsAuditDetailsOut(t *testing.T) {
+	content := RenderScanTaskRunMarkdown(ScanTaskRunReport{
+		Task: model.ScanTask{ID: 7}, Run: model.ScanTaskRun{ID: 9, ScanTaskID: 7, Target: "192.168.75.1", Status: model.ScanTaskRunStatusSuccess},
+		Snapshot: model.ScanTaskRunSnapshot{
+			Validation:         model.ScanTaskRunValidation{Status: model.ScanTaskRunValidationSuccess, CandidateEndpointCount: 2, ExecutedEndpointCount: 2, TemplateCount: 3, FindingCount: 1},
+			Ports:              []model.ScanTaskRunPort{{IP: "192.168.75.1", Port: 23333, ServiceType: "http", Product: "nginx"}},
+			ProtocolEvidence:   []model.ScanTaskRunProtocolEvidence{{IP: "192.168.75.1", Port: 23333, Protocol: "http", Responded: true, StatusCode: 500, Server: "nginx", BodyCapturedLength: 2422}},
+			Vulnerabilities:    []model.ScanTaskRunVulnerability{{FindingKey: "test", TemplateID: "test-template", Name: "Test vulnerability", Severity: "high", Target: "http://192.168.75.1:23333", MatchedAt: "/admin", Description: "Readable vulnerability description", Evidence: `{"raw":"nuclei-json"}`}},
+			TemplateCandidates: []model.ScanTaskRunTemplateCandidate{{TemplateID: "internal-only", Path: "private.yaml", Source: "fingerprint_mapping", Reason: "audit only"}},
+		},
+		FingerprintImports: []model.FingerprintImport{{ID: 11, ProjectionSHA256: "audit-sha"}},
+	})
+	validationIndex := strings.Index(content, "## Vulnerability Validation")
+	serviceIndex := strings.Index(content, "## Port And Service Summary")
+	if validationIndex < 0 || serviceIndex < 0 || validationIndex > serviceIndex {
+		t.Fatalf("user report does not lead with validation:\n%s", content)
+	}
+	for _, expected := range []string{"success", "Test vulnerability", "Readable vulnerability description", "high", "HTTP 500 server=nginx response=2422 bytes"} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("user report missing %q:\n%s", expected, content)
+		}
+	}
+	for _, forbidden := range []string{"Frozen Fingerprint Revisions", "audit-sha", "internal-only", "private.yaml", `{"raw":"nuclei-json"}`} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("user report exposed audit detail %q:\n%s", forbidden, content)
+		}
+	}
 }
 
 func TestGenerateScanTaskRunReportUsesTaskLocalRunDiff(t *testing.T) {
@@ -103,7 +226,8 @@ func TestGenerateScanTaskRunReportUsesTaskLocalRunDiff(t *testing.T) {
 		t.Fatalf("seed report diagnostic: %v", err)
 	}
 
-	path, err := GenerateScanTaskRunReport(db, task.ID, second.ID, t.TempDir())
+	directory := t.TempDir()
+	path, err := GenerateScanTaskRunReport(db, task.ID, second.ID, directory)
 	if err != nil {
 		t.Fatalf("generate run report: %v", err)
 	}
@@ -124,8 +248,35 @@ func TestGenerateScanTaskRunReportUsesTaskLocalRunDiff(t *testing.T) {
 		}
 	}
 	persisted, err := storage.GetScanTaskRun(db, second.ID)
-	if err != nil || persisted.ReportPath != path || persisted.ReportError != "" {
+	if err != nil || persisted.ReportPath != path || persisted.AuditReportPath != ScanTaskRunAuditReportPath(directory, task.ID, second.ID) || persisted.ReportError != "" {
 		t.Fatalf("persisted report = %#v, error = %v, want path %q and cleared diagnostic", persisted, err, path)
+	}
+}
+
+func TestGenerateScanTaskRunReportRestoresExistingPairWhenDatabaseUpdateFails(t *testing.T) {
+	db := openRunReportDB(t)
+	task, err := storage.CreateScanTask(db, model.ScanTask{Target: "192.168.20.0/24", ScanType: model.ScanTypeSubnet, Mode: model.ScanTaskModeScheduled, Cron: "0 2 * * *", Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := completeRunReportTest(t, db, task.ID, "2026-07-26T02:00:00Z", model.ScanTaskRunSnapshot{})
+	directory := t.TempDir()
+	paths, err := WriteScanTaskRunReport(directory, ScanTaskRunReport{Task: task, Run: run, GeneratedAt: time.Date(2026, 7, 26, 3, 0, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldUser, _ := os.ReadFile(paths.User)
+	oldAudit, _ := os.ReadFile(paths.Audit)
+	originalUpdate := updateScanTaskRunReportPaths
+	t.Cleanup(func() { updateScanTaskRunReportPaths = originalUpdate })
+	updateScanTaskRunReportPaths = func(*sql.DB, int64, string, string) error { return errors.New("forced database update failure") }
+	if _, err := GenerateScanTaskRunReport(db, task.ID, run.ID, directory); err == nil {
+		t.Fatal("database update failure must be returned")
+	}
+	user, userErr := os.ReadFile(paths.User)
+	audit, auditErr := os.ReadFile(paths.Audit)
+	if userErr != nil || auditErr != nil || string(user) != string(oldUser) || string(audit) != string(oldAudit) {
+		t.Fatalf("database failure did not restore old pair user_err=%v audit_err=%v", userErr, auditErr)
 	}
 }
 
@@ -138,10 +289,10 @@ func openRunReportDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { _ = db.Close() })
 	for _, statement := range []string{
 		`CREATE TABLE scan_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, scan_type TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, cron TEXT, timezone TEXT, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, archived_at DATETIME)`,
-		`CREATE TABLE scan_task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_task_id INTEGER NOT NULL, sequence INTEGER NOT NULL, scheduled_for DATETIME NOT NULL, status TEXT NOT NULL, target TEXT NOT NULL, scan_type TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', error_message TEXT, report_path TEXT, report_error TEXT, started_at DATETIME, finished_at DATETIME, snapshot_written_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, UNIQUE(scan_task_id, sequence), UNIQUE(scan_task_id, scheduled_for))`,
+		`CREATE TABLE scan_task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_task_id INTEGER NOT NULL, sequence INTEGER NOT NULL, scheduled_for DATETIME NOT NULL, status TEXT NOT NULL, target TEXT NOT NULL, scan_type TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', error_message TEXT, report_path TEXT, audit_report_path TEXT, report_error TEXT, started_at DATETIME, finished_at DATETIME, snapshot_written_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, UNIQUE(scan_task_id, sequence), UNIQUE(scan_task_id, scheduled_for))`,
 		`CREATE TABLE scan_task_run_hosts (scan_task_run_id INTEGER NOT NULL, ip TEXT NOT NULL, is_active INTEGER NOT NULL, PRIMARY KEY(scan_task_run_id, ip))`,
 		`CREATE TABLE scan_task_run_ports (scan_task_run_id INTEGER NOT NULL, ip TEXT NOT NULL, port INTEGER NOT NULL, service_type TEXT NOT NULL, product TEXT, banner TEXT, PRIMARY KEY(scan_task_run_id, ip, port))`,
-		`CREATE TABLE scan_task_run_vulnerabilities (scan_task_run_id INTEGER NOT NULL, finding_key TEXT NOT NULL, template_id TEXT, name TEXT, severity TEXT, target TEXT NOT NULL, target_ip TEXT, target_port INTEGER, matched_at TEXT, evidence TEXT, PRIMARY KEY(scan_task_run_id, finding_key))`,
+		`CREATE TABLE scan_task_run_vulnerabilities (scan_task_run_id INTEGER NOT NULL, finding_key TEXT NOT NULL, template_id TEXT, name TEXT, severity TEXT, target TEXT NOT NULL, target_ip TEXT, target_port INTEGER, matched_at TEXT, description TEXT, evidence TEXT, PRIMARY KEY(scan_task_run_id, finding_key))`,
 		`CREATE TABLE scan_task_run_template_candidates (scan_task_run_id INTEGER NOT NULL, template_id TEXT NOT NULL, path TEXT NOT NULL, source TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(scan_task_run_id, template_id, path))`,
 	} {
 		if _, err := db.Exec(statement); err != nil {

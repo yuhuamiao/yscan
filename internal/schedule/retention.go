@@ -64,29 +64,31 @@ func (policy *RetentionPolicy) Prune(ctx context.Context) (RetentionResult, erro
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		staged, err := stageReport(candidate.ReportPath)
+		staged, err := stageReports([]string{candidate.ReportPath, candidate.AuditReportPath})
 		if err != nil {
-			return result, fmt.Errorf("stage report for scan task run %d: %w", candidate.ID, err)
+			return result, fmt.Errorf("stage reports for scan task run %d: %w", candidate.ID, err)
 		}
 		deleted, err := storage.DeleteExpiredTerminalScanTaskRun(policy.DB, candidate.ID, cutoff)
 		if err != nil {
-			return result, restoreStagedReport(staged, fmt.Errorf("delete scan task run %d: %w", candidate.ID, err))
+			return result, restoreStagedReports(staged, fmt.Errorf("delete scan task run %d: %w", candidate.ID, err))
 		}
 		if !deleted {
-			if err := restoreStagedReport(staged, nil); err != nil {
+			if err := restoreStagedReports(staged, nil); err != nil {
 				return result, err
 			}
 			continue
 		}
 
 		result.DeletedRuns++
-		if staged.temporary == "" {
-			continue
+		for _, report := range staged {
+			if report.temporary == "" {
+				continue
+			}
+			if err := os.Remove(report.temporary); err != nil {
+				return result, fmt.Errorf("remove retired report for scan task run %d: %w", candidate.ID, err)
+			}
+			result.DeletedReports++
 		}
-		if err := os.Remove(staged.temporary); err != nil {
-			return result, fmt.Errorf("remove retired report for scan task run %d: %w", candidate.ID, err)
-		}
-		result.DeletedReports++
 	}
 	return result, nil
 }
@@ -94,6 +96,18 @@ func (policy *RetentionPolicy) Prune(ctx context.Context) (RetentionResult, erro
 type stagedReport struct {
 	original  string
 	temporary string
+}
+
+func stageReports(paths []string) ([]stagedReport, error) {
+	staged := make([]stagedReport, 0, len(paths))
+	for _, path := range paths {
+		report, err := stageReport(path)
+		if err != nil {
+			return nil, restoreStagedReports(staged, err)
+		}
+		staged = append(staged, report)
+	}
+	return staged, nil
 }
 
 func stageReport(path string) (stagedReport, error) {
@@ -138,4 +152,12 @@ func restoreStagedReport(staged stagedReport, originalErr error) error {
 		return fmt.Errorf("restore staged report: %w", err)
 	}
 	return originalErr
+}
+
+func restoreStagedReports(staged []stagedReport, originalErr error) error {
+	result := originalErr
+	for index := len(staged) - 1; index >= 0; index-- {
+		result = restoreStagedReport(staged[index], result)
+	}
+	return result
 }

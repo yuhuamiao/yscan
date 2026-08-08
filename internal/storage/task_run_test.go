@@ -131,6 +131,35 @@ func TestUpdateScanTaskRunReportErrorPreservesTerminalRun(t *testing.T) {
 	}
 }
 
+func TestClaimQueuedOneTimeRunFreezesActiveImportsOnlyWhenMissing(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	task, err := CreateScanTask(db, model.ScanTask{Target: "192.168.60.10", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeOnce})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-07-24T02:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM scan_task_run_fingerprint_imports WHERE scan_task_run_id = ?`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := ClaimQueuedOneTimeScanTaskRun(db)
+	if err != nil || recovered == nil || recovered.ID != run.ID {
+		t.Fatalf("recovered=%#v err=%v", recovered, err)
+	}
+	var activeCount, frozenCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM fingerprint_imports WHERE is_active = 1`).Scan(&activeCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM scan_task_run_fingerprint_imports WHERE scan_task_run_id = ?`, run.ID).Scan(&frozenCount); err != nil || frozenCount != activeCount {
+		t.Fatalf("frozen=%d active=%d err=%v", frozenCount, activeCount, err)
+	}
+}
+
 func createScheduledTaskForTest(t *testing.T, db *sql.DB, target string) model.ScanTask {
 	t.Helper()
 	task, err := CreateScanTask(db, model.ScanTask{

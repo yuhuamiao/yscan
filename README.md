@@ -24,7 +24,7 @@
 | 能力 | 当前实现 | 说明 |
 | --- | --- | --- |
 | 内网资产发现 | IPv4 CIDR 展开、ICMP/TCP 存活探测 | 网段任务有主机数量上限，取消先进入 `cancel_requested`，执行器退出后再进入最终状态 |
-| 服务画像 | 内网基线端口、Banner 读取、基础规则匹配 | 覆盖 SMB、RDP、LDAP、WinRM、常见数据库、Docker、Kubernetes、Elasticsearch 等常见暴露面 |
+| 服务画像 | 单 IP 全端口或显式端口集合、网段基线或显式端口集合、TCP/Web 统一指纹 | 规则命中保留来源修订、规则 ID、版本/CPE、证据摘要与冲突候选 |
 | 资产状态管理 | SQLite IP 聚合库存与范围主机/端口成员关系 | 记录全局和范围级 `first_seen`、`last_seen`、`is_active`，重叠 CIDR 的主机和端口变化互不覆盖 |
 | 漏洞验证 | 本地 [Nuclei](https://github.com/projectdiscovery/nuclei) 调用与 JSONL 解析 | 使用本地 templates，服务标签只缩小候选范围，默认排除 `intrusive`、`dos`、`auth` |
 | 域名资产收集 | crt.sh、搜索引擎、DNS 字典爆破、DNS 活性验证 | 支持 `internal`、`external`、`hybrid` DNS 策略，以及泛解析/CNAME 聚合干扰处理 |
@@ -153,7 +153,7 @@ DNS 模式用于处理内网、代理/TUN 和外网解析视角的冲突：
 启动服务：
 
 ```bash
-./yscan api :8080
+./yscan api 127.0.0.1:8080
 ```
 
 访问地址：
@@ -165,8 +165,17 @@ DNS 模式用于处理内网、代理/TUN 和外网解析视角的冲突：
 API 与 CLI 使用同一个 SQLite 数据库。启动 API 时也可以传入全局 Nuclei 与 DNS 参数：
 
 ```bash
-./yscan --templates /path/to/nuclei-templates --dns-mode internal api :8080
+./yscan --templates /path/to/nuclei-templates --dns-mode internal api 127.0.0.1:8080
 ```
+
+回环监听无需访问名单。空 host、`0.0.0.0`、`[::]` 或其他非回环地址会暴露内部资产与指纹数据，因此必须至少配置一个受信客户端 CIDR：
+
+```bash
+./yscan api 0.0.0.0:8080 --allow-cidr 192.168.10.0/24
+./yscan api '[::]:8080' --allow-cidr 2001:db8:1234::/48
+```
+
+可重复使用 `--allow-cidr`。监听校验和每个请求的 `RemoteAddr` 授权都会执行；不在名单内的客户端返回 `403`。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -184,6 +193,11 @@ API 与 CLI 使用同一个 SQLite 数据库。启动 API 时也可以传入全�
 | `POST` | `/api/scan-tasks/{taskId}/archive` | 归档逻辑任务，归档后不可恢复 |
 | `GET` | `/api/assets?active=true&scope=subnet:192.168.10.0/24` | 查询 IP 聚合库存，可按扫描范围精确过滤 |
 | `GET` | `/api/assets/{ip}` | 查询资产聚合状态、全部范围成员及端口详情 |
+| `GET` | `/api/fingerprints/sources` | 查询规则来源与 active 修订摘要 |
+| `GET` | `/api/fingerprints/imports?page=1&page_size=50` | 分页查询 import 摘要，不返回大型 manifest |
+| `GET` | `/api/fingerprints/imports/{importId}` | 按需查询单个 import 及 manifest |
+| `GET` | `/api/fingerprints/sources/{sourceKey}/rules` | 按规则 ID、产品、状态分页检索原始规则 |
+| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/fingerprints/{imports\|matches\|conclusions}` | 分页查询本轮冻结修订、命中和结论 |
 
 创建每天执行的网段逻辑任务示例：
 
@@ -239,7 +253,14 @@ curl -X POST http://127.0.0.1:8080/api/scan-tasks \
 | `schedule show <scan_task_id>` | 查看逻辑任务的配置、状态和计划 |
 | `schedule runs <scan_task_id>` | 查看任务的运行历史和报告路径 |
 | `schedule pause\|resume\|archive <scan_task_id>` | 暂停、恢复或归档逻辑任务 |
-| `api [addr]` | 启动 API 和 Web 控制台 |
+| `fingerprint list` | 列出规则来源和当前 active import |
+| `fingerprint import --source <source_key> [--recovery-archive <path>]` | 校验并导入一个固定来源或显式恢复归档 |
+| `fingerprint upgrade [--source <source_key>]` | 显式升级全部或单个嵌入来源；逐来源输出成功/失败诊断 |
+| `fingerprint cleanup [--apply]` | 列出无引用的非活动修订；默认 dry-run，只有 `--apply` 才事务删除 |
+| `fingerprint mapping list` | 列出本地审核的规则到 Nuclei 模板映射 |
+| `fingerprint mapping import --manifest <path> --templates <root>` | 校验模板 SHA 后导入审核映射修订 |
+| `fingerprint mapping disable --id <id>` | 停用一条模板映射 |
+| `api [addr] [--allow-cidr <cidr>]...` | 启动 API 和 Web 控制台；非回环监听必须配置受信 CIDR |
 
 全局参数：
 
@@ -255,18 +276,15 @@ curl -X POST http://127.0.0.1:8080/api/scan-tasks \
 - Nuclei templates 的内容、影响范围和许可证由操作者负责审查；生产环境应先使用受控模板集验证。
 - `yscan` 不是漏洞修复、工单、资产归属、RBAC、多租户或互联网全量测绘平台。
 - 数据库与报告可能包含内部 IP、服务和漏洞信息；提交 Issue、日志或截图前应完成脱敏。
+- API 没有应用层登录机制；非回环部署必须结合 `--allow-cidr`、主机防火墙和受控管理网络，不能直接暴露到互联网。
 
 ## v2 路线
 
-v2 不追求无边界堆功能，优先补足“服务识别结果是否可靠、漏洞验证是否足够定向”这条链路：
+v2 不追求无边界堆功能，优先补足“服务识别结果是否可靠、漏洞验证是否足够定向”这条链路。此前两条样例规则、文件快照和硬编码置信度组成的指纹原型已经撤回，不能视为指纹库能力。
 
-1. 建立第三方指纹规则的来源、许可证、版本和校验值台账。
-2. 引入可复现的本地规则快照编译流程，优先评估 FingerprintHub，并审计 Wappalyzer 数据边界。
-3. 增加 Header、Body、Title、Banner 和 favicon 的证据采集与置信度输出。
-4. 解析本地 Nuclei 模板元数据，建立安全策略和基于产品/CPE/版本的候选规划。
-5. 用高置信度指纹逐步替换 v1 静态服务 tags，同时保留可解释的回退路径。
+M11 随单二进制嵌入 9 个固定第三方来源，共归档 41,192 条原始规则；当前 28,509 条进入统一可执行投影，12,683 条以明确原因保留为 `unsupported`。另有本地旧 `banner` 规则迁移投影。空数据库首次启动会逐来源初始化嵌入规则；首次初始化中失败或缺失的来源会保留诊断并在下次启动单独重试，已有任意历史 import 的来源不会被自动升级。规则升级仍必须显式执行 `fingerprint upgrade`。
 
-完整任务拆分、文件边界和验收标准见 [技术设计方案-v2.md](技术设计方案-v2.md)。产品定位与国内 CAASM 产品调研见 [产品调研.md](产品调研.md)。仓库内 AI 开发约束见 [AGENTS.md](AGENTS.md)。
+可执行范围包括 FingerprintHub Web/Service 的被动条件、WhatWeb 可静态提取条件、Wappalyzer 被动 HTTP 条件、Nmap NULL Probe，以及固定只读白名单中的 TCP payload Probe。仍不执行动态 Ruby、DOM/JavaScript 行为、无法保真投影的隐式关系、UDP Probe、认证/写入/状态变更探针和未审核的 Nuclei 模板。互联网 CVE/POC 自动同步属于后续边界，不在当前版本中。
 
 ## 开发验证
 
@@ -275,6 +293,9 @@ go test ./...
 go test -race ./...
 go vet ./...
 go build -o yscan .
+./scripts/verify-t293.sh
+# 需要 Docker Compose v2、Nuclei，并占用本机 22/80/443/3306/6379/8080
+./scripts/verify-t293-products.sh
 ```
 
 ## 贡献

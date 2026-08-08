@@ -2,6 +2,7 @@ package report
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -43,11 +44,14 @@ func GenerateTaskReport(db *sql.DB, taskID int64, directory string) (string, err
 // ScanTaskRunReport is the v2 report model. It intentionally refers only to
 // a logical ScanTask, its immutable run snapshot, and its task-local Diff.
 type ScanTaskRunReport struct {
-	Task        model.ScanTask
-	Run         model.ScanTaskRun
-	Changes     model.ScanTaskRunChanges
-	Snapshot    model.ScanTaskRunSnapshot
-	GeneratedAt time.Time
+	Task                   model.ScanTask
+	Run                    model.ScanTaskRun
+	Changes                model.ScanTaskRunChanges
+	Snapshot               model.ScanTaskRunSnapshot
+	FingerprintImports     []model.FingerprintImport
+	FingerprintMatches     []map[string]interface{}
+	FingerprintConclusions []map[string]interface{}
+	GeneratedAt            time.Time
 }
 
 func GenerateScanTaskRunReport(db *sql.DB, scanTaskID, runID int64, directory string) (string, error) {
@@ -78,21 +82,39 @@ func GenerateScanTaskRunReport(db *sql.DB, scanTaskID, runID int64, directory st
 			return "", err
 		}
 	}
+	frozenImports, err := storage.ListFingerprintImportsForRun(db, run.ID)
+	if err != nil && !isMissingFingerprintReportTable(err) {
+		return "", err
+	}
+	fingerprintMatches, err := storage.ListFingerprintRunMatches(db, run.ID)
+	if err != nil && !isMissingFingerprintReportTable(err) {
+		return "", err
+	}
+	fingerprintConclusions, err := storage.ListFingerprintRunConclusions(db, run.ID)
+	if err != nil && !isMissingFingerprintReportTable(err) {
+		return "", err
+	}
 
-	path, err := WriteScanTaskRunReport(directory, ScanTaskRunReport{
-		Task:        task,
-		Run:         run,
-		Changes:     changes,
-		Snapshot:    snapshot,
-		GeneratedAt: time.Now().UTC(),
+	transaction, err := prepareScanTaskRunReport(directory, ScanTaskRunReport{
+		Task: task, Run: run, Changes: changes, Snapshot: snapshot,
+		FingerprintImports: frozenImports, FingerprintMatches: fingerprintMatches,
+		FingerprintConclusions: fingerprintConclusions, GeneratedAt: time.Now().UTC(),
 	})
 	if err != nil {
 		return "", err
 	}
-	if err := storage.UpdateScanTaskRunReportPath(db, run.ID, path); err != nil {
+	paths := transaction.paths
+	if err := updateScanTaskRunReportPaths(db, run.ID, paths.User, paths.Audit); err != nil {
+		_ = transaction.rollback()
 		return "", err
 	}
-	return path, nil
+	transaction.commit()
+	return paths.User, nil
+}
+
+func isMissingFingerprintReportTable(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no such table") && strings.Contains(message, "fingerprint")
 }
 
 func WriteTaskReport(directory string, report TaskReport) (string, error) {
@@ -105,7 +127,6 @@ func WriteTaskReport(directory string, report TaskReport) (string, error) {
 	if err := os.MkdirAll(directory, 0750); err != nil {
 		return "", err
 	}
-
 	path := TaskReportPath(directory, report.Task.ID)
 	temporary, err := os.CreateTemp(directory, ".yscan-report-*.md")
 	if err != nil {
@@ -127,33 +148,209 @@ func WriteTaskReport(directory string, report TaskReport) (string, error) {
 	return path, nil
 }
 
-func WriteScanTaskRunReport(directory string, report ScanTaskRunReport) (string, error) {
+type ScanTaskRunReportPaths struct {
+	User  string
+	Audit string
+}
+
+var renameScanTaskRunReportFile = os.Rename
+var updateScanTaskRunReportPaths = storage.UpdateScanTaskRunReportPaths
+
+type scanTaskRunReportTransaction struct {
+	paths        ScanTaskRunReportPaths
+	journalPath  string
+	userBackup   string
+	auditBackup  string
+	userExisted  bool
+	auditExisted bool
+}
+
+type scanTaskRunReportJournal struct {
+	UserPath     string `json:"user_path"`
+	AuditPath    string `json:"audit_path"`
+	UserBackup   string `json:"user_backup,omitempty"`
+	AuditBackup  string `json:"audit_backup,omitempty"`
+	UserExisted  bool   `json:"user_existed"`
+	AuditExisted bool   `json:"audit_existed"`
+}
+
+func WriteScanTaskRunReport(directory string, report ScanTaskRunReport) (ScanTaskRunReportPaths, error) {
+	transaction, err := prepareScanTaskRunReport(directory, report)
+	if err != nil {
+		return ScanTaskRunReportPaths{}, err
+	}
+	transaction.commit()
+	return transaction.paths, nil
+}
+
+func prepareScanTaskRunReport(directory string, report ScanTaskRunReport) (*scanTaskRunReportTransaction, error) {
 	if report.Task.ID <= 0 || report.Run.ID <= 0 || report.Run.ScanTaskID != report.Task.ID {
-		return "", errors.New("valid scan task and matching run are required")
+		return nil, errors.New("valid scan task and matching run are required")
 	}
 	if strings.TrimSpace(directory) == "" {
 		directory = DefaultDirectory
 	}
 	if err := os.MkdirAll(directory, 0750); err != nil {
-		return "", err
+		return nil, err
 	}
-
-	path := ScanTaskRunReportPath(directory, report.Task.ID, report.Run.ID)
-	temporary, err := os.CreateTemp(directory, ".yscan-run-report-*.md")
+	paths := ScanTaskRunReportPaths{User: ScanTaskRunReportPath(directory, report.Task.ID, report.Run.ID), Audit: ScanTaskRunAuditReportPath(directory, report.Task.ID, report.Run.ID)}
+	journalPath := scanTaskRunReportJournalPath(directory, report.Task.ID, report.Run.ID)
+	if err := recoverScanTaskRunReportPair(journalPath); err != nil {
+		return nil, err
+	}
+	userTemporaryPath, err := writeTemporaryScanTaskRunReport(directory, ".yscan-run-report-*.md", RenderScanTaskRunMarkdown(report))
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	defer os.Remove(userTemporaryPath)
+	auditTemporaryPath, err := writeTemporaryScanTaskRunReport(directory, ".yscan-run-audit-*.md", RenderScanTaskRunAuditMarkdown(report))
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(auditTemporaryPath)
+	transaction := &scanTaskRunReportTransaction{paths: paths, journalPath: journalPath}
+	transaction.userBackup, transaction.userExisted, err = backupScanTaskRunReport(paths.User, directory)
+	if err != nil {
+		return nil, err
+	}
+	transaction.auditBackup, transaction.auditExisted, err = backupScanTaskRunReport(paths.Audit, directory)
+	if err != nil {
+		transaction.commit()
+		return nil, err
+	}
+	if err := writeScanTaskRunReportJournal(transaction); err != nil {
+		transaction.commit()
+		return nil, err
+	}
+	if err := renameScanTaskRunReportFile(userTemporaryPath, paths.User); err != nil {
+		_ = transaction.rollback()
+		return nil, err
+	}
+	if err := renameScanTaskRunReportFile(auditTemporaryPath, paths.Audit); err != nil {
+		_ = transaction.rollback()
+		return nil, err
+	}
+	return transaction, nil
+}
+
+func backupScanTaskRunReport(path, directory string) (string, bool, error) {
+	content, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	backup, err := os.CreateTemp(directory, ".yscan-run-report-backup-*.md")
+	if err != nil {
+		return "", false, err
+	}
+	backupPath := backup.Name()
+	if _, err := backup.Write(content); err != nil {
+		_ = backup.Close()
+		_ = os.Remove(backupPath)
+		return "", false, err
+	}
+	if err := backup.Close(); err != nil {
+		_ = os.Remove(backupPath)
+		return "", false, err
+	}
+	return backupPath, true, nil
+}
+
+func writeScanTaskRunReportJournal(transaction *scanTaskRunReportTransaction) error {
+	content, err := json.Marshal(scanTaskRunReportJournal{
+		UserPath: transaction.paths.User, AuditPath: transaction.paths.Audit,
+		UserBackup: transaction.userBackup, AuditBackup: transaction.auditBackup,
+		UserExisted: transaction.userExisted, AuditExisted: transaction.auditExisted,
+	})
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(transaction.journalPath), ".yscan-run-report-journal-*.json")
+	if err != nil {
+		return err
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-
-	if _, err := temporary.WriteString(RenderScanTaskRunMarkdown(report)); err != nil {
+	if _, err := temporary.Write(content); err != nil {
 		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, transaction.journalPath)
+}
+
+func (transaction *scanTaskRunReportTransaction) rollback() error {
+	if transaction == nil {
+		return nil
+	}
+	var rollbackErr error
+	for _, item := range []struct {
+		path, backup string
+		existed      bool
+	}{{transaction.paths.User, transaction.userBackup, transaction.userExisted}, {transaction.paths.Audit, transaction.auditBackup, transaction.auditExisted}} {
+		if item.existed {
+			if err := os.Rename(item.backup, item.path); err != nil && rollbackErr == nil {
+				rollbackErr = err
+			}
+		} else if err := os.Remove(item.path); err != nil && !errors.Is(err, os.ErrNotExist) && rollbackErr == nil {
+			rollbackErr = err
+		}
+	}
+	if rollbackErr == nil {
+		_ = os.Remove(transaction.journalPath)
+	}
+	return rollbackErr
+}
+
+func (transaction *scanTaskRunReportTransaction) commit() {
+	if transaction == nil {
+		return
+	}
+	_ = os.Remove(transaction.userBackup)
+	_ = os.Remove(transaction.auditBackup)
+	_ = os.Remove(transaction.journalPath)
+}
+
+func recoverScanTaskRunReportPair(journalPath string) error {
+	content, err := os.ReadFile(journalPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var journal scanTaskRunReportJournal
+	if err := json.Unmarshal(content, &journal); err != nil {
+		return err
+	}
+	transaction := &scanTaskRunReportTransaction{
+		paths: ScanTaskRunReportPaths{User: journal.UserPath, Audit: journal.AuditPath}, journalPath: journalPath,
+		userBackup: journal.UserBackup, auditBackup: journal.AuditBackup, userExisted: journal.UserExisted, auditExisted: journal.AuditExisted,
+	}
+	return transaction.rollback()
+}
+
+func scanTaskRunReportJournalPath(directory string, scanTaskID, runID int64) string {
+	return filepath.Join(directory, fmt.Sprintf(".scan-task-%d-run-%d-report-pair.json", scanTaskID, runID))
+}
+
+func writeTemporaryScanTaskRunReport(directory, pattern, content string) (string, error) {
+	temporary, err := os.CreateTemp(directory, pattern)
+	if err != nil {
+		return "", err
+	}
+	path := temporary.Name()
+	if _, err := temporary.WriteString(content); err != nil {
+		_ = temporary.Close()
+		_ = os.Remove(path)
 		return "", err
 	}
 	if err := temporary.Close(); err != nil {
-		return "", err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
+		_ = os.Remove(path)
 		return "", err
 	}
 	return path, nil
@@ -179,7 +376,23 @@ func ReadScanTaskRunReport(directory string, scanTaskID, runID int64) ([]byte, e
 	if strings.TrimSpace(directory) == "" {
 		directory = DefaultDirectory
 	}
+	if err := recoverScanTaskRunReportPair(scanTaskRunReportJournalPath(directory, scanTaskID, runID)); err != nil {
+		return nil, err
+	}
 	return os.ReadFile(ScanTaskRunReportPath(directory, scanTaskID, runID))
+}
+
+func ReadScanTaskRunAuditReport(directory string, scanTaskID, runID int64) ([]byte, error) {
+	if scanTaskID <= 0 || runID <= 0 {
+		return nil, fmt.Errorf("invalid scan task or run ID")
+	}
+	if strings.TrimSpace(directory) == "" {
+		directory = DefaultDirectory
+	}
+	if err := recoverScanTaskRunReportPair(scanTaskRunReportJournalPath(directory, scanTaskID, runID)); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(ScanTaskRunAuditReportPath(directory, scanTaskID, runID))
 }
 
 func TaskReportPath(directory string, taskID int64) string {
@@ -188,6 +401,10 @@ func TaskReportPath(directory string, taskID int64) string {
 
 func ScanTaskRunReportPath(directory string, scanTaskID, runID int64) string {
 	return filepath.Join(directory, fmt.Sprintf("scan-task-%d-run-%d.md", scanTaskID, runID))
+}
+
+func ScanTaskRunAuditReportPath(directory string, scanTaskID, runID int64) string {
+	return filepath.Join(directory, fmt.Sprintf("scan-task-%d-run-%d-audit.md", scanTaskID, runID))
 }
 
 func RenderMarkdown(report TaskReport) string {
@@ -249,6 +466,147 @@ func RenderScanTaskRunMarkdown(report ScanTaskRunReport) string {
 	builder.WriteString("| Field | Value |\n| --- | --- |\n")
 	fmt.Fprintf(&builder, "| Logical Task ID | %d |\n", report.Task.ID)
 	fmt.Fprintf(&builder, "| Run ID | %d |\n", report.Run.ID)
+	fmt.Fprintf(&builder, "| Target | %s |\n", markdownCell(report.Run.Target))
+	fmt.Fprintf(&builder, "| Run Status | %s |\n", markdownCell(report.Run.Status))
+	fmt.Fprintf(&builder, "| Generated | %s |\n\n", generatedAt.Format(time.RFC3339))
+
+	writeRunValidation(&builder, report.Snapshot.Validation, report.Snapshot.Vulnerabilities)
+	writeRunServiceSummary(&builder, report.Snapshot)
+
+	builder.WriteString("## Asset Changes\n\n")
+	fmt.Fprintf(&builder, "Baseline run: %d. Configuration changed: %t.\n\n", report.Changes.BaselineRunID, report.Changes.ConfigChanged)
+	writeStringList(&builder, "New hosts", report.Changes.HostChanges.NewHosts)
+	writeStringList(&builder, "Inactive hosts", report.Changes.HostChanges.InactiveHosts)
+	writePortChanges(&builder, "Opened ports", report.Changes.PortChanges.Opened)
+	writePortChanges(&builder, "Closed ports", report.Changes.PortChanges.Closed)
+	return builder.String()
+}
+
+func writeRunValidation(builder *strings.Builder, validation model.ScanTaskRunValidation, findings []model.ScanTaskRunVulnerability) {
+	builder.WriteString("## Vulnerability Validation\n\n")
+	status := validation.Status
+	if status == "" {
+		status = "unavailable"
+	}
+	severityCounts := make(map[string]int)
+	for _, finding := range findings {
+		severity := strings.ToLower(strings.TrimSpace(finding.Severity))
+		switch severity {
+		case "critical", "high", "medium", "low", "info":
+		default:
+			severity = "unknown"
+		}
+		severityCounts[severity]++
+	}
+	builder.WriteString("| Status | Candidate endpoints | Executed endpoints | Templates | Findings |\n| --- | ---: | ---: | ---: | ---: |\n")
+	fmt.Fprintf(builder, "| %s | %d | %d | %d | %d |\n\n", markdownCell(status), validation.CandidateEndpointCount, validation.ExecutedEndpointCount, validation.TemplateCount, len(findings))
+	switch status {
+	case model.ScanTaskRunValidationDisabled:
+		builder.WriteString("Vulnerability validation was not enabled for this run.\n\n")
+	case model.ScanTaskRunValidationNotStarted:
+		builder.WriteString("Vulnerability validation did not start because the scan stopped in an earlier phase. No security conclusion can be drawn.\n\n")
+	case model.ScanTaskRunValidationNoCandidates:
+		builder.WriteString("Validation was enabled, but no usable endpoint/template candidate was available. No security conclusion can be drawn.\n\n")
+	case model.ScanTaskRunValidationFailed:
+		fmt.Fprintf(builder, "Validation failed: %s\n\n", markdownCell(validation.Error))
+	case model.ScanTaskRunValidationSuccess:
+		if len(findings) == 0 {
+			builder.WriteString("Validation executed successfully and recorded no findings.\n\n")
+		} else {
+			builder.WriteString("Validation executed successfully and recorded findings.\n\n")
+		}
+	default:
+		builder.WriteString("Validation state is unavailable for this historical run.\n\n")
+	}
+	builder.WriteString("### Risk Summary\n\n")
+	builder.WriteString("| Critical | High | Medium | Low | Info | Unknown |\n| ---: | ---: | ---: | ---: | ---: | ---: |\n")
+	fmt.Fprintf(builder, "| %d | %d | %d | %d | %d | %d |\n\n", severityCounts["critical"], severityCounts["high"], severityCounts["medium"], severityCounts["low"], severityCounts["info"], severityCounts["unknown"])
+	builder.WriteString("### Findings\n\n")
+	if len(findings) == 0 {
+		builder.WriteString("No vulnerability findings were recorded.\n\n")
+		return
+	}
+	builder.WriteString("| Severity | Name | Endpoint | Template | Matched at | Summary |\n| --- | --- | --- | --- | --- | --- |\n")
+	for _, finding := range findings {
+		fmt.Fprintf(builder, "| %s | %s | %s | %s | %s | %s |\n", markdownCell(finding.Severity), markdownCell(finding.Name), markdownCell(finding.Target), markdownCell(finding.TemplateID), markdownCell(finding.MatchedAt), markdownCell(finding.Description))
+	}
+	builder.WriteString("\n")
+}
+
+func writeRunServiceSummary(builder *strings.Builder, snapshot model.ScanTaskRunSnapshot) {
+	builder.WriteString("## Port And Service Summary\n\n")
+	if len(snapshot.Ports) == 0 {
+		builder.WriteString("No open ports were recorded.\n\n")
+		return
+	}
+	evidenceByPort := make(map[string][]model.ScanTaskRunProtocolEvidence)
+	for _, evidence := range snapshot.ProtocolEvidence {
+		key := fmt.Sprintf("%s:%d", evidence.IP, evidence.Port)
+		evidenceByPort[key] = append(evidenceByPort[key], evidence)
+	}
+	builder.WriteString("| Endpoint | Service | Product | Protocol response |\n| --- | --- | --- | --- |\n")
+	for _, port := range snapshot.Ports {
+		key := fmt.Sprintf("%s:%d", port.IP, port.Port)
+		fmt.Fprintf(builder, "| %s | %s | %s | %s |\n", markdownCell(key), markdownCell(port.ServiceType), markdownCell(port.Product), markdownCell(protocolEvidenceSummary(evidenceByPort[key])))
+	}
+	builder.WriteString("\n")
+}
+
+func protocolEvidenceSummary(evidence []model.ScanTaskRunProtocolEvidence) string {
+	parts := make([]string, 0, len(evidence))
+	for _, item := range evidence {
+		if item.EvidenceType == model.ProtocolEvidencePassiveBanner || (item.EvidenceType == "" && item.Protocol == "tcp") {
+			if item.Responded {
+				parts = append(parts, fmt.Sprintf("TCP banner %d bytes", item.BannerCapturedLength))
+			}
+			continue
+		}
+		if item.EvidenceType == model.ProtocolEvidenceActiveProbe {
+			if item.Responded {
+				parts = append(parts, fmt.Sprintf("TCP probe %s %d bytes", item.ProbeName, item.BannerCapturedLength))
+			} else {
+				outcome := item.Outcome
+				if outcome == "" {
+					outcome = model.ProtocolProbeOutcomeNoResponse
+				}
+				parts = append(parts, fmt.Sprintf("TCP probe %s %s", item.ProbeName, outcome))
+			}
+			continue
+		}
+		if !item.Responded {
+			continue
+		}
+		value := strings.ToUpper(item.Protocol)
+		if item.StatusCode > 0 {
+			value += fmt.Sprintf(" %d", item.StatusCode)
+		}
+		if item.Server != "" {
+			value += " server=" + item.Server
+		}
+		if item.Title != "" {
+			value += " title=" + item.Title
+		}
+		value += fmt.Sprintf(" response=%d bytes", item.BodyCapturedLength)
+		parts = append(parts, value)
+	}
+	if len(parts) == 0 {
+		return "No protocol response summary; passive banner unavailable"
+	}
+	return strings.Join(parts, "; ")
+}
+
+func RenderScanTaskRunAuditMarkdown(report ScanTaskRunReport) string {
+	generatedAt := report.GeneratedAt
+	if generatedAt.IsZero() {
+		generatedAt = time.Now().UTC()
+	}
+
+	var builder strings.Builder
+	builder.WriteString("# yscan CAASM Scan Task Run Audit Report\n\n")
+	builder.WriteString("## Run Summary\n\n")
+	builder.WriteString("| Field | Value |\n| --- | --- |\n")
+	fmt.Fprintf(&builder, "| Logical Task ID | %d |\n", report.Task.ID)
+	fmt.Fprintf(&builder, "| Run ID | %d |\n", report.Run.ID)
 	fmt.Fprintf(&builder, "| Sequence | %d |\n", report.Run.Sequence)
 	fmt.Fprintf(&builder, "| Target | %s |\n", markdownCell(report.Run.Target))
 	fmt.Fprintf(&builder, "| Scan Type | %s |\n", markdownCell(report.Run.ScanType))
@@ -268,17 +626,66 @@ func RenderScanTaskRunMarkdown(report ScanTaskRunReport) string {
 	writePortChanges(&builder, "Opened ports", report.Changes.PortChanges.Opened)
 	writePortChanges(&builder, "Closed ports", report.Changes.PortChanges.Closed)
 
-	builder.WriteString("## Vulnerability Summary\n\n")
+	builder.WriteString("## Frozen Fingerprint Revisions\n\n")
+	if len(report.FingerprintImports) == 0 {
+		builder.WriteString("No fingerprint revisions were frozen for this run.\n\n")
+	} else {
+		builder.WriteString("| Import | Source | Upstream Revision | Adapter | Projection SHA-256 |\n| --- | --- | --- | --- | --- |\n")
+		for _, fingerprintImport := range report.FingerprintImports {
+			fmt.Fprintf(&builder, "| %d | %d | %s | %s | %s |\n", fingerprintImport.ID, fingerprintImport.FingerprintSourceID, markdownCell(fingerprintImport.Commit), markdownCell(fingerprintImport.AdapterVersion), markdownCell(fingerprintImport.ProjectionSHA256))
+		}
+		builder.WriteString("\n")
+	}
+
+	builder.WriteString("## Fingerprint Conclusions\n\n")
+	if len(report.FingerprintConclusions) == 0 {
+		builder.WriteString("No definite fingerprint conclusions were recorded.\n\n")
+	} else {
+		builder.WriteString("| Endpoint | Product | Role / Exclusive group | Product evidence status | Version evidence status | CPE evidence status | Tags |\n| --- | --- | --- | --- | --- | --- | --- |\n")
+		for _, conclusion := range report.FingerprintConclusions {
+			fmt.Fprintf(&builder, "| %s:%d/%s | %s | %s / %s | %s (%d sources) | %s / %s (%d sources) | %s / %s (%d sources) | %s |\n",
+				markdownCell(reportMapString(conclusion, "ip")), reportMapInt(conclusion, "port"), markdownCell(reportMapString(conclusion, "protocol")),
+				markdownCell(reportMapString(conclusion, "product_key")), markdownCell(reportMapString(conclusion, "product_role")), markdownCell(reportMapString(conclusion, "exclusive_group")), markdownCell(reportMapString(conclusion, "product_status")), reportMapInt(conclusion, "product_source_count"),
+				markdownCell(reportMapString(conclusion, "version")), markdownCell(reportMapString(conclusion, "version_status")), reportMapInt(conclusion, "version_source_count"),
+				markdownCell(reportMapString(conclusion, "cpe")), markdownCell(reportMapString(conclusion, "cpe_status")), reportMapInt(conclusion, "cpe_source_count"),
+				markdownCell(reportMapStringSlice(conclusion, "tags")))
+		}
+		builder.WriteString("\n")
+	}
+
+	builder.WriteString("## Fingerprint Evidence\n\n")
+	if len(report.FingerprintMatches) == 0 {
+		builder.WriteString("No fingerprint matcher evidence was recorded.\n\n")
+	} else {
+		builder.WriteString("| Endpoint | Product | Source Rule | Matcher Evidence |\n| --- | --- | --- | --- |\n")
+		for _, match := range report.FingerprintMatches {
+			product := reportMapString(match, "product_key")
+			if sourceProduct := reportMapString(match, "source_product"); sourceProduct != "" && !strings.EqualFold(sourceProduct, product) {
+				product += " (source: " + sourceProduct + ")"
+			}
+			fmt.Fprintf(&builder, "| %s:%d/%s | %s | %s / %s | %s |\n",
+				markdownCell(reportMapString(match, "ip")), reportMapInt(match, "port"), markdownCell(reportMapString(match, "protocol")),
+				markdownCell(product), markdownCell(reportMapString(match, "source_key")), markdownCell(reportMapString(match, "source_rule_id")),
+				markdownCell(reportMatcherEvidence(match)))
+		}
+		builder.WriteString("\n")
+	}
+
 	builder.WriteString("## Validation Plan\n\n")
 	if len(report.Snapshot.TemplateCandidates) == 0 {
 		builder.WriteString("No validation templates were selected.\n\n")
 	} else {
-		builder.WriteString("| Template | Source | Reason |\n| --- | --- | --- |\n")
+		builder.WriteString("| Endpoint | Template | Source | Mapping Revision | Template SHA-256 | Reason |\n| --- | --- | --- | --- | --- | --- |\n")
 		for _, candidate := range report.Snapshot.TemplateCandidates {
-			fmt.Fprintf(&builder, "| %s | %s | %s |\n", markdownCell(candidate.TemplateID), markdownCell(candidate.Source), markdownCell(candidate.Reason))
+			endpoint := "-"
+			if candidate.IP != "" {
+				endpoint = fmt.Sprintf("%s:%d/%s", candidate.IP, candidate.Port, candidate.Protocol)
+			}
+			fmt.Fprintf(&builder, "| %s | %s | %s | %s | %s | %s |\n", markdownCell(endpoint), markdownCell(candidate.TemplateID), markdownCell(candidate.Source), markdownCell(candidate.TemplateSetRevision), markdownCell(candidate.TemplateSHA256), markdownCell(candidate.Reason))
 		}
 		builder.WriteString("\n")
 	}
+	builder.WriteString("## Vulnerability Summary\n\n")
 	if len(report.Snapshot.Vulnerabilities) == 0 {
 		builder.WriteString("No vulnerability findings were recorded for this run.\n")
 		return builder.String()
@@ -293,6 +700,56 @@ func RenderScanTaskRunMarkdown(report ScanTaskRunReport) string {
 		)
 	}
 	return builder.String()
+}
+
+func reportMapString(value map[string]interface{}, key string) string {
+	if value[key] == nil {
+		return ""
+	}
+	if text, ok := value[key].(string); ok {
+		return text
+	}
+	return fmt.Sprint(value[key])
+}
+
+func reportMapInt(value map[string]interface{}, key string) int {
+	switch number := value[key].(type) {
+	case int:
+		return number
+	case int64:
+		return int(number)
+	case float64:
+		return int(number)
+	default:
+		return 0
+	}
+}
+
+func reportMapStringSlice(value map[string]interface{}, key string) string {
+	switch values := value[key].(type) {
+	case []string:
+		return strings.Join(values, ", ")
+	case []interface{}:
+		out := make([]string, 0, len(values))
+		for _, item := range values {
+			out = append(out, fmt.Sprint(item))
+		}
+		return strings.Join(out, ", ")
+	default:
+		return ""
+	}
+}
+
+func reportMatcherEvidence(match map[string]interface{}) string {
+	values, ok := match["matcher_evidence"].([]map[string]interface{})
+	if !ok {
+		return ""
+	}
+	summaries := make([]string, 0, len(values))
+	for _, evidence := range values {
+		summaries = append(summaries, reportMapString(evidence, "summary"))
+	}
+	return strings.Join(summaries, "; ")
 }
 
 func emptyChanges(task model.Task) model.TaskChangeSummary {

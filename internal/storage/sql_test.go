@@ -2,7 +2,10 @@ package storage
 
 import (
 	"database/sql"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -98,6 +101,159 @@ func TestInitSQLiteSchemaMigratesLegacyDatabase(t *testing.T) {
 	}
 	if task.ReportError != "legacy migration check" {
 		t.Fatalf("report error after migration = %q", task.ReportError)
+	}
+}
+
+func TestM11V2RoleMigrationIsMarkedReentrantAndRestoresFrozenRoles(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	fixture, err := os.ReadFile(filepath.Join("testdata", "m11-v2-before-t320.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(fixture)); err != nil {
+		t.Fatalf("load previous M11/V2 fixture: %v", err)
+	}
+	if err := ensureSQLiteMigrations(db); err != nil {
+		t.Fatalf("upgrade previous M11/V2 fixture: %v", err)
+	}
+
+	want := map[string][2]string{
+		"nginx":   {"web_server", "web_server"},
+		"openssh": {"network_service", "network_service"},
+		"redis":   {"network_service", "network_service"},
+	}
+	for _, table := range []string{"fingerprint_rules", "asset_fingerprint_matches", "asset_fingerprint_conclusions"} {
+		var rows *sql.Rows
+		if table == "fingerprint_rules" {
+			rows, err = db.Query(`SELECT product.canonical_name, rule.product_role, rule.exclusive_group
+				FROM fingerprint_rules AS rule JOIN fingerprint_products AS product ON product.id = rule.fingerprint_product_id
+				WHERE rule.fingerprint_source_rule_id BETWEEN 9400 AND 9402`)
+		} else {
+			rows, err = db.Query(`SELECT product_key, product_role, exclusive_group FROM ` + table + ` WHERE scan_task_run_id = 9900`)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var product, role, group string
+			if err := rows.Scan(&product, &role, &group); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			if expected := want[product]; role != expected[0] || group != expected[1] {
+				rows.Close()
+				t.Fatalf("%s %s role=%q/%q want=%q/%q", table, product, role, group, expected[0], expected[1])
+			}
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var markerCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE name = ?`, t320FrozenProductRolesMigration).Scan(&markerCount); err != nil || markerCount != 1 {
+		t.Fatalf("migration marker count=%d err=%v", markerCount, err)
+	}
+	if _, err := db.Exec(`UPDATE fingerprint_rules SET product_role = 'sentinel' WHERE id = 9500`); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSQLiteMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	var role string
+	if err := db.QueryRow(`SELECT product_role FROM fingerprint_rules WHERE id = 9500`).Scan(&role); err != nil || role != "sentinel" {
+		t.Fatalf("completed migration reran: role=%q err=%v", role, err)
+	}
+
+	newRun, err := CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: 9800, ScheduledFor: "2026-08-02T00:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frozenCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM scan_task_run_fingerprint_imports AS frozen
+		JOIN fingerprint_rules AS rule ON rule.fingerprint_source_rule_id IN
+			(SELECT id FROM fingerprint_source_rules WHERE fingerprint_import_id = frozen.fingerprint_import_id)
+		WHERE frozen.scan_task_run_id = ? AND frozen.fingerprint_import_id = 9200
+			AND rule.product_role IN ('web_server', 'network_service', 'sentinel')`, newRun.ID).Scan(&frozenCount); err != nil || frozenCount != 3 {
+		t.Fatalf("new run frozen classified rules=%d err=%v", frozenCount, err)
+	}
+}
+
+func TestInitSQLiteSchemaBackfillsLayeredFingerprintConfidence(t *testing.T) {
+	db := openTestDB(t)
+	for _, statement := range []string{
+		`CREATE TABLE asset_fingerprint_matches (
+			id INTEGER PRIMARY KEY, scan_task_run_id INTEGER NOT NULL, fingerprint_import_id INTEGER NOT NULL,
+			fingerprint_source_rule_id INTEGER NOT NULL, ip TEXT NOT NULL, port INTEGER NOT NULL, protocol TEXT NOT NULL,
+			product_key TEXT NOT NULL, version TEXT, cpe TEXT, tags_json TEXT NOT NULL DEFAULT '[]', is_soft INTEGER NOT NULL DEFAULT 0,
+			evidence_summary TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE asset_fingerprint_conclusions (
+			id INTEGER PRIMARY KEY, scan_task_run_id INTEGER NOT NULL, ip TEXT NOT NULL, port INTEGER NOT NULL, protocol TEXT NOT NULL,
+			product_key TEXT NOT NULL, version TEXT, cpe TEXT, tags_json TEXT NOT NULL DEFAULT '[]',
+			conclusion_status TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(scan_task_run_id, ip, port, protocol, product_key)
+		)`,
+		`INSERT INTO asset_fingerprint_matches (id, scan_task_run_id, fingerprint_import_id, fingerprint_source_rule_id, ip, port, protocol, product_key, version, cpe, evidence_summary)
+		 VALUES (1, 7, 10, 100, '192.168.90.1', 22, 'tcp', 'openssh', '9.6', 'cpe:/a:openbsd:openssh:9.6', 'a'),
+		        (2, 7, 11, 101, '192.168.90.1', 22, 'tcp', 'openssh', NULL, NULL, 'b')`,
+		`INSERT INTO asset_fingerprint_conclusions (id, scan_task_run_id, ip, port, protocol, product_key, version, cpe, conclusion_status)
+		 VALUES (1, 7, '192.168.90.1', 22, 'tcp', 'openssh', '9.6', 'cpe:/a:openbsd:openssh:9.6', 'corroborated')`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatalf("migrate layered confidence: %v", err)
+	}
+	var productStatus, versionStatus, cpeStatus, legacyStatus string
+	var productSources, versionSources, cpeSources int
+	if err := db.QueryRow(`SELECT conclusion_status, product_status, product_source_count, version_status, version_source_count, cpe_status, cpe_source_count FROM asset_fingerprint_conclusions WHERE id = 1`).Scan(&legacyStatus, &productStatus, &productSources, &versionStatus, &versionSources, &cpeStatus, &cpeSources); err != nil {
+		t.Fatal(err)
+	}
+	if legacyStatus != "corroborated" || productStatus != "corroborated" || productSources != 2 || versionStatus != "matched" || versionSources != 1 || cpeStatus != "matched" || cpeSources != 1 {
+		t.Fatalf("backfilled confidence legacy=%s product=%s/%d version=%s/%d cpe=%s/%d", legacyStatus, productStatus, productSources, versionStatus, versionSources, cpeStatus, cpeSources)
+	}
+}
+
+func TestInitSQLiteSchemaClearsConflictingLegacyVersionAndCPE(t *testing.T) {
+	db := openTestDB(t)
+	for _, statement := range []string{
+		`CREATE TABLE asset_fingerprint_matches (
+			id INTEGER PRIMARY KEY, scan_task_run_id INTEGER NOT NULL, fingerprint_import_id INTEGER NOT NULL,
+			fingerprint_source_rule_id INTEGER NOT NULL, ip TEXT NOT NULL, port INTEGER NOT NULL, protocol TEXT NOT NULL,
+			product_key TEXT NOT NULL, version TEXT, cpe TEXT, tags_json TEXT NOT NULL DEFAULT '[]', is_soft INTEGER NOT NULL DEFAULT 0,
+			evidence_summary TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE asset_fingerprint_conclusions (
+			id INTEGER PRIMARY KEY, scan_task_run_id INTEGER NOT NULL, ip TEXT NOT NULL, port INTEGER NOT NULL, protocol TEXT NOT NULL,
+			product_key TEXT NOT NULL, version TEXT, cpe TEXT, tags_json TEXT NOT NULL DEFAULT '[]',
+			conclusion_status TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(scan_task_run_id, ip, port, protocol, product_key)
+		)`,
+		`INSERT INTO asset_fingerprint_matches (id, scan_task_run_id, fingerprint_import_id, fingerprint_source_rule_id, ip, port, protocol, product_key, version, cpe, evidence_summary)
+		 VALUES (1, 8, 20, 200, '192.168.90.2', 80, 'http', 'fixture', '1.0', 'cpe:/a:fixture:server:1.0', 'a'),
+		        (2, 8, 21, 201, '192.168.90.2', 80, 'http', 'fixture', '2.0', 'cpe:/a:fixture:server:2.0', 'b')`,
+		`INSERT INTO asset_fingerprint_conclusions (id, scan_task_run_id, ip, port, protocol, product_key, version, cpe, conclusion_status)
+		 VALUES (1, 8, '192.168.90.2', 80, 'http', 'fixture', '1.0', 'cpe:/a:fixture:server:1.0', 'corroborated')`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	var version, cpe sql.NullString
+	var versionStatus, cpeStatus string
+	if err := db.QueryRow(`SELECT version, cpe, version_status, cpe_status FROM asset_fingerprint_conclusions WHERE id = 1`).Scan(&version, &cpe, &versionStatus, &cpeStatus); err != nil {
+		t.Fatal(err)
+	}
+	if version.Valid || cpe.Valid || versionStatus != "conflicted" || cpeStatus != "conflicted" {
+		t.Fatalf("conflicting migration version=%v cpe=%v statuses=%s/%s", version, cpe, versionStatus, cpeStatus)
 	}
 }
 
@@ -320,13 +476,124 @@ func TestSyncOpenPortsReplacesPreviousPortInventory(t *testing.T) {
 		t.Fatalf("second port sync: %v", err)
 	}
 
-	ports, err := ListOpenPortsByIP(db, ip)
+	rows, err := db.Query(`SELECT port FROM current_port_inventory WHERE ip = ? ORDER BY port`, ip)
 	if err != nil {
-		t.Fatalf("list ports: %v", err)
+		t.Fatalf("list current V2 ports: %v", err)
+	}
+	defer rows.Close()
+	var ports []int
+	for rows.Next() {
+		var port int
+		if err := rows.Scan(&port); err != nil {
+			t.Fatalf("scan current V2 port: %v", err)
+		}
+		ports = append(ports, port)
 	}
 	if want := []int{443}; !reflect.DeepEqual(ports, want) {
-		t.Fatalf("ports = %v, want %v", ports, want)
+		t.Fatalf("current V2 ports = %v, want %v", ports, want)
 	}
+	var legacyCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM scan_results WHERE ip = ?`, ip).Scan(&legacyCount); err != nil {
+		t.Fatalf("count legacy scan results: %v", err)
+	}
+	if legacyCount != 0 {
+		t.Fatalf("V2 port sync wrote legacy scan_results rows: %d", legacyCount)
+	}
+}
+
+func TestPortInventoryRespectsSelectedScanCoverage(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatalf("initSQLiteSchema: %v", err)
+	}
+
+	const (
+		ip    = "192.168.10.20"
+		scope = "subnet:192.168.10.0/24"
+	)
+	fullResults := []model.ScanResult{
+		{Address: ip + ":80", Open: true, Service: "http"},
+		{Address: ip + ":32123", Open: true, Service: "unknown"},
+	}
+	fullCoverage := FullPortScanCoverage()
+	if err := SyncOpenPorts(db, ip, fullResults, fullCoverage); err != nil {
+		t.Fatalf("seed full current inventory: %v", err)
+	}
+	if err := SyncScopeOpenPorts(db, scope, ip, fullResults, fullCoverage); err != nil {
+		t.Fatalf("seed full scope inventory: %v", err)
+	}
+
+	baselineCoverage := SelectedPortScanCoverage([]int{80, 443})
+	baselineResults := []model.ScanResult{{Address: ip + ":443", Open: true, Service: "https"}}
+	if err := SyncOpenPorts(db, ip, baselineResults, baselineCoverage); err != nil {
+		t.Fatalf("sync selected current inventory: %v", err)
+	}
+	if err := SyncScopeOpenPorts(db, scope, ip, baselineResults, baselineCoverage); err != nil {
+		t.Fatalf("sync selected scope inventory: %v", err)
+	}
+	if got, want := listCurrentPortsForTest(t, db, ip), []int{443, 32123}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("current ports after selected scan = %v, want %v", got, want)
+	}
+	scopePorts, err := ListScopeActivePorts(db, scope)
+	if err != nil {
+		t.Fatalf("list scope ports after selected scan: %v", err)
+	}
+	if want := map[string][]int{ip: {443, 32123}}; !reflect.DeepEqual(scopePorts, want) {
+		t.Fatalf("scope ports after selected scan = %#v, want %#v", scopePorts, want)
+	}
+
+	if err := SyncOpenPorts(db, ip, baselineResults, fullCoverage); err != nil {
+		t.Fatalf("sync full current inventory: %v", err)
+	}
+	if err := SyncScopeOpenPorts(db, scope, ip, baselineResults, fullCoverage); err != nil {
+		t.Fatalf("sync full scope inventory: %v", err)
+	}
+	if got, want := listCurrentPortsForTest(t, db, ip), []int{443}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("current ports after full scan = %v, want %v", got, want)
+	}
+	scopePorts, err = ListScopeActivePorts(db, scope)
+	if err != nil {
+		t.Fatalf("list scope ports after full scan: %v", err)
+	}
+	if want := map[string][]int{ip: {443}}; !reflect.DeepEqual(scopePorts, want) {
+		t.Fatalf("scope ports after full scan = %#v, want %#v", scopePorts, want)
+	}
+}
+
+func TestPortInventoryRejectsResultsOutsideDeclaredCoverage(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatalf("initSQLiteSchema: %v", err)
+	}
+	const ip = "192.168.10.21"
+	result := []model.ScanResult{{Address: ip + ":32123", Open: true, Service: "unknown"}}
+	if err := SyncOpenPorts(db, ip, result, SelectedPortScanCoverage([]int{80, 443})); err == nil {
+		t.Fatal("result outside selected coverage must be rejected")
+	}
+	if got := listCurrentPortsForTest(t, db, ip); len(got) != 0 {
+		t.Fatalf("rejected result changed current inventory: %v", got)
+	}
+}
+
+func listCurrentPortsForTest(t *testing.T, db *sql.DB, ip string) []int {
+	t.Helper()
+	rows, err := db.Query(`SELECT port FROM current_port_inventory WHERE ip = ? ORDER BY port`, ip)
+	if err != nil {
+		t.Fatalf("list current ports: %v", err)
+	}
+	defer rows.Close()
+	ports := make([]int, 0)
+	for rows.Next() {
+		var port int
+		if err := rows.Scan(&port); err != nil {
+			t.Fatalf("scan current port: %v", err)
+		}
+		ports = append(ports, port)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate current ports: %v", err)
+	}
+	return ports
 }
 
 func TestScopePortInventoryKeepsOverlappingScopesIndependent(t *testing.T) {
@@ -446,16 +713,121 @@ func TestGetAssetDetail(t *testing.T) {
 	}
 	if err := SyncOpenPorts(db, "192.168.10.10", []model.ScanResult{
 		{Address: "192.168.10.10:443", Open: true, Service: "https"},
+		{Address: "192.168.10.10:22", Open: true, Service: "openssh"},
 	}); err != nil {
 		t.Fatalf("sync ports: %v", err)
+	}
+	task := createScheduledTaskForTest(t, db, "192.168.10.0/24")
+	run := createRunningTaskRun(t, db, task.ID, "2026-08-07T02:00:00Z")
+	if err := SaveScanTaskRunSnapshot(db, model.ScanTaskRunSnapshot{
+		RunID: run.ID,
+		Ports: []model.ScanTaskRunPort{
+			{IP: "192.168.10.10", Port: 22, ServiceType: "openssh", Product: "openssh"},
+			{IP: "192.168.10.10", Port: 443, ServiceType: "https", Product: "nginx"},
+		},
+		ProtocolEvidence: []model.ScanTaskRunProtocolEvidence{
+			{IP: "192.168.10.10", Port: 22, EvidenceType: model.ProtocolEvidencePassiveBanner, Protocol: "tcp", Responded: true, BannerCapturedLength: 28, BannerSHA256: strings.Repeat("a", 64)},
+			{IP: "192.168.10.10", Port: 22, EvidenceType: model.ProtocolEvidenceActiveProbe, ProbeName: "GenericLines", Protocol: "tcp", Responded: true, BannerCapturedLength: 31, BannerSHA256: strings.Repeat("b", 64)},
+			{IP: "192.168.10.10", Port: 22, EvidenceType: model.ProtocolEvidenceActiveProbe, ProbeName: "GetRequest", Protocol: "tcp", Responded: true, BannerCapturedLength: 35, BannerSHA256: strings.Repeat("d", 64)},
+			{IP: "192.168.10.10", Port: 443, EvidenceType: model.ProtocolEvidenceWeb, Protocol: "https", Responded: true, StatusCode: 200, Server: "nginx", Title: "Console", BodyCapturedLength: 917, BodySHA256: strings.Repeat("c", 64)},
+		},
+		Validation: model.ScanTaskRunValidation{Status: model.ScanTaskRunValidationDisabled},
+	}); err != nil {
+		t.Fatalf("save protocol evidence: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE scan_task_runs SET status = 'success', finished_at = datetime('now') WHERE id = ?`, run.ID); err != nil {
+		t.Fatal(err)
 	}
 
 	detail, err := GetAssetDetail(db, "192.168.10.10")
 	if err != nil {
 		t.Fatalf("get asset detail: %v", err)
 	}
-	if detail.Host.IP != "192.168.10.10" || detail.Host.ScopeCount != 1 || len(detail.Scopes) != 1 || len(detail.Ports) != 1 || detail.Ports[0].Port != 443 {
+	if detail.Host.IP != "192.168.10.10" || detail.Host.ScopeCount != 1 || len(detail.Scopes) != 1 || len(detail.Ports) != 2 {
 		t.Fatalf("asset detail = %#v", detail)
+	}
+	ssh, web := detail.Ports[0], detail.Ports[1]
+	if ssh.Port != 22 || ssh.Protocol != "tcp" || ssh.ResponseLength != 28 || len(ssh.ProtocolEvidence) != 3 || ssh.ProtocolEvidence[0].EvidenceType != model.ProtocolEvidenceActiveProbe || web.Port != 443 || web.Protocol != "https" || web.StatusCode != 200 || web.Server != "nginx" || web.ResponseLength != 917 || len(web.ProtocolEvidence) != 1 {
+		t.Fatalf("asset protocol evidence ssh=%#v web=%#v", ssh, web)
+	}
+}
+
+func TestProtocolEvidenceMigrationPreservesLegacyRowsAndAllowsMultipleProbes(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE scan_task_runs (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE scan_task_run_protocol_evidence (
+		scan_task_run_id INTEGER NOT NULL, ip TEXT NOT NULL, port INTEGER NOT NULL, protocol TEXT NOT NULL,
+		responded INTEGER NOT NULL DEFAULT 0, status_code INTEGER, server TEXT, title TEXT,
+		banner_captured_length INTEGER NOT NULL DEFAULT 0, banner_sha256 TEXT, banner_truncated INTEGER NOT NULL DEFAULT 0,
+		header_captured_length INTEGER NOT NULL DEFAULT 0, header_sha256 TEXT, header_truncated INTEGER NOT NULL DEFAULT 0,
+		body_captured_length INTEGER NOT NULL DEFAULT 0, body_sha256 TEXT, body_truncated INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (scan_task_run_id, ip, port, protocol))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO scan_task_run_protocol_evidence (scan_task_run_id, ip, port, protocol, responded, banner_captured_length, banner_sha256) VALUES (1, '192.0.2.10', 22, 'tcp', 1, 28, ?)`, strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateProtocolEvidenceSchema(db); err != nil {
+		t.Fatalf("migrate protocol evidence: %v", err)
+	}
+	var evidenceType, probeName string
+	if err := db.QueryRow(`SELECT evidence_type, probe_name FROM scan_task_run_protocol_evidence WHERE scan_task_run_id = 1`).Scan(&evidenceType, &probeName); err != nil || evidenceType != model.ProtocolEvidencePassiveBanner || probeName != "" {
+		t.Fatalf("legacy evidence type=%q probe=%q err=%v", evidenceType, probeName, err)
+	}
+	for _, probe := range []string{"GenericLines", "GetRequest"} {
+		if _, err := db.Exec(`INSERT INTO scan_task_run_protocol_evidence (scan_task_run_id, ip, port, evidence_type, probe_name, protocol, responded) VALUES (1, '192.0.2.10', 22, ?, ?, 'tcp', 1)`, model.ProtocolEvidenceActiveProbe, probe); err != nil {
+			t.Fatalf("insert active probe %s: %v", probe, err)
+		}
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM scan_task_run_protocol_evidence WHERE scan_task_run_id = 1`).Scan(&count); err != nil || count != 3 {
+		t.Fatalf("protocol evidence count=%d err=%v", count, err)
+	}
+}
+
+func TestMigrationBackfillsAuditReportPathForExistingRunReports(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	task := createScheduledTaskForTest(t, db, "192.0.2.0/24")
+	run := createRunningTaskRun(t, db, task.ID, "2026-08-07T03:00:00Z")
+	const reportPath = "reports/scan-task-1-run-1.md"
+	if _, err := db.Exec(`UPDATE scan_task_runs SET report_path = ?, audit_report_path = NULL WHERE id = ?`, reportPath, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSQLiteMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := GetScanTaskRun(db, run.ID)
+	if err != nil || loaded.AuditReportPath != "reports/scan-task-1-run-1-audit.md" {
+		t.Fatalf("audit report path=%q err=%v", loaded.AuditReportPath, err)
+	}
+}
+
+func TestGetAssetDetailExcludesLegacyScanResults(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatalf("initSQLiteSchema: %v", err)
+	}
+	const ip = "192.168.10.11"
+	if err := SyncHostInventory(db, "ip:"+ip, []string{ip}); err != nil {
+		t.Fatalf("sync host: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO scan_results (ip, port, service_type) VALUES (?, 9999, 'legacy')`, ip); err != nil {
+		t.Fatalf("seed legacy result: %v", err)
+	}
+	if err := SyncOpenPorts(db, ip, []model.ScanResult{{Address: ip + ":443", Open: true, Service: "https"}}); err != nil {
+		t.Fatalf("sync V2 port: %v", err)
+	}
+	detail, err := GetAssetDetail(db, ip)
+	if err != nil {
+		t.Fatalf("get asset detail: %v", err)
+	}
+	if len(detail.Ports) != 1 || detail.Ports[0].Port != 443 {
+		t.Fatalf("asset detail included legacy ports: %#v", detail.Ports)
 	}
 }
 

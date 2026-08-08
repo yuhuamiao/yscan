@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -82,8 +84,9 @@ func FinalizeInterruptedScanTaskRuns(db *sql.DB) error {
 // report path is returned separately so filesystem cleanup can be coordinated
 // by the scheduling layer without coupling storage to report generation.
 type ExpiredScanTaskRun struct {
-	ID         int64
-	ReportPath string
+	ID              int64
+	ReportPath      string
+	AuditReportPath string
 }
 
 func CreateScanTaskRun(db *sql.DB, run model.ScanTaskRun) (model.ScanTaskRun, error) {
@@ -163,6 +166,9 @@ func CreateScanTaskRun(db *sql.DB, run model.ScanTaskRun) (model.ScanTaskRun, er
 	run.ID, err = result.LastInsertId()
 	if err != nil {
 		return model.ScanTaskRun{}, err
+	}
+	if err := FreezeActiveFingerprintImportsTx(tx, run.ID); err != nil {
+		return model.ScanTaskRun{}, fmt.Errorf("freeze active fingerprint imports: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return model.ScanTaskRun{}, err
@@ -244,6 +250,15 @@ func ClaimQueuedOneTimeScanTaskRun(db *sql.DB) (*model.ScanTaskRun, error) {
 	if err != nil {
 		return nil, err
 	}
+	var frozenCount int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM scan_task_run_fingerprint_imports WHERE scan_task_run_id = ?`, runID).Scan(&frozenCount); err != nil && !isMissingFingerprintCatalogTable(err) {
+		return nil, err
+	}
+	if frozenCount == 0 {
+		if err := FreezeActiveFingerprintImportsTx(tx, runID); err != nil {
+			return nil, fmt.Errorf("freeze recovered run fingerprint imports: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -255,7 +270,7 @@ func ClaimQueuedOneTimeScanTaskRun(db *sql.DB) (*model.ScanTaskRun, error) {
 // baseline even when it predates the normal retention window.
 func ListExpiredTerminalScanTaskRuns(db *sql.DB, cutoff time.Time) ([]ExpiredScanTaskRun, error) {
 	rows, err := db.Query(`
-		SELECT run.id, COALESCE(run.report_path, '')
+		SELECT run.id, COALESCE(run.report_path, ''), COALESCE(run.audit_report_path, '')
 		FROM scan_task_runs AS run
 		WHERE run.status IN (?, ?, ?, ?, ?)
 			AND julianday(COALESCE(run.finished_at, run.scheduled_for, run.created_at)) < julianday(?)
@@ -281,7 +296,7 @@ func ListExpiredTerminalScanTaskRuns(db *sql.DB, cutoff time.Time) ([]ExpiredSca
 	runs := make([]ExpiredScanTaskRun, 0)
 	for rows.Next() {
 		var run ExpiredScanTaskRun
-		if err := rows.Scan(&run.ID, &run.ReportPath); err != nil {
+		if err := rows.Scan(&run.ID, &run.ReportPath, &run.AuditReportPath); err != nil {
 			return nil, err
 		}
 		runs = append(runs, run)
@@ -376,10 +391,33 @@ func UpdateScanTaskRunReportPath(db *sql.DB, runID int64, path string) error {
 	if path == "" {
 		return errors.New("scan task run report path is required")
 	}
+	result, err := db.Exec(`UPDATE scan_task_runs SET report_path = ?, report_error = NULL, updated_at = datetime('now') WHERE id = ?`, path, runID)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 0 {
+		return ErrScanTaskRunNotFound
+	}
+	return nil
+}
+
+func UpdateScanTaskRunReportPaths(db *sql.DB, runID int64, path, auditPath string) error {
+	if runID <= 0 {
+		return errors.New("scan task run ID is required")
+	}
+	path = strings.TrimSpace(path)
+	auditPath = strings.TrimSpace(auditPath)
+	if path == "" || auditPath == "" {
+		return errors.New("scan task run user and audit report paths are required")
+	}
 	result, err := db.Exec(`
 		UPDATE scan_task_runs
-		SET report_path = ?, report_error = NULL, updated_at = datetime('now')
-		WHERE id = ?`, path, runID)
+		SET report_path = ?, audit_report_path = ?, report_error = NULL, updated_at = datetime('now')
+		WHERE id = ?`, path, auditPath, runID)
 	if err != nil {
 		return err
 	}
@@ -439,9 +477,10 @@ func SaveScanTaskRunSnapshot(db *sql.DB, snapshot model.ScanTaskRunSnapshot) err
 	result, err := tx.Exec(`
 		UPDATE scan_task_runs
 		SET snapshot_written_at = datetime('now'), updated_at = datetime('now')
-		WHERE id = ? AND status = ? AND snapshot_written_at IS NULL`,
+		WHERE id = ? AND status IN (?, ?) AND snapshot_written_at IS NULL`,
 		snapshot.RunID,
 		model.ScanTaskRunStatusRunning,
+		model.ScanTaskRunStatusCancelRequested,
 	)
 	if err != nil {
 		return err
@@ -468,16 +507,50 @@ func SaveScanTaskRunSnapshot(db *sql.DB, snapshot model.ScanTaskRunSnapshot) err
 			return err
 		}
 	}
-	for _, candidate := range snapshot.TemplateCandidates {
-		if _, err := tx.Exec(`INSERT INTO scan_task_run_template_candidates (scan_task_run_id, template_id, path, source, reason) VALUES (?, ?, ?, ?, ?)`, snapshot.RunID, candidate.TemplateID, candidate.Path, candidate.Source, candidate.Reason); err != nil {
+	for _, evidence := range snapshot.ProtocolEvidence {
+		evidence.EvidenceType = normalizedProtocolEvidenceType(evidence)
+		if _, err := tx.Exec(`
+			INSERT INTO scan_task_run_protocol_evidence
+				(scan_task_run_id, ip, port, evidence_type, probe_name, protocol, responded, outcome, diagnostic, status_code, server, title,
+				 banner_captured_length, banner_sha256, banner_truncated,
+				 header_captured_length, header_sha256, header_truncated,
+				 body_captured_length, body_sha256, body_truncated)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			snapshot.RunID, evidence.IP, evidence.Port, evidence.EvidenceType, evidence.ProbeName, evidence.Protocol, boolToInt(evidence.Responded), normalizedProtocolEvidenceOutcome(evidence), evidence.Diagnostic, nullIfZero(evidence.StatusCode),
+			nullIfEmpty(evidence.Server), nullIfEmpty(evidence.Title), evidence.BannerCapturedLength, nullIfEmpty(evidence.BannerSHA256), boolToInt(evidence.BannerTruncated),
+			evidence.HeaderCapturedLength, nullIfEmpty(evidence.HeaderSHA256), boolToInt(evidence.HeaderTruncated), evidence.BodyCapturedLength, nullIfEmpty(evidence.BodySHA256), boolToInt(evidence.BodyTruncated)); err != nil {
 			return err
+		}
+	}
+	if snapshot.Validation.Status != "" {
+		if _, err := tx.Exec(`
+			INSERT INTO scan_task_run_validation
+				(scan_task_run_id, status, candidate_endpoint_count, executed_endpoint_count, template_count, finding_count, started_at, finished_at, error_message)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, snapshot.RunID, snapshot.Validation.Status,
+			snapshot.Validation.CandidateEndpointCount, snapshot.Validation.ExecutedEndpointCount, snapshot.Validation.TemplateCount, snapshot.Validation.FindingCount,
+			nullIfEmpty(snapshot.Validation.StartedAt), nullIfEmpty(snapshot.Validation.FinishedAt), nullIfEmpty(snapshot.Validation.Error)); err != nil {
+			return err
+		}
+	}
+	for _, candidate := range snapshot.TemplateCandidates {
+		mappingImportID := interface{}(nil)
+		if candidate.MappingImportID > 0 {
+			mappingImportID = candidate.MappingImportID
+		}
+		if _, err := tx.Exec(`INSERT INTO scan_task_run_template_candidates (scan_task_run_id, template_id, path, source, reason, template_sha256, template_set_revision, template_mapping_import_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(scan_task_run_id, template_id, path) DO UPDATE SET source = excluded.source, reason = excluded.reason, template_sha256 = excluded.template_sha256, template_set_revision = excluded.template_set_revision, template_mapping_import_id = excluded.template_mapping_import_id`, snapshot.RunID, candidate.TemplateID, candidate.Path, candidate.Source, candidate.Reason, nullIfEmpty(candidate.TemplateSHA256), nullIfEmpty(candidate.TemplateSetRevision), mappingImportID); err != nil {
+			return err
+		}
+		if candidate.IP != "" && candidate.Port > 0 && candidate.Protocol != "" {
+			if _, err := tx.Exec(`INSERT INTO scan_task_run_template_candidate_endpoints (scan_task_run_id, template_id, path, ip, port, protocol) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, snapshot.RunID, candidate.TemplateID, candidate.Path, candidate.IP, candidate.Port, candidate.Protocol); err != nil {
+				return err
+			}
 		}
 	}
 	for _, finding := range snapshot.Vulnerabilities {
 		if _, err := tx.Exec(`
 			INSERT INTO scan_task_run_vulnerabilities
-				(scan_task_run_id, finding_key, template_id, name, severity, target, target_ip, target_port, matched_at, evidence)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				(scan_task_run_id, finding_key, template_id, name, severity, target, target_ip, target_port, matched_at, description, evidence)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			snapshot.RunID,
 			finding.FindingKey,
 			nullIfEmpty(finding.TemplateID),
@@ -487,10 +560,14 @@ func SaveScanTaskRunSnapshot(db *sql.DB, snapshot model.ScanTaskRunSnapshot) err
 			nullIfEmpty(finding.TargetIP),
 			nullIfZero(finding.TargetPort),
 			nullIfEmpty(finding.MatchedAt),
+			nullIfEmpty(finding.Description),
 			nullIfEmpty(finding.Evidence),
 		); err != nil {
 			return err
 		}
+	}
+	if err := saveFingerprintRunMatchesTx(tx, snapshot.RunID, snapshot.FingerprintMatches); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -520,28 +597,79 @@ func GetScanTaskRunSnapshot(db *sql.DB, runID int64) (model.ScanTaskRunSnapshot,
 	if err := loadScanTaskRunPorts(db, &snapshot); err != nil {
 		return model.ScanTaskRunSnapshot{}, err
 	}
+	if err := loadScanTaskRunProtocolEvidence(db, &snapshot); err != nil {
+		return model.ScanTaskRunSnapshot{}, err
+	}
+	if err := loadScanTaskRunValidation(db, &snapshot); err != nil {
+		return model.ScanTaskRunSnapshot{}, err
+	}
 	if err := loadScanTaskRunVulnerabilities(db, &snapshot); err != nil {
 		return model.ScanTaskRunSnapshot{}, err
 	}
-	rows, err := db.Query(`SELECT template_id, path, source, reason FROM scan_task_run_template_candidates WHERE scan_task_run_id = ? ORDER BY template_id, path`, runID)
+	rows, err := db.Query(`
+		SELECT candidate.template_id, candidate.path, candidate.source, candidate.reason,
+			COALESCE(candidate.template_sha256, ''), COALESCE(candidate.template_set_revision, ''),
+			COALESCE(candidate.template_mapping_import_id, 0), endpoint.ip, endpoint.port, endpoint.protocol
+		FROM scan_task_run_template_candidates AS candidate
+		JOIN scan_task_run_template_candidate_endpoints AS endpoint
+			ON endpoint.scan_task_run_id = candidate.scan_task_run_id AND endpoint.template_id = candidate.template_id AND endpoint.path = candidate.path
+		WHERE candidate.scan_task_run_id = ?
+		ORDER BY candidate.template_id, candidate.path, endpoint.ip, endpoint.port, endpoint.protocol`, runID)
 	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such column") {
+			if legacyErr := loadLegacyTemplateCandidates(db, &snapshot); legacyErr != nil {
+				return model.ScanTaskRunSnapshot{}, legacyErr
+			}
+			return snapshot, nil
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "no such table: scan_task_run_template_candidate_endpoints") {
+			if legacyErr := loadLegacyTemplateCandidates(db, &snapshot); legacyErr != nil {
+				return model.ScanTaskRunSnapshot{}, legacyErr
+			}
+			return snapshot, nil
+		}
 		if isMissingTemplateCandidateTable(err) {
 			return snapshot, nil
 		}
 		return model.ScanTaskRunSnapshot{}, err
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var candidate model.ScanTaskRunTemplateCandidate
-		if err := rows.Scan(&candidate.TemplateID, &candidate.Path, &candidate.Source, &candidate.Reason); err != nil {
+		if err := rows.Scan(&candidate.TemplateID, &candidate.Path, &candidate.Source, &candidate.Reason, &candidate.TemplateSHA256, &candidate.TemplateSetRevision, &candidate.MappingImportID, &candidate.IP, &candidate.Port, &candidate.Protocol); err != nil {
+			rows.Close()
 			return model.ScanTaskRunSnapshot{}, err
 		}
 		snapshot.TemplateCandidates = append(snapshot.TemplateCandidates, candidate)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return model.ScanTaskRunSnapshot{}, err
 	}
+	if err := rows.Close(); err != nil {
+		return model.ScanTaskRunSnapshot{}, err
+	}
+	if len(snapshot.TemplateCandidates) == 0 {
+		if err := loadLegacyTemplateCandidates(db, &snapshot); err != nil {
+			return model.ScanTaskRunSnapshot{}, err
+		}
+	}
 	return snapshot, nil
+}
+
+func loadLegacyTemplateCandidates(db *sql.DB, snapshot *model.ScanTaskRunSnapshot) error {
+	rows, err := db.Query(`SELECT template_id, path, source, reason FROM scan_task_run_template_candidates WHERE scan_task_run_id = ? ORDER BY template_id, path`, snapshot.RunID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var candidate model.ScanTaskRunTemplateCandidate
+		if err := rows.Scan(&candidate.TemplateID, &candidate.Path, &candidate.Source, &candidate.Reason); err != nil {
+			return err
+		}
+		snapshot.TemplateCandidates = append(snapshot.TemplateCandidates, candidate)
+	}
+	return rows.Err()
 }
 
 func isMissingTemplateCandidateTable(err error) bool {
@@ -550,7 +678,7 @@ func isMissingTemplateCandidateTable(err error) bool {
 
 const scanTaskRunSelect = `
 	SELECT id, scan_task_id, sequence, scheduled_for, status, target, scan_type, config_json, config_hash,
-		error_message, report_path, report_error, started_at, finished_at, snapshot_written_at, created_at, updated_at
+		error_message, report_path, audit_report_path, report_error, started_at, finished_at, snapshot_written_at, created_at, updated_at
 	FROM scan_task_runs`
 
 type scanTaskRunScanner interface {
@@ -559,7 +687,7 @@ type scanTaskRunScanner interface {
 
 func scanScanTaskRun(scanner scanTaskRunScanner) (model.ScanTaskRun, error) {
 	var run model.ScanTaskRun
-	var configJSON, configHash, errorMessage, reportPath, reportError, startedAt, finishedAt, snapshotWrittenAt, updatedAt sql.NullString
+	var configJSON, configHash, errorMessage, reportPath, auditReportPath, reportError, startedAt, finishedAt, snapshotWrittenAt, updatedAt sql.NullString
 	if err := scanner.Scan(
 		&run.ID,
 		&run.ScanTaskID,
@@ -572,6 +700,7 @@ func scanScanTaskRun(scanner scanTaskRunScanner) (model.ScanTaskRun, error) {
 		&configHash,
 		&errorMessage,
 		&reportPath,
+		&auditReportPath,
 		&reportError,
 		&startedAt,
 		&finishedAt,
@@ -584,6 +713,7 @@ func scanScanTaskRun(scanner scanTaskRunScanner) (model.ScanTaskRun, error) {
 	run.ConfigHash = configHash.String
 	run.ErrorMessage = errorMessage.String
 	run.ReportPath = reportPath.String
+	run.AuditReportPath = auditReportPath.String
 	run.ReportError = reportError.String
 	run.StartedAt = startedAt.String
 	run.FinishedAt = finishedAt.String
@@ -632,6 +762,22 @@ func validateScanTaskRunSnapshot(snapshot model.ScanTaskRunSnapshot) error {
 			return fmt.Errorf("invalid snapshot port: %s:%d", port.IP, port.Port)
 		}
 	}
+	for _, evidence := range snapshot.ProtocolEvidence {
+		evidenceType := normalizedProtocolEvidenceType(evidence)
+		if net.ParseIP(strings.TrimSpace(evidence.IP)) == nil || evidence.Port < 1 || evidence.Port > 65535 || strings.TrimSpace(evidence.Protocol) == "" || !validProtocolEvidenceIdentity(evidenceType, evidence.Protocol, evidence.ProbeName) || !validProtocolEvidenceOutcome(evidenceType, normalizedProtocolEvidenceOutcome(evidence), evidence.Diagnostic) || evidence.StatusCode < 0 || evidence.StatusCode > 999 || evidence.BannerCapturedLength < 0 || evidence.HeaderCapturedLength < 0 || evidence.BodyCapturedLength < 0 {
+			return fmt.Errorf("invalid snapshot protocol evidence: %s:%d/%s", evidence.IP, evidence.Port, evidence.Protocol)
+		}
+		for _, digest := range []string{evidence.BannerSHA256, evidence.HeaderSHA256, evidence.BodySHA256} {
+			if err := validateProtocolEvidenceDigest(digest); err != nil {
+				return err
+			}
+		}
+	}
+	if snapshot.Validation.Status != "" {
+		if !isScanTaskRunValidationStatus(snapshot.Validation.Status) || snapshot.Validation.CandidateEndpointCount < 0 || snapshot.Validation.ExecutedEndpointCount < 0 || snapshot.Validation.TemplateCount < 0 || snapshot.Validation.FindingCount < 0 || snapshot.Validation.ExecutedEndpointCount > snapshot.Validation.CandidateEndpointCount || snapshot.Validation.FindingCount != len(snapshot.Vulnerabilities) {
+			return errors.New("invalid snapshot validation state")
+		}
+	}
 	for _, finding := range snapshot.Vulnerabilities {
 		if strings.TrimSpace(finding.FindingKey) == "" || strings.TrimSpace(finding.Target) == "" {
 			return errors.New("snapshot vulnerability requires finding key and target")
@@ -640,6 +786,11 @@ func validateScanTaskRunSnapshot(snapshot model.ScanTaskRunSnapshot) error {
 	for _, candidate := range snapshot.TemplateCandidates {
 		if strings.TrimSpace(candidate.TemplateID) == "" || strings.TrimSpace(candidate.Path) == "" || strings.TrimSpace(candidate.Source) == "" || strings.TrimSpace(candidate.Reason) == "" {
 			return errors.New("invalid snapshot template candidate")
+		}
+		if candidate.IP != "" || candidate.Port != 0 || candidate.Protocol != "" {
+			if net.ParseIP(candidate.IP) == nil || candidate.Port < 1 || candidate.Port > 65535 || strings.TrimSpace(candidate.Protocol) == "" {
+				return errors.New("invalid snapshot template candidate endpoint")
+			}
 		}
 	}
 	return nil
@@ -690,9 +841,144 @@ func loadScanTaskRunPorts(db *sql.DB, snapshot *model.ScanTaskRunSnapshot) error
 	return rows.Err()
 }
 
+func loadScanTaskRunProtocolEvidence(db *sql.DB, snapshot *model.ScanTaskRunSnapshot) error {
+	rows, err := db.Query(`
+		SELECT ip, port, evidence_type, probe_name, protocol, responded, outcome, diagnostic, COALESCE(status_code, 0), COALESCE(server, ''), COALESCE(title, ''),
+			banner_captured_length, COALESCE(banner_sha256, ''), banner_truncated,
+			header_captured_length, COALESCE(header_sha256, ''), header_truncated,
+			body_captured_length, COALESCE(body_sha256, ''), body_truncated
+		FROM scan_task_run_protocol_evidence
+		WHERE scan_task_run_id = ?
+		ORDER BY ip, port, evidence_type, protocol, probe_name`, snapshot.RunID)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table: scan_task_run_protocol_evidence") {
+			return nil
+		}
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var evidence model.ScanTaskRunProtocolEvidence
+		var responded, bannerTruncated, headerTruncated, bodyTruncated int
+		if err := rows.Scan(&evidence.IP, &evidence.Port, &evidence.EvidenceType, &evidence.ProbeName, &evidence.Protocol, &responded, &evidence.Outcome, &evidence.Diagnostic, &evidence.StatusCode, &evidence.Server, &evidence.Title,
+			&evidence.BannerCapturedLength, &evidence.BannerSHA256, &bannerTruncated,
+			&evidence.HeaderCapturedLength, &evidence.HeaderSHA256, &headerTruncated,
+			&evidence.BodyCapturedLength, &evidence.BodySHA256, &bodyTruncated); err != nil {
+			return err
+		}
+		evidence.Responded = responded != 0
+		evidence.BannerTruncated = bannerTruncated != 0
+		evidence.HeaderTruncated = headerTruncated != 0
+		evidence.BodyTruncated = bodyTruncated != 0
+		snapshot.ProtocolEvidence = append(snapshot.ProtocolEvidence, evidence)
+	}
+	return rows.Err()
+}
+
+func loadScanTaskRunValidation(db *sql.DB, snapshot *model.ScanTaskRunSnapshot) error {
+	var startedAt, finishedAt, errorMessage sql.NullString
+	err := db.QueryRow(`
+		SELECT status, candidate_endpoint_count, executed_endpoint_count, template_count, finding_count,
+			started_at, finished_at, error_message
+		FROM scan_task_run_validation WHERE scan_task_run_id = ?`, snapshot.RunID).Scan(
+		&snapshot.Validation.Status, &snapshot.Validation.CandidateEndpointCount, &snapshot.Validation.ExecutedEndpointCount,
+		&snapshot.Validation.TemplateCount, &snapshot.Validation.FindingCount, &startedAt, &finishedAt, &errorMessage,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table: scan_task_run_validation") {
+			return nil
+		}
+		return err
+	}
+	snapshot.Validation.StartedAt = startedAt.String
+	snapshot.Validation.FinishedAt = finishedAt.String
+	snapshot.Validation.Error = errorMessage.String
+	return nil
+}
+
+func isScanTaskRunValidationStatus(status string) bool {
+	switch status {
+	case model.ScanTaskRunValidationDisabled, model.ScanTaskRunValidationNotStarted, model.ScanTaskRunValidationNoCandidates, model.ScanTaskRunValidationSuccess, model.ScanTaskRunValidationFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizedProtocolEvidenceType(evidence model.ScanTaskRunProtocolEvidence) string {
+	evidenceType := strings.ToLower(strings.TrimSpace(evidence.EvidenceType))
+	if evidenceType != "" {
+		return evidenceType
+	}
+	protocol := strings.ToLower(strings.TrimSpace(evidence.Protocol))
+	if protocol == "http" || protocol == "https" {
+		return model.ProtocolEvidenceWeb
+	}
+	return model.ProtocolEvidencePassiveBanner
+}
+
+func validProtocolEvidenceIdentity(evidenceType, protocol, probeName string) bool {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	probeName = strings.TrimSpace(probeName)
+	switch evidenceType {
+	case model.ProtocolEvidencePassiveBanner:
+		return protocol == "tcp" && probeName == ""
+	case model.ProtocolEvidenceActiveProbe:
+		return protocol == "tcp" && probeName != ""
+	case model.ProtocolEvidenceWeb:
+		return (protocol == "http" || protocol == "https") && probeName == ""
+	default:
+		return false
+	}
+}
+
+func normalizedProtocolEvidenceOutcome(evidence model.ScanTaskRunProtocolEvidence) string {
+	outcome := strings.ToLower(strings.TrimSpace(evidence.Outcome))
+	if outcome != "" {
+		return outcome
+	}
+	if evidence.Responded {
+		return model.ProtocolProbeOutcomeResponded
+	}
+	return model.ProtocolProbeOutcomeNoResponse
+}
+
+func validProtocolEvidenceOutcome(evidenceType, outcome, diagnostic string) bool {
+	if evidenceType != model.ProtocolEvidenceActiveProbe {
+		return diagnostic == "" && (outcome == model.ProtocolProbeOutcomeResponded || outcome == model.ProtocolProbeOutcomeNoResponse)
+	}
+	switch outcome {
+	case model.ProtocolProbeOutcomeResponded, model.ProtocolProbeOutcomeNoResponse,
+		model.ProtocolProbeOutcomeConnectFailed, model.ProtocolProbeOutcomeConnectTimeout,
+		model.ProtocolProbeOutcomeWriteFailed, model.ProtocolProbeOutcomeReadFailed,
+		model.ProtocolProbeOutcomeReadTimeout, model.ProtocolProbeOutcomeBudgetTimeout,
+		model.ProtocolProbeOutcomeCanceled:
+		return diagnostic == "" || diagnostic == outcome
+	default:
+		return false
+	}
+}
+
+func validateProtocolEvidenceDigest(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if len(value) != sha256.Size*2 {
+		return errors.New("invalid protocol evidence SHA-256")
+	}
+	if _, err := hex.DecodeString(value); err != nil {
+		return errors.New("invalid protocol evidence SHA-256")
+	}
+	return nil
+}
+
 func loadScanTaskRunVulnerabilities(db *sql.DB, snapshot *model.ScanTaskRunSnapshot) error {
 	rows, err := db.Query(`
-		SELECT finding_key, template_id, name, severity, target, target_ip, target_port, matched_at, evidence
+		SELECT finding_key, template_id, name, severity, target, target_ip, target_port, matched_at, description, evidence
 		FROM scan_task_run_vulnerabilities
 		WHERE scan_task_run_id = ?
 		ORDER BY finding_key ASC`, snapshot.RunID)
@@ -702,9 +988,9 @@ func loadScanTaskRunVulnerabilities(db *sql.DB, snapshot *model.ScanTaskRunSnaps
 	defer rows.Close()
 	for rows.Next() {
 		var finding model.ScanTaskRunVulnerability
-		var templateID, name, severity, targetIP, matchedAt, evidence sql.NullString
+		var templateID, name, severity, targetIP, matchedAt, description, evidence sql.NullString
 		var targetPort sql.NullInt64
-		if err := rows.Scan(&finding.FindingKey, &templateID, &name, &severity, &finding.Target, &targetIP, &targetPort, &matchedAt, &evidence); err != nil {
+		if err := rows.Scan(&finding.FindingKey, &templateID, &name, &severity, &finding.Target, &targetIP, &targetPort, &matchedAt, &description, &evidence); err != nil {
 			return err
 		}
 		finding.TemplateID = templateID.String
@@ -713,6 +999,7 @@ func loadScanTaskRunVulnerabilities(db *sql.DB, snapshot *model.ScanTaskRunSnaps
 		finding.TargetIP = targetIP.String
 		finding.TargetPort = int(targetPort.Int64)
 		finding.MatchedAt = matchedAt.String
+		finding.Description = description.String
 		finding.Evidence = evidence.String
 		snapshot.Vulnerabilities = append(snapshot.Vulnerabilities, finding)
 	}
