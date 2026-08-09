@@ -13,11 +13,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
 
-const NucleiTemplateIndexAdapterVersion = "nuclei-template-index-v4"
+const NucleiTemplateIndexAdapterVersion = "nuclei-template-index-v5"
 
 const (
 	maxNucleiTemplateFileBytes   = 512 << 10
@@ -138,27 +139,39 @@ func BuildNucleiTemplateIndex(root string) (*NucleiTemplateIndex, error) {
 			}
 			return nil
 		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
 		extension := strings.ToLower(filepath.Ext(path))
 		if extension != ".yaml" && extension != ".yml" {
 			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("nuclei template candidate is a symbolic link: %s", path)
+		}
+		fileInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !fileInfo.Mode().IsRegular() {
+			return fmt.Errorf("nuclei template candidate is not a regular file: %s", path)
 		}
 		fileCount++
 		if fileCount > maxNucleiTemplateFiles {
 			return fmt.Errorf("nuclei template file budget exceeded: %d", maxNucleiTemplateFiles)
 		}
-		content, err := readBoundedNucleiTemplate(path)
+		declaredBytes := fileInfo.Size()
+		if declaredBytes < 0 || declaredBytes > maxNucleiTemplateTotalBytes-totalBytes {
+			return fmt.Errorf("nuclei template byte budget exceeded: %d", maxNucleiTemplateTotalBytes)
+		}
+		if declaredBytes > maxNucleiTemplateFileBytes {
+			totalBytes += declaredBytes
+			return nil
+		}
+		content, accountedBytes, err := readBoundedNucleiTemplate(path, maxNucleiTemplateTotalBytes-totalBytes)
 		if err != nil {
 			return err
 		}
+		totalBytes += accountedBytes
 		if content == nil {
 			return nil
-		}
-		totalBytes += int64(len(content))
-		if totalBytes > maxNucleiTemplateTotalBytes {
-			return fmt.Errorf("nuclei template byte budget exceeded: %d", maxNucleiTemplateTotalBytes)
 		}
 		var rootNode yaml.Node
 		if err := yaml.Unmarshal(content, &rootNode); err != nil {
@@ -218,20 +231,50 @@ func BuildNucleiTemplateIndex(root string) (*NucleiTemplateIndex, error) {
 	return index, nil
 }
 
-func readBoundedNucleiTemplate(path string) ([]byte, error) {
-	file, err := os.Open(path)
+func readBoundedNucleiTemplate(path string, remainingBytes int64) ([]byte, int64, error) {
+	file, err := openNucleiTemplateFile(path)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer file.Close()
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	if !fileInfo.Mode().IsRegular() {
+		return nil, 0, fmt.Errorf("nuclei template descriptor is not a regular file: %s", path)
+	}
+	accountedBytes := fileInfo.Size()
+	if accountedBytes < 0 || accountedBytes > remainingBytes {
+		return nil, 0, fmt.Errorf("nuclei template byte budget exceeded: %d", maxNucleiTemplateTotalBytes)
+	}
+	if accountedBytes > maxNucleiTemplateFileBytes {
+		return nil, accountedBytes, nil
+	}
 	content, err := io.ReadAll(io.LimitReader(file, maxNucleiTemplateFileBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	if size := int64(len(content)); size > accountedBytes {
+		accountedBytes = size
+	}
+	postReadInfo, err := file.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	if !postReadInfo.Mode().IsRegular() {
+		return nil, 0, fmt.Errorf("nuclei template descriptor changed file type: %s", path)
+	}
+	if postReadInfo.Size() > accountedBytes {
+		accountedBytes = postReadInfo.Size()
+	}
+	if accountedBytes < 0 || accountedBytes > remainingBytes {
+		return nil, 0, fmt.Errorf("nuclei template byte budget exceeded: %d", maxNucleiTemplateTotalBytes)
 	}
 	if len(content) > maxNucleiTemplateFileBytes {
-		return nil, nil
+		return nil, accountedBytes, nil
 	}
-	return content, nil
+	return content, accountedBytes, nil
 }
 
 // PolicyFiltered reports whether at least one actionable template for this
@@ -734,10 +777,7 @@ func safeAutomaticHTTPURL(value string) bool {
 	}
 	for _, segment := range strings.Split(strings.ToLower(decodedPath), "/") {
 		segment = strings.TrimSpace(segment)
-		if _, unsafe := unsafeAutomaticHTTPPathSegments[segment]; unsafe {
-			return false
-		}
-		if authenticationParameterName(segment) {
+		if unsafeAutomaticHTTPPathSegment(segment) {
 			return false
 		}
 	}
@@ -748,6 +788,20 @@ var unsafeAutomaticHTTPPathSegments = map[string]struct{}{
 	"command": {}, "delete": {}, "drop": {}, "execute": {}, "flush": {}, "flushall": {}, "install": {},
 	"logout": {}, "reboot": {}, "remove": {}, "reset": {}, "restart": {}, "shutdown": {}, "truncate": {},
 	"update": {}, "upgrade": {}, "upload": {}, "write": {},
+}
+
+func unsafeAutomaticHTTPPathSegment(segment string) bool {
+	for _, token := range strings.FieldsFunc(strings.ToLower(segment), func(character rune) bool {
+		return !unicode.IsLetter(character) && !unicode.IsDigit(character)
+	}) {
+		if _, unsafe := unsafeAutomaticHTTPPathSegments[token]; unsafe {
+			return true
+		}
+		if authenticationParameterName(token) {
+			return true
+		}
+	}
+	return authenticationParameterName(segment)
 }
 
 func authenticationParameterName(value string) bool {

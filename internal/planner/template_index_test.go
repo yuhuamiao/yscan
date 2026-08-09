@@ -2,6 +2,7 @@ package planner
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -251,6 +252,10 @@ func TestSafeAutomaticHTTPURLRejectsAuthenticationEncodingAndActions(t *testing.
 	for _, value := range []string{
 		"{{BaseURL}}/check?user=admin&pass=admin", "{{BaseURL}}/check?%75ser=admin", "{{BaseURL}}/check?mode=read",
 		"{{BaseURL}}/%64elete", "{{BaseURL}}/safe%252fdelete", "{{BaseURL}}/reset", "{{BaseURL}}/login",
+		"{{BaseURL}}/reboot.cgi", "{{BaseURL}}/shutdown.action", "{{BaseURL}}/reset-password",
+		"{{BaseURL}}/factory_reset.cgi",
+		"{{BaseURL}}/%72eboot.cgi", "{{BaseURL}}/%2572eboot.cgi", "{{BaseURL}}/%252572eboot.cgi",
+		"{{BaseURL}}/shutdown%252eaction", "{{BaseURL}}/reset%252dpassword",
 		"{{BaseURL}}/{{username}}", "{{BaseURL}}/{{interactsh-url}}",
 	} {
 		if safeAutomaticHTTPURL(value) {
@@ -364,6 +369,29 @@ http:
 	}
 }
 
+func TestNucleiTemplateIndexCountsOversizedFilesAgainstTotalBudget(t *testing.T) {
+	root := t.TempDir()
+	fileBytes := int64(maxNucleiTemplateFileBytes + 1)
+	fileCount := int(maxNucleiTemplateTotalBytes/fileBytes) + 2
+	for index := 0; index < fileCount; index++ {
+		path := filepath.Join(root, fmt.Sprintf("oversized-%03d.yaml", index))
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Truncate(fileBytes); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := BuildNucleiTemplateIndex(root); err == nil || !strings.Contains(err.Error(), "byte budget exceeded") {
+		t.Fatalf("oversized candidates did not exhaust total budget: %v", err)
+	}
+}
+
 func TestNucleiTemplateIndexRevisionIsDeterministicAndContentBound(t *testing.T) {
 	root := t.TempDir()
 	path := writeTemplateIndexFixture(t, root, "php.yaml", `
@@ -411,7 +439,7 @@ func TestRealNucleiTemplateIndexCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(index.Templates) != 411 || index.Revision != "nuclei-template-index-v4:7745b4f28ceba14a7f101b8248da993da9f490ef5995de7cede9b015aae04901" {
+	if len(index.Templates) != 366 || index.Revision != "nuclei-template-index-v5:d1cf38288bce60e512b1dd03f6f59ca29375ac344f67ae9480268e61008b28d0" {
 		t.Fatalf("real index changed: templates=%d revision=%q", len(index.Templates), index.Revision)
 	}
 	redis := index.Select("redis", "", "tcp")
