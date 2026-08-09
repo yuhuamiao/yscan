@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -369,10 +370,7 @@ func TestRunSubnetTaskRunBuildsImmutableSnapshotWithoutScopeBaseline(t *testing.
 			ScanTaskID: 8,
 			ScanType:   model.ScanTypeSubnet,
 			Target:     cidr,
-			Config: model.ScanTaskConfig{
-				VulnerabilityOn: true,
-				NucleiTemplates: "test-templates",
-			},
+			Config:     model.ScanTaskConfig{},
 		},
 	}, subnetDependencies{
 		discover: func(context.Context, string, pipeline.SubnetDiscoveryOptions) ([]string, error) {
@@ -381,18 +379,8 @@ func TestRunSubnetTaskRunBuildsImmutableSnapshotWithoutScopeBaseline(t *testing.
 		scanHost: func(context.Context, string, string) ([]model.ScanResult, error) {
 			return []model.ScanResult{{Address: "192.168.70.1:443", Open: true, Service: "https", Product: "nginx"}}, nil
 		},
-		runNuclei: func(_ context.Context, ip string, _ []model.ScanResult, templates string, _ []string) ([]model.NucleiFinding, error) {
-			if ip != "192.168.70.1" || templates != "test-templates" {
-				t.Fatalf("nuclei input = (%s, %s)", ip, templates)
-			}
-			return []model.NucleiFinding{{
-				TemplateID: "CVE-2026-0001",
-				Name:       "Example finding",
-				Severity:   "high",
-				Target:     "https://192.168.70.1",
-				TargetIP:   "192.168.70.1",
-				TargetPort: 443,
-			}}, nil
+		runNuclei: func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
+			return nil, nil
 		},
 	})
 	if err != nil {
@@ -407,8 +395,8 @@ func TestRunSubnetTaskRunBuildsImmutableSnapshotWithoutScopeBaseline(t *testing.
 	if want := []model.ScanTaskRunPort{{IP: "192.168.70.1", Port: 443, ServiceType: "https", Product: "nginx"}}; !reflect.DeepEqual(snapshot.Ports, want) {
 		t.Fatalf("snapshot ports = %#v, want %#v", snapshot.Ports, want)
 	}
-	if len(snapshot.Vulnerabilities) != 1 || snapshot.Vulnerabilities[0].TemplateID != "CVE-2026-0001" || snapshot.Vulnerabilities[0].TargetIP != "192.168.70.1" {
-		t.Fatalf("snapshot vulnerabilities = %#v", snapshot.Vulnerabilities)
+	if len(snapshot.Vulnerabilities) != 0 || snapshot.Validation.Status != model.ScanTaskRunValidationDisabled {
+		t.Fatalf("disabled validation snapshot=%#v", snapshot)
 	}
 }
 
@@ -504,9 +492,10 @@ func TestRunSubnetTaskRunKeepsCurrentHostPortsWhenScannerFails(t *testing.T) {
 }
 
 func TestRunSubnetTaskRunKeepsObservationsWhenNucleiFails(t *testing.T) {
-	db := openWorkflowDB(t)
+	db := openFullWorkflowDB(t)
 	const ip = "192.168.76.1"
 	nucleiErr := errors.New("nuclei fixture failed")
+	root, templateIndex := workflowTemplateIndexFixture(t, workflowTemplateSpec{id: "redis-partial", product: "redis", protocol: "tcp"})
 	snapshot, err := runSubnetTaskRun(context.Background(), SubnetTaskRunOptions{
 		DB:  db,
 		Run: model.ScanTaskRun{ID: 76, ScanTaskID: 8, ScanType: model.ScanTypeSubnet, Target: "192.168.76.0/24", Config: model.ScanTaskConfig{VulnerabilityOn: true}},
@@ -519,23 +508,27 @@ func TestRunSubnetTaskRunKeepsObservationsWhenNucleiFails(t *testing.T) {
 		},
 		collectFingerprints: func(_ context.Context, _ *sql.DB, _ model.ScanTaskRun, host string, results []model.ScanResult) ([]model.ScanResult, []model.FingerprintRunMatch, error) {
 			results[0].Product = "redis"
-			return results, []model.FingerprintRunMatch{{IP: host, Port: 6379, Protocol: "tcp", Product: "redis", Soft: true}}, nil
+			return results, []model.FingerprintRunMatch{{IP: host, Port: 6379, Protocol: "tcp", Product: "redis"}}, nil
 		},
-		runNuclei: func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
-			return []model.NucleiFinding{{TemplateID: "redis-partial", TargetIP: ip, TargetPort: 6379}}, nucleiErr
+		loadTemplateIndex: func(string) (string, *planner.NucleiTemplateIndex, error) { return root, templateIndex, nil },
+		executeTemplatePaths: func(_ context.Context, host string, _ []model.ScanResult, _ []string) vuln.NucleiExecutionResult {
+			return vuln.NucleiExecutionResult{Started: true, Executed: true, Findings: []model.NucleiFinding{{TemplateID: "redis-partial", Target: host + ":6379", TargetIP: host, TargetPort: 6379}}, Err: nucleiErr}
 		},
 	})
-	if !errors.Is(err, nucleiErr) {
-		t.Fatalf("error=%v, want %v", err, nucleiErr)
+	if err != nil {
+		t.Fatalf("endpoint-level nuclei failure must not abort later endpoints: %v", err)
 	}
-	if len(snapshot.Ports) != 1 || snapshot.Ports[0].IP != ip || len(snapshot.FingerprintMatches) != 1 {
+	if len(snapshot.Ports) != 2 || snapshot.Ports[0].IP != ip || len(snapshot.FingerprintMatches) != 2 {
 		t.Fatalf("nuclei failure lost observations: %#v", snapshot)
 	}
-	if len(snapshot.Vulnerabilities) != 1 || snapshot.Vulnerabilities[0].TemplateID != "redis-partial" || len(snapshot.TemplateCandidates) == 0 {
+	if len(snapshot.Vulnerabilities) != 2 || snapshot.Vulnerabilities[0].TemplateID != "redis-partial" || len(snapshot.TemplateCandidates) != 2 {
 		t.Fatalf("nuclei failure lost validation partials: %#v", snapshot)
 	}
-	if snapshot.Validation.Status != model.ScanTaskRunValidationFailed || snapshot.Validation.Error == "" || snapshot.Validation.FindingCount != 1 {
+	if snapshot.Validation.Status != model.ScanTaskRunValidationFailed || snapshot.Validation.Error == "" || snapshot.Validation.FindingCount != 2 {
 		t.Fatalf("nuclei failure validation state=%#v", snapshot.Validation)
+	}
+	if len(snapshot.EndpointValidations) != 2 || snapshot.EndpointValidations[0].Status != model.ScanTaskRunValidationFailed || snapshot.EndpointValidations[1].Status != model.ScanTaskRunValidationFailed {
+		t.Fatalf("endpoint failure states=%#v", snapshot.EndpointValidations)
 	}
 }
 
@@ -589,7 +582,8 @@ tcp:
 	result := runFingerprintMappingValidation(context.Background(), db, model.ScanTaskRun{ID: 77}, ip, []model.ScanResult{port}, []model.FingerprintRunMatch{match}, root, index,
 		func(_ context.Context, target string, ports []model.ScanResult, paths []string) vuln.NucleiExecutionResult {
 			executions++
-			if target != ip || len(ports) != 1 || len(paths) != 1 || paths[0] != templatePath {
+			content, readErr := os.ReadFile(paths[0])
+			if target != ip || len(ports) != 1 || len(paths) != 1 || paths[0] == templatePath || readErr != nil || !strings.Contains(string(content), "id: exposed-redis") {
 				t.Fatalf("automatic invocation target=%s ports=%#v paths=%#v", target, ports, paths)
 			}
 			return vuln.NucleiExecutionResult{Started: true, Executed: true, Findings: []model.NucleiFinding{{TemplateID: "exposed-redis", Name: "Redis Exposure", Target: ip + ":6379", TargetIP: ip, TargetPort: 6379}}}
@@ -606,6 +600,50 @@ tcp:
 	}
 }
 
+func TestServiceFallbackExecutesOnlyStrictPinnedIndexEntries(t *testing.T) {
+	const ip = "192.168.77.13"
+	root, index := workflowTemplateIndexFixture(t, workflowTemplateSpec{id: "redis-safe", product: "redis", protocol: "tcp"})
+	executions := 0
+	result := runServiceTagValidation(context.Background(), ip, []model.ScanResult{{Address: ip + ":6379", Open: true, Service: "redis"}}, index,
+		func(_ context.Context, _ string, _ []model.ScanResult, paths []string) vuln.NucleiExecutionResult {
+			executions++
+			if len(paths) != 1 || strings.HasPrefix(paths[0], root) {
+				t.Fatalf("service fallback received mutable or unexpected paths: %#v", paths)
+			}
+			return vuln.NucleiExecutionResult{Started: true, Executed: true}
+		})
+	if executions != 1 || len(result.candidates) != 1 || result.candidates[0].TemplateID != "redis-safe" || result.candidates[0].Source != "service_tag" || !result.candidates[0].Executed {
+		t.Fatalf("strict service fallback result=%#v executions=%d", result, executions)
+	}
+	result = runServiceTagValidation(context.Background(), ip, []model.ScanResult{{Address: ip + ":8080", Open: true, Service: "http"}}, index,
+		func(context.Context, string, []model.ScanResult, []string) vuln.NucleiExecutionResult {
+			t.Fatal("generic HTTP service must not select templates")
+			return vuln.NucleiExecutionResult{}
+		})
+	if len(result.candidates) != 0 {
+		t.Fatalf("generic service candidates=%#v", result.candidates)
+	}
+}
+
+func TestValidationErrorReasonsUseTypedDependencies(t *testing.T) {
+	tests := []struct {
+		err  error
+		want string
+	}{
+		{vuln.ErrNoTemplates, model.ValidationReasonTemplateMissing},
+		{vuln.ErrTemplateMissing, model.ValidationReasonTemplateMissing},
+		{planner.ErrPinnedTemplateMissing, model.ValidationReasonTemplateMissing},
+		{vuln.ErrNucleiMissing, model.ValidationReasonNucleiMissing},
+		{vuln.ErrTemplateDirectoryMissing, model.ValidationReasonTemplateDirectory},
+		{errors.New("fixture"), model.ValidationReasonExecutionFailed},
+	}
+	for _, test := range tests {
+		if got := validationErrorReason(test.err); got != test.want {
+			t.Fatalf("reason for %v = %s, want %s", test.err, got, test.want)
+		}
+	}
+}
+
 func TestValidationReportsIdentifiedProductWithoutTemplateAsUnmapped(t *testing.T) {
 	tracker := newRunValidationTracker()
 	identity := validationProductIdentity("192.168.77.11", 8080, "http", "fixture-app")
@@ -614,5 +652,34 @@ func TestValidationReportsIdentifiedProductWithoutTemplateAsUnmapped(t *testing.
 	tracker.finish(&snapshot, nil)
 	if snapshot.Validation.Status != model.ScanTaskRunValidationNoCandidates || snapshot.Validation.IdentifiedProductCount != 1 || snapshot.Validation.MappedProductCount != 0 || !reflect.DeepEqual(snapshot.Validation.UnmappedProducts, []string{identity}) {
 		t.Fatalf("unmapped validation coverage=%#v", snapshot.Validation)
+	}
+}
+
+func TestValidationPreservesMixedEndpointExecutionStates(t *testing.T) {
+	const ip = "192.168.77.12"
+	ports := []model.ScanResult{
+		{Address: ip + ":8080", Open: true, Service: "http"},
+		{Address: ip + ":8081", Open: true, Service: "http"},
+	}
+	tracker := newRunValidationTracker()
+	tracker.register(ip, ports, nil)
+	successCandidate := model.ScanTaskRunTemplateCandidate{TemplateID: "safe", Path: "safe.yaml", ProductKey: "app-a", Source: "automatic_template_index", Reason: "fixture", IP: ip, Port: 8080, Protocol: "http", Executed: true}
+	success := validationExecutionResult{candidates: []model.ScanTaskRunTemplateCandidate{successCandidate}, findings: []model.NucleiFinding{{TemplateID: "safe", Target: "http://" + ip + ":8080", TargetIP: ip, TargetPort: 8080}}, identifiedProducts: map[string]struct{}{validationProductIdentity(ip, 8080, "http", "app-a"): {}}, mappedProducts: map[string]struct{}{validationProductIdentity(ip, 8080, "http", "app-a"): {}}}
+	success.observeExecution(success.candidates, vuln.NucleiExecutionResult{Started: true, Executed: true})
+	failedCandidate := model.ScanTaskRunTemplateCandidate{TemplateID: "safe", Path: "safe.yaml", ProductKey: "app-b", Source: "automatic_template_index", Reason: "fixture", IP: ip, Port: 8081, Protocol: "http"}
+	failed := validationExecutionResult{candidates: []model.ScanTaskRunTemplateCandidate{failedCandidate}, identifiedProducts: map[string]struct{}{validationProductIdentity(ip, 8081, "http", "app-b"): {}}, mappedProducts: map[string]struct{}{validationProductIdentity(ip, 8081, "http", "app-b"): {}}}
+	failed.observeExecution(failed.candidates, vuln.NucleiExecutionResult{Err: vuln.ErrNucleiMissing})
+	tracker.observe(success)
+	tracker.observe(failed)
+	snapshot := model.ScanTaskRunSnapshot{Vulnerabilities: snapshotVulnerabilities(success.findings)}
+	tracker.finish(&snapshot, nil)
+	if snapshot.Validation.Status != model.ScanTaskRunValidationFailed || len(snapshot.EndpointValidations) != 2 {
+		t.Fatalf("mixed validation summary=%#v endpoints=%#v", snapshot.Validation, snapshot.EndpointValidations)
+	}
+	if snapshot.EndpointValidations[0].Status != model.ScanTaskRunValidationSuccess || snapshot.EndpointValidations[0].FindingCount != 1 {
+		t.Fatalf("successful endpoint was overwritten: %#v", snapshot.EndpointValidations[0])
+	}
+	if snapshot.EndpointValidations[1].Status != model.ScanTaskRunValidationFailed || snapshot.EndpointValidations[1].Reason != model.ValidationReasonNucleiMissing {
+		t.Fatalf("failed endpoint classification=%#v", snapshot.EndpointValidations[1])
 	}
 }

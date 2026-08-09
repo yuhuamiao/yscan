@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"golandproject/yscan/internal/model"
+	"golandproject/yscan/internal/planner"
 	"golandproject/yscan/internal/report"
 	"golandproject/yscan/internal/schedule"
 	"golandproject/yscan/internal/storage"
@@ -80,8 +81,33 @@ func TestT322PreviousDatabaseFivePortUserJourney(t *testing.T) {
 	if err := os.MkdirAll(templateRoot, 0750); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(templateRoot, "fixture.yaml"), []byte("id: t322-process-fixture\n"), 0600); err != nil {
+	fixtureTemplate := []byte(`id: t322-process-fixture
+info:
+  name: T322 read-only process fixture
+  severity: medium
+  metadata:
+    product:
+      - http
+      - https
+  tags: nginx,exposure
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    matchers:
+      - type: word
+        words:
+          - five-port-response
+`)
+	if err := os.WriteFile(filepath.Join(templateRoot, "fixture.yaml"), fixtureTemplate, 0600); err != nil {
 		t.Fatal(err)
+	}
+	templateIndex, err := planner.BuildNucleiTemplateIndex(templateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(templateIndex.Templates) != 1 || len(templateIndex.Select("http", "", "http")) != 1 || len(templateIndex.Select("https", "", "https")) != 1 {
+		t.Fatalf("strict T322 template projection=%#v", templateIndex.Templates)
 	}
 	installT322NucleiProcessFixture(t, workspace)
 

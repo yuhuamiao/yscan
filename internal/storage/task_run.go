@@ -538,6 +538,25 @@ func SaveScanTaskRunSnapshot(db *sql.DB, snapshot model.ScanTaskRunSnapshot) err
 			return err
 		}
 	}
+	for _, validation := range snapshot.EndpointValidations {
+		unmappedProductsJSON, err := json.Marshal(validation.UnmappedProducts)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO scan_task_run_endpoint_validation
+				(scan_task_run_id, ip, port, protocol, enabled, status, reason, identified_product_count,
+				 mapped_product_count, unmapped_products_json, candidate_template_count, executed_template_count,
+				 finding_count, started_at, finished_at, error_message)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, snapshot.RunID,
+			validation.IP, validation.Port, validation.Protocol, boolToInt(validation.Enabled), validation.Status,
+			validation.Reason, validation.IdentifiedProductCount, validation.MappedProductCount,
+			string(unmappedProductsJSON), validation.CandidateTemplateCount, validation.ExecutedTemplateCount,
+			validation.FindingCount, nullIfEmpty(validation.StartedAt), nullIfEmpty(validation.FinishedAt),
+			nullIfEmpty(validation.Error)); err != nil {
+			return err
+		}
+	}
 	for _, candidate := range snapshot.TemplateCandidates {
 		mappingImportID := interface{}(nil)
 		if candidate.MappingImportID > 0 {
@@ -547,8 +566,13 @@ func SaveScanTaskRunSnapshot(db *sql.DB, snapshot model.ScanTaskRunSnapshot) err
 			return err
 		}
 		if candidate.IP != "" && candidate.Port > 0 && candidate.Protocol != "" {
-			if _, err := tx.Exec(`INSERT INTO scan_task_run_template_candidate_endpoints (scan_task_run_id, template_id, path, ip, port, protocol, product_key, executed) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET product_key = excluded.product_key, executed = excluded.executed`, snapshot.RunID, candidate.TemplateID, candidate.Path, candidate.IP, candidate.Port, candidate.Protocol, candidate.ProductKey, boolToInt(candidate.Executed)); err != nil {
+			if _, err := tx.Exec(`INSERT INTO scan_task_run_template_candidate_endpoints (scan_task_run_id, template_id, path, ip, port, protocol, product_key, executed) VALUES (?, ?, ?, ?, ?, ?, '', ?) ON CONFLICT DO UPDATE SET executed = MAX(scan_task_run_template_candidate_endpoints.executed, excluded.executed)`, snapshot.RunID, candidate.TemplateID, candidate.Path, candidate.IP, candidate.Port, candidate.Protocol, boolToInt(candidate.Executed)); err != nil {
 				return err
+			}
+			if strings.TrimSpace(candidate.ProductKey) != "" {
+				if _, err := tx.Exec(`INSERT INTO scan_task_run_template_candidate_products (scan_task_run_id, template_id, path, ip, port, protocol, product_key) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, snapshot.RunID, candidate.TemplateID, candidate.Path, candidate.IP, candidate.Port, candidate.Protocol, candidate.ProductKey); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -609,18 +633,25 @@ func GetScanTaskRunSnapshot(db *sql.DB, runID int64) (model.ScanTaskRunSnapshot,
 	if err := loadScanTaskRunValidation(db, &snapshot); err != nil {
 		return model.ScanTaskRunSnapshot{}, err
 	}
+	if err := loadScanTaskRunEndpointValidations(db, &snapshot); err != nil {
+		return model.ScanTaskRunSnapshot{}, err
+	}
 	if err := loadScanTaskRunVulnerabilities(db, &snapshot); err != nil {
 		return model.ScanTaskRunSnapshot{}, err
 	}
 	rows, err := db.Query(`
 		SELECT candidate.template_id, candidate.path, candidate.source, candidate.reason,
 			COALESCE(candidate.template_sha256, ''), COALESCE(candidate.template_set_revision, ''),
-			COALESCE(candidate.template_mapping_import_id, 0), endpoint.ip, endpoint.port, endpoint.protocol, COALESCE(endpoint.product_key, ''), COALESCE(endpoint.executed, 0)
+			COALESCE(candidate.template_mapping_import_id, 0), endpoint.ip, endpoint.port, endpoint.protocol,
+			COALESCE(product.product_key, NULLIF(endpoint.product_key, ''), ''), COALESCE(endpoint.executed, 0)
 		FROM scan_task_run_template_candidates AS candidate
 		JOIN scan_task_run_template_candidate_endpoints AS endpoint
 			ON endpoint.scan_task_run_id = candidate.scan_task_run_id AND endpoint.template_id = candidate.template_id AND endpoint.path = candidate.path
+		LEFT JOIN scan_task_run_template_candidate_products AS product
+			ON product.scan_task_run_id = endpoint.scan_task_run_id AND product.template_id = endpoint.template_id AND product.path = endpoint.path
+			AND product.ip = endpoint.ip AND product.port = endpoint.port AND product.protocol = endpoint.protocol
 		WHERE candidate.scan_task_run_id = ?
-		ORDER BY candidate.template_id, candidate.path, endpoint.ip, endpoint.port, endpoint.protocol`, runID)
+		ORDER BY candidate.template_id, candidate.path, endpoint.ip, endpoint.port, endpoint.protocol, product.product_key`, runID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "no such column") {
 			if legacyErr := loadLegacyTemplateCandidates(db, &snapshot); legacyErr != nil {
@@ -786,6 +817,17 @@ func validateScanTaskRunSnapshot(snapshot model.ScanTaskRunSnapshot) error {
 			return errors.New("invalid snapshot validation state")
 		}
 	}
+	seenEndpointValidations := make(map[string]struct{}, len(snapshot.EndpointValidations))
+	for _, validation := range snapshot.EndpointValidations {
+		identity := fmt.Sprintf("%s:%d/%s", strings.TrimSpace(validation.IP), validation.Port, strings.ToLower(strings.TrimSpace(validation.Protocol)))
+		if net.ParseIP(strings.TrimSpace(validation.IP)) == nil || validation.Port < 1 || validation.Port > 65535 || strings.TrimSpace(validation.Protocol) == "" || !isScanTaskRunValidationStatus(validation.Status) || !isEndpointValidationReason(validation.Reason) || validation.IdentifiedProductCount < 0 || validation.MappedProductCount < 0 || validation.MappedProductCount > validation.IdentifiedProductCount || validation.CandidateTemplateCount < 0 || validation.ExecutedTemplateCount < 0 || validation.ExecutedTemplateCount > validation.CandidateTemplateCount || validation.FindingCount < 0 {
+			return fmt.Errorf("invalid snapshot endpoint validation: %s", identity)
+		}
+		if _, duplicate := seenEndpointValidations[identity]; duplicate {
+			return fmt.Errorf("duplicate snapshot endpoint validation: %s", identity)
+		}
+		seenEndpointValidations[identity] = struct{}{}
+	}
 	for _, finding := range snapshot.Vulnerabilities {
 		if strings.TrimSpace(finding.FindingKey) == "" || strings.TrimSpace(finding.Target) == "" {
 			return errors.New("snapshot vulnerability requires finding key and target")
@@ -912,9 +954,53 @@ func loadScanTaskRunValidation(db *sql.DB, snapshot *model.ScanTaskRunSnapshot) 
 	return nil
 }
 
+func loadScanTaskRunEndpointValidations(db *sql.DB, snapshot *model.ScanTaskRunSnapshot) error {
+	rows, err := db.Query(`
+		SELECT ip, port, protocol, enabled, status, reason, identified_product_count, mapped_product_count,
+			unmapped_products_json, candidate_template_count, executed_template_count, finding_count,
+			COALESCE(started_at, ''), COALESCE(finished_at, ''), COALESCE(error_message, '')
+		FROM scan_task_run_endpoint_validation WHERE scan_task_run_id = ?
+		ORDER BY ip, port, protocol`, snapshot.RunID)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table: scan_task_run_endpoint_validation") {
+			return nil
+		}
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var validation model.ScanTaskRunEndpointValidation
+		var enabled int
+		var unmappedProductsJSON string
+		if err := rows.Scan(&validation.IP, &validation.Port, &validation.Protocol, &enabled, &validation.Status,
+			&validation.Reason, &validation.IdentifiedProductCount, &validation.MappedProductCount,
+			&unmappedProductsJSON, &validation.CandidateTemplateCount, &validation.ExecutedTemplateCount,
+			&validation.FindingCount, &validation.StartedAt, &validation.FinishedAt, &validation.Error); err != nil {
+			return err
+		}
+		validation.Enabled = enabled != 0
+		validation.UnmappedProducts = make([]string, 0)
+		_ = json.Unmarshal([]byte(unmappedProductsJSON), &validation.UnmappedProducts)
+		snapshot.EndpointValidations = append(snapshot.EndpointValidations, validation)
+	}
+	return rows.Err()
+}
+
 func isScanTaskRunValidationStatus(status string) bool {
 	switch status {
 	case model.ScanTaskRunValidationDisabled, model.ScanTaskRunValidationNotStarted, model.ScanTaskRunValidationNoCandidates, model.ScanTaskRunValidationSuccess, model.ScanTaskRunValidationFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func isEndpointValidationReason(reason string) bool {
+	switch reason {
+	case "", model.ValidationReasonUnidentifiedProduct, model.ValidationReasonMappingMissing,
+		model.ValidationReasonTemplateMissing, model.ValidationReasonNucleiMissing,
+		model.ValidationReasonTemplateDirectory, model.ValidationReasonPolicyFiltered,
+		model.ValidationReasonExecutionFailed, model.ValidationReasonRunFailure:
 		return true
 	default:
 		return false

@@ -210,6 +210,25 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 			finding_count INTEGER NOT NULL DEFAULT 0,
 			started_at TEXT, finished_at TEXT, error_message TEXT
 		)`,
+		`CREATE TABLE IF NOT EXISTS scan_task_run_endpoint_validation (
+			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+			ip TEXT NOT NULL,
+			port INTEGER NOT NULL,
+			protocol TEXT NOT NULL,
+			enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+			status TEXT NOT NULL,
+			reason TEXT NOT NULL DEFAULT '',
+			identified_product_count INTEGER NOT NULL DEFAULT 0,
+			mapped_product_count INTEGER NOT NULL DEFAULT 0,
+			unmapped_products_json TEXT NOT NULL DEFAULT '[]',
+			candidate_template_count INTEGER NOT NULL DEFAULT 0,
+			executed_template_count INTEGER NOT NULL DEFAULT 0,
+			finding_count INTEGER NOT NULL DEFAULT 0,
+			started_at TEXT,
+			finished_at TEXT,
+			error_message TEXT,
+			PRIMARY KEY (scan_task_run_id, ip, port, protocol)
+		)`,
 		`CREATE TABLE IF NOT EXISTS scan_task_run_vulnerabilities (
 			scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
 			finding_key TEXT NOT NULL,
@@ -241,6 +260,18 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 			PRIMARY KEY (scan_task_run_id, template_id, path, ip, port, protocol),
 			FOREIGN KEY (scan_task_run_id, template_id, path)
 				REFERENCES scan_task_run_template_candidates(scan_task_run_id, template_id, path) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS scan_task_run_template_candidate_products (
+			scan_task_run_id INTEGER NOT NULL,
+			template_id TEXT NOT NULL,
+			path TEXT NOT NULL,
+			ip TEXT NOT NULL,
+			port INTEGER NOT NULL,
+			protocol TEXT NOT NULL,
+			product_key TEXT NOT NULL,
+			PRIMARY KEY (scan_task_run_id, template_id, path, ip, port, protocol, product_key),
+			FOREIGN KEY (scan_task_run_id, template_id, path, ip, port, protocol)
+				REFERENCES scan_task_run_template_candidate_endpoints(scan_task_run_id, template_id, path, ip, port, protocol) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS fingerprint_sources (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -480,6 +511,10 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 		`UPDATE fingerprint_imports SET projection_sha256 = content_sha256 WHERE projection_sha256 = ''`,
 		`UPDATE scan_task_runs SET audit_report_path = CASE WHEN report_path LIKE '%.md' THEN SUBSTR(report_path, 1, LENGTH(report_path) - 3) || '-audit.md' ELSE report_path || '-audit.md' END WHERE COALESCE(report_path, '') <> '' AND COALESCE(audit_report_path, '') = ''`,
 		`UPDATE scan_task_run_protocol_evidence SET outcome = CASE WHEN responded = 1 THEN 'responded' ELSE 'no_response' END WHERE COALESCE(outcome, '') = ''`,
+		`INSERT INTO scan_task_run_template_candidate_products (scan_task_run_id, template_id, path, ip, port, protocol, product_key)
+		 SELECT scan_task_run_id, template_id, path, ip, port, protocol, product_key
+		 FROM scan_task_run_template_candidate_endpoints WHERE COALESCE(product_key, '') <> ''
+		 ON CONFLICT DO NOTHING`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_banner_service_pattern ON banner(service_name, banner_pattern)`,
 		`CREATE INDEX IF NOT EXISTS idx_domain_info_subdomain_active ON domain_info(subdomain, is_active)`,
 		`CREATE INDEX IF NOT EXISTS idx_domain_ips_ip_active ON domain_ips(ip, is_active)`,
@@ -497,7 +532,9 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_scan_task_run_ports_run ON scan_task_run_ports(scan_task_run_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_scan_task_run_protocol_evidence_run ON scan_task_run_protocol_evidence(scan_task_run_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_scan_task_run_vulnerabilities_run ON scan_task_run_vulnerabilities(scan_task_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_scan_task_run_endpoint_validation_run ON scan_task_run_endpoint_validation(scan_task_run_id, ip, port)`,
 		`CREATE INDEX IF NOT EXISTS idx_template_candidate_endpoints_run ON scan_task_run_template_candidate_endpoints(scan_task_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_template_candidate_products_run ON scan_task_run_template_candidate_products(scan_task_run_id, ip, port, protocol)`,
 		`CREATE INDEX IF NOT EXISTS idx_fingerprint_imports_source_active ON fingerprint_imports(fingerprint_source_id, is_active)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_fingerprint_imports_one_active_per_source ON fingerprint_imports(fingerprint_source_id) WHERE is_active = 1`,
 		`CREATE INDEX IF NOT EXISTS idx_fingerprint_source_rules_import ON fingerprint_source_rules(fingerprint_import_id)`,
@@ -1032,6 +1069,26 @@ CREATE TABLE IF NOT EXISTS scan_task_run_validation (
     error_message TEXT
 );
 
+CREATE TABLE IF NOT EXISTS scan_task_run_endpoint_validation (
+    scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id) ON DELETE CASCADE,
+    ip TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    protocol TEXT NOT NULL,
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    status TEXT NOT NULL CHECK (status IN ('disabled', 'not_started', 'no_candidates', 'success', 'failed')),
+    reason TEXT NOT NULL DEFAULT '',
+    identified_product_count INTEGER NOT NULL DEFAULT 0,
+    mapped_product_count INTEGER NOT NULL DEFAULT 0,
+    unmapped_products_json TEXT NOT NULL DEFAULT '[]',
+    candidate_template_count INTEGER NOT NULL DEFAULT 0,
+    executed_template_count INTEGER NOT NULL DEFAULT 0,
+    finding_count INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT,
+    finished_at TEXT,
+    error_message TEXT,
+    PRIMARY KEY (scan_task_run_id, ip, port, protocol)
+);
+
 CREATE TABLE IF NOT EXISTS scan_task_run_vulnerabilities (
     scan_task_run_id INTEGER NOT NULL REFERENCES scan_task_runs(id),
     finding_key      TEXT NOT NULL,
@@ -1066,6 +1123,19 @@ CREATE TABLE IF NOT EXISTS scan_task_run_template_candidate_endpoints (
     PRIMARY KEY (scan_task_run_id, template_id, path, ip, port, protocol),
     FOREIGN KEY (scan_task_run_id, template_id, path)
         REFERENCES scan_task_run_template_candidates(scan_task_run_id, template_id, path) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS scan_task_run_template_candidate_products (
+    scan_task_run_id INTEGER NOT NULL,
+    template_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    protocol TEXT NOT NULL,
+    product_key TEXT NOT NULL,
+    PRIMARY KEY (scan_task_run_id, template_id, path, ip, port, protocol, product_key),
+    FOREIGN KEY (scan_task_run_id, template_id, path, ip, port, protocol)
+        REFERENCES scan_task_run_template_candidate_endpoints(scan_task_run_id, template_id, path, ip, port, protocol) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS fingerprint_sources (
@@ -1314,7 +1384,9 @@ CREATE INDEX IF NOT EXISTS idx_scan_task_run_hosts_run ON scan_task_run_hosts(sc
 CREATE INDEX IF NOT EXISTS idx_scan_task_run_ports_run ON scan_task_run_ports(scan_task_run_id);
 CREATE INDEX IF NOT EXISTS idx_scan_task_run_protocol_evidence_run ON scan_task_run_protocol_evidence(scan_task_run_id);
 CREATE INDEX IF NOT EXISTS idx_scan_task_run_vulnerabilities_run ON scan_task_run_vulnerabilities(scan_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_scan_task_run_endpoint_validation_run ON scan_task_run_endpoint_validation(scan_task_run_id, ip, port);
 CREATE INDEX IF NOT EXISTS idx_template_candidate_endpoints_run ON scan_task_run_template_candidate_endpoints(scan_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_template_candidate_products_run ON scan_task_run_template_candidate_products(scan_task_run_id, ip, port, protocol);
 CREATE INDEX IF NOT EXISTS idx_fingerprint_imports_source_active ON fingerprint_imports(fingerprint_source_id, is_active);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fingerprint_imports_one_active_per_source ON fingerprint_imports(fingerprint_source_id) WHERE is_active = 1;
 CREATE INDEX IF NOT EXISTS idx_fingerprint_source_rules_import ON fingerprint_source_rules(fingerprint_import_id);
@@ -3156,37 +3228,67 @@ func loadAssetPortValidationSet(db *sql.DB, ip string, ports []model.AssetPort) 
 		portIndexes[ports[index].Port] = index
 	}
 	rows, err := db.Query(latestAssetPortRunsCTE+`
-		SELECT latest.port, validation.status, validation.identified_product_count, validation.mapped_product_count,
-			validation.unmapped_products_json, validation.candidate_endpoint_count,
-			validation.executed_endpoint_count, validation.template_count, validation.executed_template_count, validation.finding_count,
-			COALESCE(validation.started_at, ''), COALESCE(validation.finished_at, ''), COALESCE(validation.error_message, '')
+		SELECT latest.port, endpoint.protocol, endpoint.enabled, endpoint.status, endpoint.reason,
+			endpoint.identified_product_count, endpoint.mapped_product_count, endpoint.unmapped_products_json,
+			endpoint.candidate_template_count, endpoint.executed_template_count, endpoint.finding_count,
+			COALESCE(endpoint.started_at, ''), COALESCE(endpoint.finished_at, ''), COALESCE(endpoint.error_message, ''),
+			COALESCE(validation.candidate_endpoint_count, 0), COALESCE(validation.executed_endpoint_count, 0),
+			COALESCE(validation.identified_product_count, 0), COALESCE(validation.mapped_product_count, 0),
+			COALESCE(validation.template_count, 0), COALESCE(validation.executed_template_count, 0), COALESCE(validation.finding_count, 0)
 		FROM latest_port_runs AS latest
-		JOIN scan_task_run_validation AS validation ON validation.scan_task_run_id = latest.scan_task_run_id
-		ORDER BY latest.port`, ip)
+		JOIN scan_task_run_endpoint_validation AS endpoint
+			ON endpoint.scan_task_run_id = latest.scan_task_run_id AND endpoint.ip = ? AND endpoint.port = latest.port
+		LEFT JOIN scan_task_run_validation AS validation ON validation.scan_task_run_id = latest.scan_task_run_id
+		ORDER BY latest.port, endpoint.protocol`, ip, ip)
 	if err != nil {
 		message := strings.ToLower(err.Error())
-		if strings.Contains(message, "no such table: scan_task_run_validation") {
+		if strings.Contains(message, "no such table: scan_task_run_endpoint_validation") {
 			return nil
 		}
 		return err
 	}
 	for rows.Next() {
 		var port int
-		var summary model.AssetValidationSummary
+		var endpoint model.ScanTaskRunEndpointValidation
+		var enabled int
 		var unmappedProductsJSON string
-		if err := rows.Scan(&port, &summary.Status, &summary.RunIdentifiedProductCount, &summary.RunMappedProductCount, &unmappedProductsJSON,
-			&summary.RunCandidateEndpointCount, &summary.RunExecutedEndpointCount,
-			&summary.RunTemplateCount, &summary.RunExecutedTemplateCount, &summary.RunFindingCount, &summary.StartedAt, &summary.FinishedAt, &summary.Error); err != nil {
+		var runCandidateEndpoints, runExecutedEndpoints, runIdentified, runMapped, runTemplates, runExecutedTemplates, runFindings int
+		if err := rows.Scan(&port, &endpoint.Protocol, &enabled, &endpoint.Status, &endpoint.Reason,
+			&endpoint.IdentifiedProductCount, &endpoint.MappedProductCount, &unmappedProductsJSON,
+			&endpoint.CandidateTemplateCount, &endpoint.ExecutedTemplateCount, &endpoint.FindingCount,
+			&endpoint.StartedAt, &endpoint.FinishedAt, &endpoint.Error,
+			&runCandidateEndpoints, &runExecutedEndpoints, &runIdentified, &runMapped,
+			&runTemplates, &runExecutedTemplates, &runFindings); err != nil {
 			rows.Close()
 			return err
 		}
 		if index, ok := portIndexes[port]; ok {
-			summary.Enabled = summary.Status != model.ScanTaskRunValidationDisabled
-			summary.UnmappedProducts = make([]string, 0)
-			var ignoredRunUnmappedProducts []string
-			_ = json.Unmarshal([]byte(unmappedProductsJSON), &ignoredRunUnmappedProducts)
+			endpoint.IP = ip
+			endpoint.Port = port
+			endpoint.Enabled = enabled != 0
+			endpoint.UnmappedProducts = make([]string, 0)
+			_ = json.Unmarshal([]byte(unmappedProductsJSON), &endpoint.UnmappedProducts)
+			ports[index].EndpointValidations = append(ports[index].EndpointValidations, endpoint)
+			summary := &ports[index].Validation
+			summary.Enabled = summary.Enabled || endpoint.Enabled
+			summary.Status = mergeAssetValidationStatus(summary.Status, endpoint.Status)
+			if summary.Reason == "" || endpoint.Status == model.ScanTaskRunValidationFailed {
+				summary.Reason = endpoint.Reason
+			}
+			summary.IdentifiedProductCount += endpoint.IdentifiedProductCount
+			summary.MappedProductCount += endpoint.MappedProductCount
+			summary.CandidateTemplateCount += endpoint.CandidateTemplateCount
+			summary.ExecutedTemplateCount += endpoint.ExecutedTemplateCount
+			summary.FindingCount += endpoint.FindingCount
+			summary.UnmappedProducts = append(summary.UnmappedProducts, endpoint.UnmappedProducts...)
+			summary.StartedAt, summary.FinishedAt = endpoint.StartedAt, endpoint.FinishedAt
+			if endpoint.Error != "" {
+				summary.Error = endpoint.Error
+			}
+			summary.RunCandidateEndpointCount, summary.RunExecutedEndpointCount = runCandidateEndpoints, runExecutedEndpoints
+			summary.RunIdentifiedProductCount, summary.RunMappedProductCount = runIdentified, runMapped
+			summary.RunTemplateCount, summary.RunExecutedTemplateCount, summary.RunFindingCount = runTemplates, runExecutedTemplates, runFindings
 			summary.Findings = make([]model.ScanTaskRunVulnerability, 0)
-			ports[index].Validation = summary
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -3196,12 +3298,19 @@ func loadAssetPortValidationSet(db *sql.DB, ip string, ports []model.AssetPort) 
 	if err := rows.Close(); err != nil {
 		return err
 	}
+	for index := range ports {
+		ports[index].Validation.UnmappedProducts = uniqueSortedStrings(ports[index].Validation.UnmappedProducts)
+	}
 	candidateRows, err := db.Query(latestAssetPortRunsCTE+`
-		SELECT endpoint.port, endpoint.template_id, endpoint.path, COALESCE(endpoint.product_key, ''), COALESCE(endpoint.executed, 0)
+		SELECT endpoint.port, endpoint.template_id, endpoint.path,
+			COALESCE(product.product_key, NULLIF(endpoint.product_key, ''), ''), COALESCE(endpoint.executed, 0)
 		FROM scan_task_run_template_candidate_endpoints AS endpoint
 		JOIN latest_port_runs AS latest ON latest.port = endpoint.port AND latest.scan_task_run_id = endpoint.scan_task_run_id
+		LEFT JOIN scan_task_run_template_candidate_products AS product
+			ON product.scan_task_run_id = endpoint.scan_task_run_id AND product.template_id = endpoint.template_id AND product.path = endpoint.path
+			AND product.ip = endpoint.ip AND product.port = endpoint.port AND product.protocol = endpoint.protocol
 		WHERE endpoint.ip = ?
-		ORDER BY endpoint.port, endpoint.template_id, endpoint.path`, ip, ip)
+		ORDER BY endpoint.port, endpoint.template_id, endpoint.path, product.product_key`, ip, ip)
 	if err != nil {
 		return err
 	}
@@ -3302,12 +3411,26 @@ func finalizeAssetPortProfiles(ports []model.AssetPort) {
 		if len(port.Validation.UnmappedProducts) > 0 && port.Validation.MappedProductCount > 0 {
 			port.UnresolvedReasons = append(port.UnresolvedReasons, "partial_template_mapping")
 		}
-		port.Validation.Reason = assetValidationReason(*port)
+		if port.Validation.Reason == "" {
+			port.Validation.Reason = assetValidationReason(*port)
+		}
 		if port.Validation.Reason != "" && port.Validation.Reason != "disabled" {
 			port.UnresolvedReasons = append(port.UnresolvedReasons, port.Validation.Reason)
 		}
 		port.UnresolvedReasons = uniqueSortedStrings(port.UnresolvedReasons)
 	}
+}
+
+func mergeAssetValidationStatus(current, next string) string {
+	priority := map[string]int{
+		model.ScanTaskRunValidationDisabled: 1, model.ScanTaskRunValidationNotStarted: 2,
+		model.ScanTaskRunValidationNoCandidates: 3, model.ScanTaskRunValidationSuccess: 4,
+		model.ScanTaskRunValidationFailed: 5,
+	}
+	if priority[next] > priority[current] {
+		return next
+	}
+	return current
 }
 
 func assetValidationReason(port model.AssetPort) string {

@@ -88,7 +88,7 @@ func runTargetTaskRun(ctx context.Context, options TargetTaskRunOptions, depende
 	if strings.TrimSpace(options.Network) == "" {
 		options.Network = "tcp"
 	}
-	if dependencies.scanHost == nil || (dependencies.runNuclei == nil && dependencies.executeNuclei == nil) {
+	if dependencies.scanHost == nil || (dependencies.runNuclei == nil && dependencies.executeNuclei == nil && dependencies.executeTemplatePaths == nil) {
 		return model.ScanTaskRunSnapshot{}, errors.New("target task run dependencies are required")
 	}
 	if err := checkCanceled(ctx, options.CheckCanceled); err != nil {
@@ -160,11 +160,13 @@ func runTargetTaskRun(ctx context.Context, options TargetTaskRunOptions, depende
 	}
 	if options.Run.Config.VulnerabilityOn {
 		validation := newRunValidationTracker()
+		validation.register(target, openPorts, fingerprintMatches)
 		templateRoot := options.Run.Config.NucleiTemplates
 		var templateIndex *planner.NucleiTemplateIndex
 		if dependencies.loadTemplateIndex != nil {
 			templateRoot, templateIndex, err = dependencies.loadTemplateIndex(options.Run.Config.NucleiTemplates)
 			if err != nil {
+				validation.failAll(err)
 				validation.finish(&snapshot, err)
 				return snapshot, err
 			}
@@ -177,7 +179,7 @@ func runTargetTaskRun(ctx context.Context, options TargetTaskRunOptions, depende
 			validation.finish(&snapshot, mappingResult.err)
 			return snapshot, mappingResult.err
 		}
-		fallbackResult := runServiceTagValidation(ctx, target, portsWithoutFingerprintMappings(openPorts, mappingResult.candidates, fingerprintMatches), templateRoot, nucleiExecutionDependency(dependencies.executeNuclei, dependencies.runNuclei))
+		fallbackResult := runServiceTagValidation(ctx, target, portsWithoutFingerprintMappings(openPorts, mappingResult.candidates, fingerprintMatches), templateIndex, dependencies.executeTemplatePaths)
 		validation.observe(fallbackResult)
 		allFindings := append(mappingResult.findings, fallbackResult.findings...)
 		allCandidates := append(mappingResult.candidates, fallbackResult.candidates...)
@@ -202,6 +204,8 @@ func partialTargetSnapshot(runID int64, ip string, results []model.ScanResult, v
 		Vulnerabilities: make([]model.ScanTaskRunVulnerability, 0), FingerprintMatches: make([]model.FingerprintRunMatch, 0),
 	}
 	snapshot.Validation = initialRunValidation(len(vulnerabilityOn) > 0 && vulnerabilityOn[0])
+	enabled := len(vulnerabilityOn) > 0 && vulnerabilityOn[0]
+	snapshot.EndpointValidations = initialEndpointValidations(ip, results, enabled)
 	if len(ports) > 0 {
 		snapshot.Hosts = []model.ScanTaskRunHost{{IP: ip, IsActive: true}}
 	}

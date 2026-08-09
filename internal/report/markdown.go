@@ -635,6 +635,21 @@ func fingerprintRoleLabel(role string) string {
 }
 
 func endpointValidationSummary(snapshot model.ScanTaskRunSnapshot, port model.ScanTaskRunPort, conclusions []map[string]interface{}) string {
+	endpointSummaries := make([]string, 0)
+	for _, validation := range snapshot.EndpointValidations {
+		if validation.IP != port.IP || validation.Port != port.Port {
+			continue
+		}
+		reason := ""
+		if validation.Reason != "" {
+			reason = "; reason=" + validation.Reason
+		}
+		endpointSummaries = append(endpointSummaries, fmt.Sprintf("%s: %s%s; candidate templates=%d; executed templates=%d; findings=%d", validation.Protocol, validation.Status, reason, validation.CandidateTemplateCount, validation.ExecutedTemplateCount, validation.FindingCount))
+	}
+	if len(endpointSummaries) > 0 {
+		sort.Strings(endpointSummaries)
+		return strings.Join(endpointSummaries, " | ")
+	}
 	candidates := make(map[string]struct{})
 	executedTemplates := make(map[string]struct{})
 	findings := 0
@@ -698,6 +713,19 @@ func endpointUnresolvedReasons(snapshot model.ScanTaskRunSnapshot, port model.Sc
 		if _, mapped := mappedProducts[strings.ToLower(product)]; !mapped {
 			reasons = append(reasons, "no template mapping for "+product)
 		}
+	}
+	endpointStateFound := false
+	for _, validation := range snapshot.EndpointValidations {
+		if validation.IP != port.IP || validation.Port != port.Port {
+			continue
+		}
+		endpointStateFound = true
+		if validation.Reason != "" {
+			reasons = append(reasons, validation.Protocol+": "+validation.Reason)
+		}
+	}
+	if endpointStateFound {
+		return uniqueReportStrings(reasons)
 	}
 	switch snapshot.Validation.Status {
 	case model.ScanTaskRunValidationDisabled:

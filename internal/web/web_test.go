@@ -100,7 +100,7 @@ func TestAssetDetailRendersProtocolResponseSummary(t *testing.T) {
 		"TCP 被动 Banner", "TCP 主动 Probe", "未保存协议响应摘要",
 		"port.technologies", "item.version", "item.cpe", "item.sources", "item.product_status", "item.conflict_candidates",
 		"网络服务", "Web Server", "运行时 / 语言", "框架", "CMS / 应用", "控制面板", "前端技术",
-		"port.validation", "candidate_template_count", "identified_product_count", "finding_count", "unresolved_reasons", "observation_run_id",
+		"port.validation", "port.endpoint_validations", "data-testid=\"endpoint-validation\"", "candidate_template_count", "identified_product_count", "finding_count", "unresolved_reasons", "observation_run_id",
 	} {
 		if !strings.Contains(section, expected) {
 			t.Fatalf("asset detail missing %q", expected)

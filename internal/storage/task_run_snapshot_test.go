@@ -115,23 +115,30 @@ func TestSnapshotAndFingerprintMatchesRollbackTogether(t *testing.T) {
 	}
 }
 
-func TestSnapshotPersistsDistinctStructuredTemplateCandidateEndpoints(t *testing.T) {
+func TestSnapshotPersistsEndpointValidationAndAllTemplateProductRelations(t *testing.T) {
 	db := openTestDB(t)
 	if err := initSQLiteSchema(db); err != nil {
 		t.Fatal(err)
 	}
 	task := createScheduledTaskForTest(t, db, "192.168.74.0/24")
 	run := createRunningTaskRun(t, db, task.ID, "2026-07-27T02:00:00Z")
-	snapshot := model.ScanTaskRunSnapshot{RunID: run.ID, TemplateCandidates: []model.ScanTaskRunTemplateCandidate{
-		{TemplateID: "fixture", Path: "fixture.yaml", ProductKey: "nginx", Source: "fingerprint_mapping", Reason: "display text", IP: "192.168.74.1", Port: 443, Protocol: "https"},
-		{TemplateID: "fixture", Path: "fixture.yaml", ProductKey: "openssh", Source: "fingerprint_mapping", Reason: "display text", IP: "192.168.74.1", Port: 443, Protocol: "tcp"},
-	}}
+	snapshot := model.ScanTaskRunSnapshot{RunID: run.ID,
+		EndpointValidations: []model.ScanTaskRunEndpointValidation{{IP: "192.168.74.1", Port: 443, Protocol: "https", Enabled: true, Status: model.ScanTaskRunValidationSuccess, IdentifiedProductCount: 2, MappedProductCount: 2, CandidateTemplateCount: 1, ExecutedTemplateCount: 1, UnmappedProducts: []string{}}},
+		TemplateCandidates: []model.ScanTaskRunTemplateCandidate{
+			{TemplateID: "fixture", Path: "fixture.yaml", ProductKey: "nginx", Source: "fingerprint_mapping", Reason: "display text", IP: "192.168.74.1", Port: 443, Protocol: "https"},
+			{TemplateID: "fixture", Path: "fixture.yaml", ProductKey: "php", Source: "fingerprint_mapping", Reason: "display text", IP: "192.168.74.1", Port: 443, Protocol: "https"},
+			{TemplateID: "fixture", Path: "fixture.yaml", ProductKey: "openssh", Source: "fingerprint_mapping", Reason: "display text", IP: "192.168.74.1", Port: 443, Protocol: "tcp"},
+		}}
 	if err := SaveScanTaskRunSnapshot(db, snapshot); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := GetScanTaskRunSnapshot(db, run.ID)
-	if err != nil || len(loaded.TemplateCandidates) != 2 || loaded.TemplateCandidates[0].Protocol == loaded.TemplateCandidates[1].Protocol || loaded.TemplateCandidates[0].ProductKey == loaded.TemplateCandidates[1].ProductKey {
+	if err != nil || len(loaded.TemplateCandidates) != 3 || len(loaded.EndpointValidations) != 1 || loaded.EndpointValidations[0].MappedProductCount != 2 {
 		t.Fatalf("loaded candidates=%#v err=%v", loaded.TemplateCandidates, err)
+	}
+	products := []string{loaded.TemplateCandidates[0].ProductKey, loaded.TemplateCandidates[1].ProductKey, loaded.TemplateCandidates[2].ProductKey}
+	if !reflect.DeepEqual(products, []string{"nginx", "php", "openssh"}) {
+		t.Fatalf("template product relations=%#v", products)
 	}
 }
 

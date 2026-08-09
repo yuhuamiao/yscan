@@ -25,7 +25,12 @@ import (
 
 const maxNucleiStderrBytes = 32 * 1024
 
-var ErrNoTemplates = errors.New("no usable nuclei templates")
+var (
+	ErrNoTemplates              = errors.New("no usable nuclei templates")
+	ErrNucleiMissing            = errors.New("nuclei executable missing")
+	ErrTemplateDirectoryMissing = errors.New("nuclei template directory missing")
+	ErrTemplateMissing          = errors.New("nuclei template missing")
+)
 
 // NucleiExecutionResult separates process startup and actual template
 // execution from findings and errors. Callers must not infer coverage from an
@@ -93,7 +98,7 @@ func ExecuteNucleiForOpenPortsWithTemplatePaths(ctx context.Context, ip string, 
 		}
 		info, err := os.Stat(absolute)
 		if err != nil || info.IsDir() {
-			return NucleiExecutionResult{Err: fmt.Errorf("reviewed nuclei template is not a file: %s", path)}
+			return NucleiExecutionResult{Err: fmt.Errorf("%w: reviewed template is not a file: %s", ErrTemplateMissing, path)}
 		}
 		paths = append(paths, absolute)
 	}
@@ -334,7 +339,7 @@ func DetectNucleiBinary() (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("nuclei not found in PATH or GOPATH/bin")
+	return "", fmt.Errorf("%w: not found in PATH or GOPATH/bin", ErrNucleiMissing)
 }
 
 func ResolveNucleiTemplatesPath(input string) (string, error) {
@@ -351,7 +356,7 @@ func ResolveNucleiTemplatesPath(input string) (string, error) {
 		}
 	}
 
-	return "", errors.New("nuclei templates not found, please specify --templates <path>")
+	return "", fmt.Errorf("%w: specify --templates <path>", ErrTemplateDirectoryMissing)
 }
 
 func nucleiBinaryNames() []string {
@@ -389,7 +394,7 @@ func nucleiTemplatesFallbackPaths() []string {
 func validateNucleiTemplatesPath(input string) (string, error) {
 	resolved := strings.TrimSpace(input)
 	if resolved == "" {
-		return "", fmt.Errorf("empty nuclei templates path")
+		return "", fmt.Errorf("%w: empty path", ErrTemplateDirectoryMissing)
 	}
 
 	abs, err := filepath.Abs(resolved)
@@ -399,10 +404,10 @@ func validateNucleiTemplatesPath(input string) (string, error) {
 
 	fi, err := os.Stat(resolved)
 	if err != nil {
-		return "", fmt.Errorf("nuclei templates path not found: %s", resolved)
+		return "", fmt.Errorf("%w: path not found: %s", ErrTemplateDirectoryMissing, resolved)
 	}
 	if !fi.IsDir() {
-		return "", fmt.Errorf("nuclei templates path is not a directory: %s", resolved)
+		return "", fmt.Errorf("%w: path is not a directory: %s", ErrTemplateDirectoryMissing, resolved)
 	}
 
 	return resolved, nil

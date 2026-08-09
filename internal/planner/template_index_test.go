@@ -65,6 +65,67 @@ info:
 headless:
   - steps: []
 `)
+	writeTemplateIndexFixture(t, root, "unsafe/payload-auth.yaml", `
+id: unsafe-payload-auth
+info:
+  name: Unsafe Payload Authentication
+  severity: high
+  metadata: {product: php}
+  tags: php,vuln
+http:
+  - method: GET
+    path: ["{{BaseURL}}/login?username={{username}}&password={{password}}"]
+    payloads:
+      username: [admin]
+      password: [admin]
+    attack: pitchfork
+`)
+	writeTemplateIndexFixture(t, root, "unsafe/header-auth.yaml", `
+id: unsafe-header-auth
+info:
+  name: Unsafe Authorization Header
+  severity: high
+  metadata: {product: php}
+  tags: php,vuln
+http:
+  - method: GET
+    path: ["{{BaseURL}}"]
+    headers:
+      Authorization: Basic dGVzdDp0ZXN0
+`)
+	writeTemplateIndexFixture(t, root, "unsafe/redirect.yaml", `
+id: unsafe-redirect
+info:
+  name: Unsafe Redirect
+  severity: medium
+  metadata: {product: php}
+  tags: php,vuln
+http:
+  - method: GET
+    path: ["{{BaseURL}}"]
+    redirects: true
+`)
+	writeTemplateIndexFixture(t, root, "unsafe/oast.yaml", `
+id: unsafe-oast
+info:
+  name: Unsafe OAST
+  severity: high
+  metadata: {product: php}
+  tags: php,vuln,oast
+http:
+  - method: GET
+    path: ["{{BaseURL}}/{{interactsh-url}}"]
+`)
+	writeTemplateIndexFixture(t, root, "unsafe/runtime-tag.yaml", `
+id: runtime-tag-is-not-a-product
+info:
+  name: Runtime Tag Is Not A Product
+  severity: medium
+  tags: python,config
+http:
+  - method: GET
+    path: ["{{BaseURL}}"]
+`)
 	writeTemplateIndexFixture(t, root, "http/php-detect.yaml", `
 id: php-detect
 info:
@@ -93,7 +154,13 @@ http:
 	if index.Revision == "" || len(index.Templates) != 3 {
 		t.Fatalf("index revision=%q templates=%#v", index.Revision, index.Templates)
 	}
-	php := index.Select("php", "", "https")
+	if !index.PolicyFiltered("php", "", "https") {
+		t.Fatal("unsafe PHP payload/auth templates were not recorded as policy-filtered")
+	}
+	if index.PolicyFiltered("python", "", "http") {
+		t.Fatal("unreviewed runtime tag must not become a rejected product selector")
+	}
+	php := index.Select("php", "cpe:2.3:a:php:php:8.2:*:*:*:*:*:*:*", "https")
 	if len(php) != 1 || php[0].TemplateID != "php-config-exposure" || php[0].SHA256 == "" || php[0].Path != "http/php.yaml" {
 		t.Fatalf("PHP candidates=%#v", php)
 	}
@@ -104,9 +171,54 @@ http:
 	if got := index.Select("php", "", "tcp"); len(got) != 0 {
 		t.Fatalf("HTTP template crossed protocol: %#v", got)
 	}
-	nginx := index.Select("nginx", "", "http")
+	if got := index.Select("nginx", "", "http"); len(got) != 0 {
+		t.Fatalf("CPE-constrained template matched without endpoint CPE: %#v", got)
+	}
+	if got := index.Select("nginx", "cpe:2.3:a:other:nginx:*:*:*:*:*:*:*:*", "http"); len(got) != 0 {
+		t.Fatalf("CPE-constrained template crossed vendor: %#v", got)
+	}
+	nginx := index.Select("nginx", "cpe:2.3:a:nginx:nginx:1.25.0:*:*:*:*:*:*:*", "http")
 	if len(nginx) != 1 || nginx[0].TemplateID != "nginx-cpe-check" {
 		t.Fatalf("CPE-only candidates=%#v", nginx)
+	}
+}
+
+func TestNucleiTemplateIndexHonorsCPEVersionAndReviewedTags(t *testing.T) {
+	root := t.TempDir()
+	writeTemplateIndexFixture(t, root, "nginx-version.yaml", `
+id: nginx-version
+info:
+  name: Nginx Version Check
+  severity: high
+  classification:
+    cpe: cpe:2.3:a:nginx:nginx:1.24.0:*:*:*:*:*:*:*
+  tags: cve,nginx
+http:
+  - method: GET
+    path: ["{{BaseURL}}"]
+`)
+	writeTemplateIndexFixture(t, root, "redis-reviewed-tag.yaml", `
+id: redis-reviewed-tag
+info:
+  name: Redis Reviewed Tag
+  severity: high
+  tags: redis,exposure
+tcp:
+  - inputs:
+      - data: "info\r\nquit\r\n"
+`)
+	index, err := BuildNucleiTemplateIndex(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := index.Select("nginx", "cpe:2.3:a:nginx:nginx:1.25.0:*:*:*:*:*:*:*", "http"); len(got) != 0 {
+		t.Fatalf("version-constrained template crossed version: %#v", got)
+	}
+	if got := index.Select("nginx", "cpe:2.3:a:nginx:nginx:1.24.0:*:*:*:*:*:*:*", "http"); len(got) != 1 {
+		t.Fatalf("exact CPE candidate=%#v", got)
+	}
+	if got := index.Select("redis", "", "tcp"); len(got) != 1 || got[0].TemplateID != "redis-reviewed-tag" {
+		t.Fatalf("reviewed product tag candidate=%#v", got)
 	}
 }
 
@@ -157,15 +269,14 @@ func TestRealNucleiTemplateIndexCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(index.Templates) < 100 || index.Revision == "" {
-		t.Fatalf("real index is unexpectedly small: templates=%d revision=%q", len(index.Templates), index.Revision)
+	if len(index.Templates) != 177 || index.Revision != "nuclei-template-index-v3:4f4a86d882371294568bc68bac65899f2e0930805362105de3985824717d9f23" {
+		t.Fatalf("real index changed: templates=%d revision=%q", len(index.Templates), index.Revision)
 	}
-	php := index.Select("php", "cpe:2.3:a:php:php:*:*:*:*:*:*:*:*", "http")
 	redis := index.Select("redis", "", "tcp")
-	if len(php) == 0 || len(redis) == 0 {
-		t.Fatalf("real index coverage php=%d redis=%d", len(php), len(redis))
+	if len(redis) != 1 {
+		t.Fatalf("real index coverage redis=%d", len(redis))
 	}
-	for _, candidates := range [][]NucleiTemplateIndexEntry{php, redis} {
+	for _, candidates := range [][]NucleiTemplateIndexEntry{redis} {
 		for _, candidate := range candidates {
 			for _, tag := range candidate.Tags {
 				if _, unsafe := unsafeAutomaticTemplateTags[tag]; unsafe {
@@ -177,14 +288,14 @@ func TestRealNucleiTemplateIndexCoverage(t *testing.T) {
 			}
 		}
 	}
-	for _, forbidden := range []string{"php-detect", "sshd-dropbear-detect", "redis-honeypot-detect", "python-code-injection", "twig-php-ssti"} {
+	for _, forbidden := range []string{"CVE-2013-4982", "php-detect", "sshd-dropbear-detect", "redis-honeypot-detect", "python-code-injection", "twig-php-ssti"} {
 		for _, candidate := range index.Templates {
 			if candidate.TemplateID == forbidden {
 				t.Fatalf("detection or intrusive template entered automatic index: %#v", candidate)
 			}
 		}
 	}
-	t.Logf("real template index: executable=%d php=%d redis=%d revision=%s", len(index.Templates), len(php), len(redis), index.Revision)
+	t.Logf("real template index: executable=%d redis=%d revision=%s", len(index.Templates), len(redis), index.Revision)
 }
 
 func writeTemplateIndexFixture(t *testing.T, root, relative, content string) string {

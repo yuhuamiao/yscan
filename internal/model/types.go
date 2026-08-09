@@ -48,6 +48,15 @@ const (
 	ScanTaskRunValidationNoCandidates = "no_candidates"
 	ScanTaskRunValidationSuccess      = "success"
 	ScanTaskRunValidationFailed       = "failed"
+
+	ValidationReasonUnidentifiedProduct = "unidentified_product"
+	ValidationReasonMappingMissing      = "mapping_missing"
+	ValidationReasonTemplateMissing     = "template_missing"
+	ValidationReasonNucleiMissing       = "nuclei_missing"
+	ValidationReasonTemplateDirectory   = "template_directory_missing"
+	ValidationReasonPolicyFiltered      = "policy_filtered"
+	ValidationReasonExecutionFailed     = "execution_failed"
+	ValidationReasonRunFailure          = "skipped_run_failure"
 )
 
 type Scanner struct {
@@ -440,6 +449,24 @@ type ScanTaskRunValidation struct {
 	Error                  string   `json:"error,omitempty"`
 }
 
+type ScanTaskRunEndpointValidation struct {
+	IP                     string   `json:"ip"`
+	Port                   int      `json:"port"`
+	Protocol               string   `json:"protocol"`
+	Enabled                bool     `json:"enabled"`
+	Status                 string   `json:"status"`
+	Reason                 string   `json:"reason,omitempty"`
+	IdentifiedProductCount int      `json:"identified_product_count"`
+	MappedProductCount     int      `json:"mapped_product_count"`
+	UnmappedProducts       []string `json:"unmapped_products"`
+	CandidateTemplateCount int      `json:"candidate_template_count"`
+	ExecutedTemplateCount  int      `json:"executed_template_count"`
+	FindingCount           int      `json:"finding_count"`
+	StartedAt              string   `json:"started_at,omitempty"`
+	FinishedAt             string   `json:"finished_at,omitempty"`
+	Error                  string   `json:"error,omitempty"`
+}
+
 // ScanTaskRunTemplateCandidate preserves why one reviewed template was chosen.
 type ScanTaskRunTemplateCandidate struct {
 	TemplateID          string `json:"template_id"`
@@ -490,14 +517,15 @@ type FingerprintRunMatch struct {
 }
 
 type ScanTaskRunSnapshot struct {
-	RunID              int64                          `json:"run_id"`
-	Hosts              []ScanTaskRunHost              `json:"hosts"`
-	Ports              []ScanTaskRunPort              `json:"ports"`
-	ProtocolEvidence   []ScanTaskRunProtocolEvidence  `json:"protocol_evidence"`
-	Validation         ScanTaskRunValidation          `json:"validation"`
-	Vulnerabilities    []ScanTaskRunVulnerability     `json:"vulnerabilities"`
-	TemplateCandidates []ScanTaskRunTemplateCandidate `json:"template_candidates"`
-	FingerprintMatches []FingerprintRunMatch          `json:"fingerprint_matches,omitempty"`
+	RunID               int64                           `json:"run_id"`
+	Hosts               []ScanTaskRunHost               `json:"hosts"`
+	Ports               []ScanTaskRunPort               `json:"ports"`
+	ProtocolEvidence    []ScanTaskRunProtocolEvidence   `json:"protocol_evidence"`
+	Validation          ScanTaskRunValidation           `json:"validation"`
+	EndpointValidations []ScanTaskRunEndpointValidation `json:"endpoint_validations"`
+	Vulnerabilities     []ScanTaskRunVulnerability      `json:"vulnerabilities"`
+	TemplateCandidates  []ScanTaskRunTemplateCandidate  `json:"template_candidates"`
+	FingerprintMatches  []FingerprintRunMatch           `json:"fingerprint_matches,omitempty"`
 }
 
 // LegacyTaskSummary exposes v1 task records as read-only history. They never
@@ -585,24 +613,25 @@ func (membership HostScopeMembership) Valid() bool {
 }
 
 type AssetPort struct {
-	Port              int                           `json:"port"`
-	Transport         string                        `json:"transport"`
-	State             string                        `json:"state"`
-	Service           string                        `json:"service"`
-	ObservationRunID  int64                         `json:"observation_run_id,omitempty"`
-	ObservedAt        string                        `json:"observed_at,omitempty"`
-	Protocol          string                        `json:"protocol,omitempty"`
-	StatusCode        int                           `json:"status_code,omitempty"`
-	Server            string                        `json:"server,omitempty"`
-	Title             string                        `json:"title,omitempty"`
-	ResponseLength    int                           `json:"response_length,omitempty"`
-	ResponseSHA256    string                        `json:"response_sha256,omitempty"`
-	ResponseTruncated bool                          `json:"response_truncated,omitempty"`
-	ProtocolEvidence  []ScanTaskRunProtocolEvidence `json:"protocol_evidence"`
-	Technologies      []AssetTechnology             `json:"technologies"`
-	Validation        AssetValidationSummary        `json:"validation"`
-	UnresolvedReasons []string                      `json:"unresolved_reasons"`
-	LastSeenAt        string                        `json:"last_seen_at"`
+	Port                int                             `json:"port"`
+	Transport           string                          `json:"transport"`
+	State               string                          `json:"state"`
+	Service             string                          `json:"service"`
+	ObservationRunID    int64                           `json:"observation_run_id,omitempty"`
+	ObservedAt          string                          `json:"observed_at,omitempty"`
+	Protocol            string                          `json:"protocol,omitempty"`
+	StatusCode          int                             `json:"status_code,omitempty"`
+	Server              string                          `json:"server,omitempty"`
+	Title               string                          `json:"title,omitempty"`
+	ResponseLength      int                             `json:"response_length,omitempty"`
+	ResponseSHA256      string                          `json:"response_sha256,omitempty"`
+	ResponseTruncated   bool                            `json:"response_truncated,omitempty"`
+	ProtocolEvidence    []ScanTaskRunProtocolEvidence   `json:"protocol_evidence"`
+	Technologies        []AssetTechnology               `json:"technologies"`
+	Validation          AssetValidationSummary          `json:"validation"`
+	EndpointValidations []ScanTaskRunEndpointValidation `json:"endpoint_validations"`
+	UnresolvedReasons   []string                        `json:"unresolved_reasons"`
+	LastSeenAt          string                          `json:"last_seen_at"`
 }
 
 type AssetTechnologySource struct {

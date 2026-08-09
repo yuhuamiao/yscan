@@ -15,6 +15,7 @@ import (
 
 	"golandproject/yscan/internal/fingerprint"
 	"golandproject/yscan/internal/model"
+	"golandproject/yscan/internal/planner"
 	"golandproject/yscan/internal/scan"
 	"golandproject/yscan/internal/storage"
 	"golandproject/yscan/internal/vuln"
@@ -158,25 +159,14 @@ func TestRunTargetTaskRunBuildsSnapshotIndependentOfInventory(t *testing.T) {
 			ScanTaskID: 12,
 			ScanType:   model.ScanTypeIP,
 			Target:     "192.168.80.10",
-			Config: model.ScanTaskConfig{
-				VulnerabilityOn: true,
-				NucleiTemplates: "test-templates",
-			},
+			Config:     model.ScanTaskConfig{},
 		},
 	}, targetDependencies{
 		scanHost: func(context.Context, string, string) (scan.PortScanOutcome, error) {
 			return scan.PortScanOutcome{Results: []model.ScanResult{{Address: "192.168.80.10:8443", Open: true, Service: "https", Product: "nginx"}}, AttemptedPorts: 65535, TotalPorts: 65535}, nil
 		},
-		runNuclei: func(_ context.Context, _ string, _ []model.ScanResult, templates string, _ []string) ([]model.NucleiFinding, error) {
-			if templates != "test-templates" {
-				t.Fatalf("templates = %q", templates)
-			}
-			return []model.NucleiFinding{{
-				TemplateID: "CVE-2026-0002",
-				Target:     "https://192.168.80.10:8443",
-				TargetIP:   "192.168.80.10",
-				TargetPort: 8443,
-			}}, nil
+		runNuclei: func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
+			return nil, nil
 		},
 	})
 	if err != nil {
@@ -191,25 +181,27 @@ func TestRunTargetTaskRunBuildsSnapshotIndependentOfInventory(t *testing.T) {
 	if want := []model.ScanTaskRunPort{{IP: "192.168.80.10", Port: 8443, ServiceType: "https", Product: "nginx"}}; !reflect.DeepEqual(snapshot.Ports, want) {
 		t.Fatalf("snapshot ports = %#v, want %#v", snapshot.Ports, want)
 	}
-	if len(snapshot.Vulnerabilities) != 1 || snapshot.Vulnerabilities[0].TemplateID != "CVE-2026-0002" {
-		t.Fatalf("snapshot vulnerabilities = %#v", snapshot.Vulnerabilities)
-	}
-	if snapshot.Validation.Status != model.ScanTaskRunValidationSuccess || snapshot.Validation.CandidateEndpointCount != 1 || snapshot.Validation.ExecutedEndpointCount != 1 || snapshot.Validation.FindingCount != 1 {
+	if len(snapshot.Vulnerabilities) != 0 || snapshot.Validation.Status != model.ScanTaskRunValidationDisabled {
 		t.Fatalf("snapshot validation = %#v", snapshot.Validation)
 	}
 }
 
 func TestNonStandardHTTPSNoTemplatesIsNotSuccessfulValidation(t *testing.T) {
-	db := openWorkflowDB(t)
+	db := openFullWorkflowDB(t)
 	const ip = "192.168.80.17"
+	root, templateIndex := workflowTemplateIndexFixture(t, workflowTemplateSpec{id: "nginx-safe", product: "nginx", protocol: "http"})
 	snapshot, err := runTargetTaskRun(context.Background(), TargetTaskRunOptions{
 		DB: db, Run: model.ScanTaskRun{ID: 97, ScanTaskID: 12, ScanType: model.ScanTypeIP, Target: ip, Config: model.ScanTaskConfig{VulnerabilityOn: true}},
 	}, targetDependencies{
 		scanHost: func(context.Context, string, string) (scan.PortScanOutcome, error) {
 			return scan.PortScanOutcome{Results: []model.ScanResult{{Address: ip + ":30957", Open: true, Service: "https"}}, AttemptedPorts: 65535, TotalPorts: 65535}, nil
 		},
-		runNuclei: func(context.Context, string, []model.ScanResult, string, []string) ([]model.NucleiFinding, error) {
-			return nil, vuln.ErrNoTemplates
+		collectFingerprints: func(_ context.Context, _ *sql.DB, _ model.ScanTaskRun, host string, results []model.ScanResult) ([]model.ScanResult, []model.FingerprintRunMatch, error) {
+			return results, []model.FingerprintRunMatch{{IP: host, Port: 30957, Protocol: "https", Product: "nginx"}}, nil
+		},
+		loadTemplateIndex: func(string) (string, *planner.NucleiTemplateIndex, error) { return root, templateIndex, nil },
+		executeTemplatePaths: func(context.Context, string, []model.ScanResult, []string) vuln.NucleiExecutionResult {
+			return vuln.NucleiExecutionResult{Started: true, Err: vuln.ErrNoTemplates}
 		},
 	})
 	if err != nil {
@@ -243,9 +235,13 @@ func TestPortScanFailureLeavesValidationNotStarted(t *testing.T) {
 }
 
 func TestValidationKeepsEarlierExecutedEndpointWhenLaterEndpointHasNoTemplates(t *testing.T) {
-	db := openWorkflowDB(t)
+	db := openFullWorkflowDB(t)
 	const ip = "192.168.80.18"
 	calls := 0
+	root, templateIndex := workflowTemplateIndexFixture(t,
+		workflowTemplateSpec{id: "nginx-safe", product: "nginx", protocol: "http"},
+		workflowTemplateSpec{id: "php-safe", product: "php", protocol: "http"},
+	)
 	snapshot, err := runTargetTaskRun(context.Background(), TargetTaskRunOptions{
 		DB: db, Run: model.ScanTaskRun{ID: 98, ScanTaskID: 12, ScanType: model.ScanTypeIP, Target: ip, Config: model.ScanTaskConfig{VulnerabilityOn: true}},
 	}, targetDependencies{
@@ -255,7 +251,11 @@ func TestValidationKeepsEarlierExecutedEndpointWhenLaterEndpointHasNoTemplates(t
 				{Address: ip + ":443", Open: true, Service: "https"},
 			}, AttemptedPorts: 65535, TotalPorts: 65535}, nil
 		},
-		executeNuclei: func(_ context.Context, _ string, ports []model.ScanResult, _ string, _ []string) vuln.NucleiExecutionResult {
+		collectFingerprints: func(_ context.Context, _ *sql.DB, _ model.ScanTaskRun, host string, results []model.ScanResult) ([]model.ScanResult, []model.FingerprintRunMatch, error) {
+			return results, []model.FingerprintRunMatch{{IP: host, Port: 80, Protocol: "http", Product: "nginx"}, {IP: host, Port: 443, Protocol: "https", Product: "php"}}, nil
+		},
+		loadTemplateIndex: func(string) (string, *planner.NucleiTemplateIndex, error) { return root, templateIndex, nil },
+		executeTemplatePaths: func(_ context.Context, _ string, ports []model.ScanResult, _ []string) vuln.NucleiExecutionResult {
 			calls++
 			if strings.HasSuffix(ports[0].Address, ":443") {
 				return vuln.NucleiExecutionResult{Started: true, Err: vuln.ErrNoTemplates}
