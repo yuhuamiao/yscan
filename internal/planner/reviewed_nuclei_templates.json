@@ -1,0 +1,35 @@
+{
+  "revision": "caasm-reviewed-nuclei-v1",
+  "templates": [
+    {
+      "template_id": "exposed-redis",
+      "path": "network/exposures/exposed-redis.yaml",
+      "sha256": "7ad8fe0c466ae8313944773bd73f1882db6b0762a48abc77e06c3644d966c827",
+      "product": "redis",
+      "cpe": "",
+      "protocol": "tcp",
+      "request_summary": "Redis INFO followed by QUIT; no authentication or mutation",
+      "side_effect": "read_only"
+    },
+    {
+      "template_id": "php-ini",
+      "path": "http/exposures/files/php-ini.yaml",
+      "sha256": "933e2e60a0c1fa0d7fb3be463e8af3f3e958188bd7440653c9dfa689562ae806",
+      "product": "php",
+      "cpe": "cpe:2.3:a:php:php:*:*:*:*:*:*:*:*",
+      "protocol": "http",
+      "request_summary": "GET /php.ini without query, credentials, redirect, or payload",
+      "side_effect": "read_only"
+    },
+    {
+      "template_id": "python-metrics",
+      "path": "http/misconfiguration/python-metrics.yaml",
+      "sha256": "739a73902b3273d25dc1a31c53046ccdc8b0bec57c32a9b987b79950bcecf4b0",
+      "product": "python",
+      "cpe": "cpe:2.3:a:python:python:*:*:*:*:*:*:*:*",
+      "protocol": "http",
+      "request_summary": "GET /metrics without query, credentials, redirect, or payload",
+      "side_effect": "read_only"
+    }
+  ]
+}

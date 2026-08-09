@@ -16,7 +16,7 @@ import (
 
 func TestBuildNucleiArgsIncludesNormalizedTags(t *testing.T) {
 	args := buildNucleiArgs("targets.txt", []string{"templates"}, []string{"http", " Redis ", "http"})
-	want := []string{"-jsonl", "-silent", "-l", "targets.txt", "-exclude-tags", "intrusive,dos,auth", "-t", "templates", "-tags", "http,redis"}
+	want := []string{"-jsonl", "-silent", "-ni", "-dr", "-rate-limit", "25", "-concurrency", "5", "-l", "targets.txt", "-exclude-tags", "intrusive,dos,auth", "-t", "templates", "-tags", "http,redis"}
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("args = %v, want %v", args, want)
 	}
@@ -38,6 +38,12 @@ func TestBuildNucleiArgsAlwaysIncludesSafetyExclusions(t *testing.T) {
 	}
 	if excludedTags != "intrusive,dos,auth" {
 		t.Fatalf("excluded tags = %q, want intrusive,dos,auth", excludedTags)
+	}
+	joined := " " + strings.Join(args, " ") + " "
+	for _, expected := range []string{" -ni ", " -dr ", " -rate-limit 25 ", " -concurrency 5 "} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("missing process safety flag %q in %v", expected, args)
+		}
 	}
 }
 

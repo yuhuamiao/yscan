@@ -42,20 +42,28 @@ command -v python3 >/dev/null
 python3 -c 'import flask, werkzeug'
 test -d "$templates_path"
 test -x "$chromium_path"
-(cd "$repo_root" && YSCAN_REAL_NUCLEI_TEMPLATES="$templates_path" go test -count=1 -run TestRealNucleiTemplateIndexCoverage ./internal/planner)
+(cd "$repo_root" && YSCAN_REAL_NUCLEI_TEMPLATES="$templates_path" go test -count=1 -run 'TestReal(NucleiTemplateIndexCoverage|ReviewedNucleiTemplateMatrix)' ./internal/planner)
 
 if [ "${YSCAN_T330_EXTERNAL_SERVICES:-0}" != "1" ]; then
-  php_root="$validation_root/php"
-  mkdir "$php_root"
-  cat > "$php_root/index.php" <<'PHP'
+  php_exposed_root="$validation_root/php-exposed"
+  php_clean_root="$validation_root/php-clean"
+  mkdir "$php_exposed_root" "$php_clean_root"
+  cat > "$php_exposed_root/index.php" <<'PHP'
 <?php header('X-Powered-By: PHP/8.1.2'); ?>
 <html><title>T330 PHP</title><body>PHP runtime fixture</body></html>
 PHP
+  cp "$php_exposed_root/index.php" "$php_clean_root/index.php"
+  cat > "$php_exposed_root/php.ini" <<'INI'
+[PHP]
+short_open_tag = Off
+safe_mode = Off
+expose_php = On
+INI
   python3 "$repo_root/scripts/t330_fixture_services.py" > "$validation_root/fixtures.log" 2>&1 &
   fixture_pid=$!
-  php -S 127.0.0.1:28080 -t "$php_root" > "$validation_root/php-28080.log" 2>&1 &
+  php -S 127.0.0.1:28080 -t "$php_exposed_root" > "$validation_root/php-28080.log" 2>&1 &
   service_pids+=("$!")
-  php -S 127.0.0.1:28081 -t "$php_root" > "$validation_root/php-28081.log" 2>&1 &
+  php -S 127.0.0.1:28081 -t "$php_clean_root" > "$validation_root/php-28081.log" 2>&1 &
   service_pids+=("$!")
 fi
 
@@ -123,7 +131,7 @@ curl --fail --silent --request POST "$base_url/api/scan-tasks/$task_id/pause" > 
 jq -e '.status == "paused"' paused-task.json >/dev/null
 
 curl --fail --silent "$base_url/api/assets/127.0.0.1" > asset.json
-jq -e --argjson run_id "$run2" '
+if ! jq -e --argjson run_id "$run2" '
   ([.ports[] | select(.port == 22222 or .port == 6379 or .port == 26379 or .port == 28080 or .port == 28081 or .port == 28082)] | length) == 6 and
   all(.ports[] | select(.port == 22222 or .port == 6379 or .port == 26379 or .port == 28080 or .port == 28081 or .port == 28082); .observation_run_id == $run_id) and
   any(.ports[]; .port == 6379 and .service == "redis" and any(.technologies[]; .product_key == "redis" and .role == "network_service")) and
@@ -134,32 +142,75 @@ jq -e --argjson run_id "$run2" '
 	  any(.ports[]; .port == 28082 and any(.technologies[]; .product_key == "flask" and .role == "framework")) and
 	  all(.ports[] | select(.port == 22222 or .port == 6379 or .port == 26379 or .port == 28080 or .port == 28081 or .port == 28082); (.endpoint_validations | length) == 1) and
 	  any(.ports[]; .port == 22222 and .validation.status == "no_candidates" and (.validation.reason == "mapping_missing" or .validation.reason == "policy_filtered")) and
-	  all(.ports[] | select(.port == 6379 or .port == 26379); .endpoint_validations[0].status == "success" and .endpoint_validations[0].executed_template_count == 1 and .endpoint_validations[0].finding_count == 1)
-' asset.json >/dev/null
+	  all(.ports[] | select(.port == 6379 or .port == 26379); .endpoint_validations[0].status == "success" and .endpoint_validations[0].executed_template_count == 1 and .endpoint_validations[0].finding_count == 1) and
+	  any(.ports[]; .port == 28080 and .endpoint_validations[0].status == "success" and .endpoint_validations[0].executed_template_count == 1 and .endpoint_validations[0].finding_count == 1) and
+	  any(.ports[]; .port == 28081 and .endpoint_validations[0].status == "success" and .endpoint_validations[0].executed_template_count == 1 and .endpoint_validations[0].finding_count == 0) and
+	  any(.ports[]; .port == 28082 and .endpoint_validations[0].status == "success" and .endpoint_validations[0].executed_template_count == 1 and .endpoint_validations[0].finding_count == 0)
+' asset.json >/dev/null; then
+  printf 'T330 asset assertion failed:\n' >&2
+  jq . asset.json >&2
+  exit 1
+fi
+printf 'T330 asset profiles verified\n'
 
 run_path="$base_url/api/scan-tasks/$task_id/runs/$run2"
 curl --fail --silent "$run_path/findings?page=1&page_size=100" > findings.json
-jq -e '
+curl --fail --silent "$run_path/audit-report" > audit-report.md
+reviewed_templates=$(awk -F '|' '/^## Validation Plan$/{inside=1; next} inside && /^## /{exit} inside && /^\| 127/{gsub(/^ +| +$/, "", $4); print $4}' audit-report.md | sort -u | paste -sd, -)
+if [ "$reviewed_templates" != "exposed-redis,php-ini,python-metrics" ]; then
+  printf 'T330 reviewed template set is %s\n' "$reviewed_templates" >&2
+  sed -n '/^## Validation Plan$/,$p' audit-report.md >&2
+  exit 1
+fi
+if ! jq -e '
   .validation.status == "success" and
 	  .validation.identified_product_count > 0 and
 	  .validation.mapped_product_count > 0 and
-	  .validation.candidate_endpoint_count == 2 and
-	  .validation.executed_endpoint_count == 2 and
-	  .validation.template_count == 1 and
-	  .validation.executed_template_count == 1 and
-  .total == 2 and
+	  .validation.candidate_endpoint_count == 5 and
+	  .validation.executed_endpoint_count == 5 and
+	  .validation.template_count == 3 and
+	  .validation.executed_template_count == 3 and
+  .total == 3 and
   ([.items[] | select(.template_id == "exposed-redis" and .severity == "high" and (.target_port == 6379 or .target_port == 26379))] | length) == 2 and
-  all(.items[]; .target_port != 28081 and .target_port != 28082)
-' findings.json >/dev/null
+	  ([.items[] | select(.template_id == "php-ini" and .severity == "low" and .target_port == 28080)] | length) == 1 and
+	  all(.items[]; .target_port != 28081 and .target_port != 28082)
+' findings.json >/dev/null; then
+  printf 'T330 findings assertion failed:\n' >&2
+  jq . findings.json >&2
+  sed -n '/^## Validation Plan$/,$p' audit-report.md >&2
+  exit 1
+fi
+printf 'T330 structured findings verified\n'
 
 curl --fail --silent "$run_path/report" > user-report.md
-curl --fail --silent "$run_path/audit-report" > audit-report.md
 curl --fail --silent "$base_url/assets" > assets.html
-rg -q '^## Endpoint Profiles$' user-report.md
-rg -q 'exposed-redis|Redis' user-report.md
-! rg -q 'Frozen Fingerprint Revisions|projection_sha256|matcher_id' user-report.md
-rg -q '^## Frozen Fingerprint Revisions$' audit-report.md
-rg -q '^## Validation Plan$' audit-report.md
+for pattern in '^## Endpoint Profiles$' 'exposed-redis|Redis' 'php-ini|Php.ini'; do
+  if ! rg -q "$pattern" user-report.md; then
+    printf 'T330 user report missing pattern: %s\n' "$pattern" >&2
+    cat user-report.md >&2
+    exit 1
+  fi
+done
+for assertion in \
+  '(?s)### 127\.0\.0\.1:28080.*?Vulnerability validation \| http: success; candidate templates=1; executed templates=1; findings=1' \
+  '(?s)### 127\.0\.0\.1:28081.*?Vulnerability validation \| http: success; candidate templates=1; executed templates=1; findings=0' \
+  '(?s)### 127\.0\.0\.1:28082.*?Vulnerability validation \| http: success; candidate templates=1; executed templates=1; findings=0'; do
+  if ! rg -U -q "$assertion" user-report.md; then
+    printf 'T330 user report endpoint coverage assertion failed: %s\n' "$assertion" >&2
+    exit 1
+  fi
+done
+if rg -q 'Frozen Fingerprint Revisions|projection_sha256|matcher_id' user-report.md; then
+  printf 'T330 user report leaked audit details\n' >&2
+  exit 1
+fi
+for pattern in '^## Frozen Fingerprint Revisions$' '^## Validation Plan$'; do
+  if ! rg -q "$pattern" audit-report.md; then
+    printf 'T330 audit report missing pattern: %s\n' "$pattern" >&2
+    exit 1
+  fi
+done
+printf 'T330 user and audit reports verified\n'
 rg -q 'protocol_evidence' assets.html
 rg -q 'technologies' assets.html
 (cd "$repo_root" && go run ./internal/web/cmd/t330browser \
@@ -168,7 +219,7 @@ rg -q 'technologies' assets.html
   --browser "$chromium_path" \
   --expected-ports 6 \
   --expected-validations 6 \
-  --expected-findings 2)
+  --expected-findings 3)
 
 curl --fail --silent "$run_path/changes?baseline_run_id=$run1" > changes.json
 jq -e --argjson task_id "$task_id" --argjson run1 "$run1" --argjson run2 "$run2" '

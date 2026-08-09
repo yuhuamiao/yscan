@@ -294,7 +294,10 @@ func (output *boundedOutput) String() string {
 }
 
 func buildNucleiArgs(targetFile string, templatePaths []string, tags []string) []string {
-	args := []string{"-jsonl", "-silent", "-l", targetFile, "-exclude-tags", strings.Join(planner.DefaultExcludedTemplateTags(), ",")}
+	args := []string{
+		"-jsonl", "-silent", "-ni", "-dr", "-rate-limit", "25", "-concurrency", "5",
+		"-l", targetFile, "-exclude-tags", strings.Join(planner.DefaultExcludedTemplateTags(), ","),
+	}
 	for _, templatePath := range templatePaths {
 		if strings.TrimSpace(templatePath) != "" {
 			args = append(args, "-t", templatePath)

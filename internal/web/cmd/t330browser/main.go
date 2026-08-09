@@ -84,7 +84,12 @@ func main() {
 	validations := page.GetByTestId("endpoint-validation")
 	assertCount(validations, *expectedValidations, "endpoint validations")
 	assertMinimumCount(page.Locator(`[data-testid="endpoint-validation"][data-protocol="tcp"]`), 3, "TCP endpoint validations")
+	assertEndpointValidation(page, 28080, "success", 1, 1)
+	assertEndpointValidation(page, 28081, "success", 1, 0)
+	assertEndpointValidation(page, 28082, "success", 1, 0)
 	assertCount(page.GetByTestId("vulnerability-finding"), *expectedFindings, "vulnerability findings")
+	assertCount(page.Locator(`[data-testid="vulnerability-finding"][data-template="exposed-redis"]`), 2, "Redis findings")
+	assertCount(page.Locator(`[data-testid="vulnerability-finding"][data-template="php-ini"]`), 1, "PHP finding")
 
 	mu.Lock()
 	deferredProblems := append([]string(nil), problems...)
@@ -93,6 +98,11 @@ func main() {
 		fatal(fmt.Errorf("browser errors: %s", strings.Join(deferredProblems, " | ")))
 	}
 	fmt.Printf("T330 browser journey verified: ip=%s endpoints=%d validations=%d findings=%d\n", *ip, *expectedPorts, *expectedValidations, *expectedFindings)
+}
+
+func assertEndpointValidation(page playwright.Page, port int, status string, executed, findings int) {
+	selector := fmt.Sprintf(`[data-testid="endpoint-profile"][data-port="%d"] [data-testid="endpoint-validation"][data-status="%s"][data-executed="%d"][data-findings="%d"]`, port, status, executed, findings)
+	assertCount(page.Locator(selector), 1, fmt.Sprintf("endpoint %d validation", port))
 }
 
 func assertCount(locator playwright.Locator, expected int, name string) {

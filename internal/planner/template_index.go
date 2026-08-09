@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,7 +17,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const NucleiTemplateIndexAdapterVersion = "nuclei-template-index-v3"
+const NucleiTemplateIndexAdapterVersion = "nuclei-template-index-v4"
+
+const (
+	maxNucleiTemplateFileBytes   = 512 << 10
+	maxNucleiTemplateTotalBytes  = 64 << 20
+	maxNucleiTemplateFiles       = 20_000
+	maxNucleiRequestsPerTemplate = 4
+	maxNucleiPathsPerRequest     = 8
+	maxNucleiInputsPerRequest    = 4
+	maxNucleiMatchersPerRequest  = 16
+	maxNucleiMatcherValues       = 64
+	maxNucleiMatcherValueBytes   = 4096
+)
 
 type NucleiProductSelector struct {
 	Vendor  string
@@ -51,7 +65,7 @@ type NucleiTemplateIndex struct {
 	Revision           string
 	Templates          []NucleiTemplateIndexEntry
 	bySelector         map[string][]int
-	filteredBySelector map[string]struct{}
+	filteredBySelector map[string][]NucleiTemplateIndexEntry
 }
 
 type nucleiIndexDocument struct {
@@ -110,7 +124,9 @@ func BuildNucleiTemplateIndex(root string) (*NucleiTemplateIndex, error) {
 		return nil, fmt.Errorf("nuclei template root is not a directory: %s", root)
 	}
 	entries := make([]NucleiTemplateIndexEntry, 0)
-	filteredBySelector := make(map[string]struct{})
+	filteredBySelector := make(map[string][]NucleiTemplateIndexEntry)
+	fileCount := 0
+	totalBytes := int64(0)
 	err = filepath.WalkDir(base, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -129,9 +145,20 @@ func BuildNucleiTemplateIndex(root string) (*NucleiTemplateIndex, error) {
 		if extension != ".yaml" && extension != ".yml" {
 			return nil
 		}
-		content, err := os.ReadFile(path)
+		fileCount++
+		if fileCount > maxNucleiTemplateFiles {
+			return fmt.Errorf("nuclei template file budget exceeded: %d", maxNucleiTemplateFiles)
+		}
+		content, err := readBoundedNucleiTemplate(path)
 		if err != nil {
 			return err
+		}
+		if content == nil {
+			return nil
+		}
+		totalBytes += int64(len(content))
+		if totalBytes > maxNucleiTemplateTotalBytes {
+			return fmt.Errorf("nuclei template byte budget exceeded: %d", maxNucleiTemplateTotalBytes)
 		}
 		var rootNode yaml.Node
 		if err := yaml.Unmarshal(content, &rootNode); err != nil {
@@ -191,6 +218,22 @@ func BuildNucleiTemplateIndex(root string) (*NucleiTemplateIndex, error) {
 	return index, nil
 }
 
+func readBoundedNucleiTemplate(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, maxNucleiTemplateFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > maxNucleiTemplateFileBytes {
+		return nil, nil
+	}
+	return content, nil
+}
+
 // PolicyFiltered reports whether at least one actionable template for this
 // exact product/protocol was excluded by the strict execution projection. It
 // never exposes or executes the rejected template.
@@ -199,7 +242,8 @@ func (index *NucleiTemplateIndex) PolicyFiltered(product, cpe, protocol string) 
 		return false
 	}
 	selectors := productAliasesForTemplateIndex(product)
-	if endpointCPE, ok := parseNucleiCPE(cpe); ok {
+	endpointCPE, hasEndpointCPE := parseNucleiCPE(cpe)
+	if hasEndpointCPE {
 		selectors = append(selectors, productAliasesForTemplateIndex(endpointCPE.Product)...)
 	}
 	protocol = strings.ToLower(strings.TrimSpace(protocol))
@@ -207,14 +251,29 @@ func (index *NucleiTemplateIndex) PolicyFiltered(product, cpe, protocol string) 
 		protocol = "http"
 	}
 	for _, selector := range normalizedIndexValues(selectors) {
-		if _, filtered := index.filteredBySelector[selector+"\x00"+protocol]; filtered {
-			return true
+		for _, entry := range index.filteredBySelector[selector+"\x00"+protocol] {
+			if templateProtocolCompatible(entry.Protocols, protocol) && templateProductCompatible(entry, product, endpointCPE, hasEndpointCPE) {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-func markPolicyFilteredSelectors(filtered map[string]struct{}, document nucleiIndexDocument) {
+func markPolicyFilteredSelectors(filtered map[string][]NucleiTemplateIndexEntry, document nucleiIndexDocument) {
+	entry, ok := projectNucleiTemplateSelectors(document)
+	if !ok {
+		return
+	}
+	for _, selector := range entry.SelectionNames {
+		for _, protocol := range entry.Protocols {
+			key := selector + "\x00" + protocol
+			filtered[key] = append(filtered[key], entry)
+		}
+	}
+}
+
+func projectNucleiTemplateSelectors(document nucleiIndexDocument) (NucleiTemplateIndexEntry, bool) {
 	tags := normalizedIndexValues(interfaceStrings(document.Info.Tags))
 	actionable := false
 	for _, tag := range tags {
@@ -223,19 +282,34 @@ func markPolicyFilteredSelectors(filtered map[string]struct{}, document nucleiIn
 		}
 	}
 	if !actionable {
-		return
+		return NucleiTemplateIndexEntry{}, false
 	}
-	selectors := make([]string, 0)
-	for _, product := range normalizedIndexValues(interfaceStrings(document.Info.Metadata["product"])) {
+	products := normalizedIndexValues(interfaceStrings(document.Info.Metadata["product"]))
+	vendors := normalizedIndexValues(interfaceStrings(document.Info.Metadata["vendor"]))
+	productSelectors := make([]NucleiProductSelector, 0, len(products))
+	selectors := make([]string, 0, len(products)+len(tags))
+	for _, product := range products {
+		vendor := ""
+		if len(vendors) == 1 {
+			vendor = vendors[0]
+		}
+		productSelectors = append(productSelectors, NucleiProductSelector{Vendor: vendor, Product: product})
 		selectors = append(selectors, productAliasesForTemplateIndex(product)...)
 	}
-	for _, rawCPE := range uniqueTrimmedIndexValues(interfaceStrings(document.Info.Classification.CPE)) {
-		if constraint, ok := parseNucleiCPE(rawCPE); ok {
-			selectors = append(selectors, productAliasesForTemplateIndex(constraint.Product)...)
+	cpes := uniqueTrimmedIndexValues(interfaceStrings(document.Info.Classification.CPE))
+	cpeConstraints := make([]NucleiCPEConstraint, 0, len(cpes))
+	for _, rawCPE := range cpes {
+		constraint, ok := parseNucleiCPE(rawCPE)
+		if !ok {
+			return NucleiTemplateIndexEntry{}, false
 		}
+		cpeConstraints = append(cpeConstraints, constraint)
+		selectors = append(selectors, productAliasesForTemplateIndex(constraint.Product)...)
 	}
+	reviewedTags := make([]string, 0)
 	for _, tag := range tags {
 		if product, reviewed := reviewedAutomaticProductTags[tag]; reviewed {
+			reviewedTags = append(reviewedTags, product)
 			selectors = append(selectors, productAliasesForTemplateIndex(product)...)
 		}
 	}
@@ -246,29 +320,29 @@ func markPolicyFilteredSelectors(filtered map[string]struct{}, document nucleiIn
 	if len(document.TCP) > 0 {
 		protocols = append(protocols, "tcp")
 	}
-	for _, selector := range normalizedIndexValues(selectors) {
-		for _, protocol := range protocols {
-			filtered[selector+"\x00"+protocol] = struct{}{}
-		}
+	selectors = normalizedIndexValues(selectors)
+	if len(protocols) == 0 || len(selectors) == 0 {
+		return NucleiTemplateIndexEntry{}, false
 	}
+	return NucleiTemplateIndexEntry{
+		Protocols: protocols, Products: products, CPEs: cpes, Tags: tags,
+		ProductSelectors: productSelectors, CPEConstraints: cpeConstraints,
+		ReviewedTagProducts: normalizedIndexValues(reviewedTags), SelectionNames: selectors,
+	}, true
 }
 
 func projectNucleiTemplateForIndex(document nucleiIndexDocument) (NucleiTemplateIndexEntry, bool) {
 	if strings.TrimSpace(document.ID) == "" || nodeHasContent(document.Headless) || nodeHasContent(document.Code) || nodeHasContent(document.Javascript) || nodeHasContent(document.File) || nodeHasContent(document.Workflow) {
 		return NucleiTemplateIndexEntry{}, false
 	}
-	tags := normalizedIndexValues(interfaceStrings(document.Info.Tags))
-	actionable := false
-	for _, tag := range tags {
+	projection, ok := projectNucleiTemplateSelectors(document)
+	if !ok {
+		return NucleiTemplateIndexEntry{}, false
+	}
+	for _, tag := range projection.Tags {
 		if _, unsafe := unsafeAutomaticTemplateTags[tag]; unsafe {
 			return NucleiTemplateIndexEntry{}, false
 		}
-		if _, allowed := actionableAutomaticTemplateTags[tag]; allowed {
-			actionable = true
-		}
-	}
-	if !actionable {
-		return NucleiTemplateIndexEntry{}, false
 	}
 	protocols := make([]string, 0, 2)
 	if len(document.HTTP) > 0 {
@@ -299,44 +373,8 @@ func projectNucleiTemplateForIndex(document nucleiIndexDocument) (NucleiTemplate
 	if len(protocols) == 0 {
 		return NucleiTemplateIndexEntry{}, false
 	}
-	products := normalizedIndexValues(interfaceStrings(document.Info.Metadata["product"]))
-	vendors := normalizedIndexValues(interfaceStrings(document.Info.Metadata["vendor"]))
-	productSelectors := make([]NucleiProductSelector, 0, len(products))
-	selectors := make([]string, 0, len(products)+len(tags))
-	for _, product := range products {
-		vendor := ""
-		if len(vendors) == 1 {
-			vendor = vendors[0]
-		}
-		productSelectors = append(productSelectors, NucleiProductSelector{Vendor: vendor, Product: product})
-		selectors = append(selectors, productAliasesForTemplateIndex(product)...)
-	}
-	cpes := uniqueTrimmedIndexValues(interfaceStrings(document.Info.Classification.CPE))
-	cpeConstraints := make([]NucleiCPEConstraint, 0, len(cpes))
-	for _, value := range cpes {
-		constraint, ok := parseNucleiCPE(value)
-		if !ok {
-			return NucleiTemplateIndexEntry{}, false
-		}
-		cpeConstraints = append(cpeConstraints, constraint)
-		selectors = append(selectors, productAliasesForTemplateIndex(constraint.Product)...)
-	}
-	reviewedTags := make([]string, 0)
-	for _, tag := range tags {
-		if product, reviewed := reviewedAutomaticProductTags[tag]; reviewed {
-			reviewedTags = append(reviewedTags, product)
-			selectors = append(selectors, productAliasesForTemplateIndex(product)...)
-		}
-	}
-	selectors = normalizedIndexValues(selectors)
-	if len(selectors) == 0 {
-		return NucleiTemplateIndexEntry{}, false
-	}
-	return NucleiTemplateIndexEntry{
-		Protocols: protocols, Products: products, CPEs: cpes, Tags: tags,
-		ProductSelectors: productSelectors, CPEConstraints: cpeConstraints,
-		ReviewedTagProducts: normalizedIndexValues(reviewedTags), SelectionNames: selectors,
-	}, true
+	projection.Protocols = protocols
+	return projection, true
 }
 
 func unsafeAutomaticTemplateIdentity(templateID, path string) bool {
@@ -425,18 +463,53 @@ func cpeConstraintCompatible(template, endpoint NucleiCPEConstraint) bool {
 }
 
 func safeReadOnlyTCPInput(value string) bool {
-	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "" {
+	if len(value) > 1024 || strings.IndexByte(value, 0) >= 0 {
+		return false
+	}
+	value = strings.ReplaceAll(value, `\r`, "\r")
+	value = strings.ReplaceAll(value, `\n`, "\n")
+	if strings.Contains(value, `\`) {
+		return false
+	}
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	if strings.Contains(value, "\r") {
+		return false
+	}
+	value = strings.TrimSuffix(value, "\n")
+	if strings.TrimSpace(value) == "" {
 		return true
 	}
-	value = strings.ReplaceAll(value, "\\r", "")
-	value = strings.ReplaceAll(value, "\\n", "")
-	for _, prefix := range []string{"info", "ping", "quit", "version", "help", "stats", "status"} {
-		if strings.HasPrefix(value, prefix) {
-			return true
+	for _, frame := range strings.Split(value, "\n") {
+		if frame == "" || strings.TrimSpace(frame) != frame {
+			return false
+		}
+		fields := strings.Fields(strings.ToLower(frame))
+		if len(fields) == 0 {
+			return false
+		}
+		switch fields[0] {
+		case "info":
+			if len(fields) > 2 || (len(fields) == 2 && !safeRedisInfoSection(fields[1])) {
+				return false
+			}
+		case "ping", "quit":
+			if len(fields) != 1 {
+				return false
+			}
+		default:
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+func safeRedisInfoSection(value string) bool {
+	_, ok := map[string]struct{}{
+		"server": {}, "clients": {}, "memory": {}, "persistence": {}, "stats": {}, "replication": {},
+		"cpu": {}, "commandstats": {}, "latencystats": {}, "sentinel": {}, "cluster": {}, "modules": {},
+		"keyspace": {}, "errorstats": {}, "all": {}, "default": {}, "everything": {},
+	}[strings.ToLower(strings.TrimSpace(value))]
+	return ok
 }
 
 func templateProtocolCompatible(protocols []string, endpointProtocol string) bool {
@@ -577,13 +650,14 @@ func validateNucleiInfo(node *yaml.Node) bool {
 		"metadata": func(value *yaml.Node) bool {
 			return validateYAMLMapping(value, map[string]func(*yaml.Node) bool{
 				"product": text, "vendor": text, "max-request": yamlNonNegativeInteger, "verified": yamlBoolean,
+				"shodan-query": text,
 			})
 		},
 	})
 }
 
 func validateNucleiHTTPRequests(node *yaml.Node) bool {
-	return validateYAMLSequence(node, func(request *yaml.Node) bool {
+	return validateYAMLSequenceLimit(node, maxNucleiRequestsPerTemplate, func(request *yaml.Node) bool {
 		return validateYAMLMapping(request, map[string]func(*yaml.Node) bool{
 			"method": func(value *yaml.Node) bool {
 				method := strings.ToUpper(strings.TrimSpace(value.Value))
@@ -597,36 +671,122 @@ func validateNucleiHTTPRequests(node *yaml.Node) bool {
 }
 
 func validateSafeHTTPPaths(node *yaml.Node) bool {
-	return validateScalarValues(node, func(value string) bool {
-		lower := strings.ToLower(value)
-		for _, marker := range []string{"authorization", "password", "passwd", "username", "login=", "token=", "auth=", "interactsh", "§"} {
-			if strings.Contains(lower, marker) {
+	return validateScalarValuesLimit(node, maxNucleiPathsPerRequest, safeAutomaticHTTPURL)
+}
+
+func safeAutomaticHTTPURL(value string) bool {
+	if len(value) > 4096 || strings.Contains(value, "§") || strings.Contains(strings.ToLower(value), "interactsh") {
+		return false
+	}
+	expanded := value
+	for {
+		start := strings.Index(expanded, "{{")
+		if start < 0 {
+			break
+		}
+		endOffset := strings.Index(expanded[start+2:], "}}")
+		if endOffset < 0 {
+			return false
+		}
+		end := start + 2 + endOffset
+		variable := strings.TrimSpace(expanded[start+2 : end])
+		if variable != "BaseURL" && variable != "RootURL" {
+			return false
+		}
+		expanded = expanded[:start] + "http://caasm.invalid" + expanded[end+2:]
+	}
+	parsed, err := url.Parse(expanded)
+	if err != nil || parsed.Scheme != "http" || parsed.Host != "caasm.invalid" || parsed.User != nil || parsed.Fragment != "" {
+		return false
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery {
+		query, err := url.ParseQuery(parsed.RawQuery)
+		if err != nil {
+			return false
+		}
+		for name, values := range query {
+			if authenticationParameterName(recursiveURLDecode(name)) {
 				return false
+			}
+			for _, value := range values {
+				if containsAuthenticationMarker(recursiveURLDecode(value)) {
+					return false
+				}
 			}
 		}
-		for {
-			start := strings.Index(value, "{{")
-			if start < 0 {
-				return true
-			}
-			end := strings.Index(value[start+2:], "}}")
-			if end < 0 {
-				return false
-			}
-			variable := strings.TrimSpace(value[start+2 : start+2+end])
-			if variable != "BaseURL" && variable != "RootURL" {
-				return false
-			}
-			value = value[start+2+end+2:]
+		// Automatic execution intentionally rejects every query. Query-bearing
+		// templates require an explicit content-SHA review outside this projection.
+		return false
+	}
+	decodedPath := parsed.EscapedPath()
+	for attempts := 0; attempts < 3; attempts++ {
+		decoded, err := url.PathUnescape(decodedPath)
+		if err != nil {
+			return false
 		}
-	})
+		if decoded == decodedPath {
+			break
+		}
+		decodedPath = decoded
+	}
+	if strings.ContainsAny(decodedPath, "%?#\x00\r\n") {
+		return false
+	}
+	for _, segment := range strings.Split(strings.ToLower(decodedPath), "/") {
+		segment = strings.TrimSpace(segment)
+		if _, unsafe := unsafeAutomaticHTTPPathSegments[segment]; unsafe {
+			return false
+		}
+		if authenticationParameterName(segment) {
+			return false
+		}
+	}
+	return true
+}
+
+var unsafeAutomaticHTTPPathSegments = map[string]struct{}{
+	"command": {}, "delete": {}, "drop": {}, "execute": {}, "flush": {}, "flushall": {}, "install": {},
+	"logout": {}, "reboot": {}, "remove": {}, "reset": {}, "restart": {}, "shutdown": {}, "truncate": {},
+	"update": {}, "upgrade": {}, "upload": {}, "write": {},
+}
+
+func authenticationParameterName(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.NewReplacer("-", "", "_", "", ".", "").Replace(value)
+	_, unsafe := map[string]struct{}{
+		"apikey": {}, "auth": {}, "authorization": {}, "credential": {}, "login": {}, "pass": {}, "passwd": {},
+		"password": {}, "pwd": {}, "secret": {}, "session": {}, "token": {}, "user": {}, "username": {},
+	}[value]
+	return unsafe
+}
+
+func recursiveURLDecode(value string) string {
+	for attempts := 0; attempts < 3; attempts++ {
+		decoded, err := url.QueryUnescape(value)
+		if err != nil || decoded == value {
+			break
+		}
+		value = decoded
+	}
+	return value
+}
+
+func containsAuthenticationMarker(value string) bool {
+	for _, field := range strings.FieldsFunc(strings.ToLower(value), func(character rune) bool {
+		return character == '=' || character == '&' || character == '?' || character == '/' || character == ':' || character == ';'
+	}) {
+		if authenticationParameterName(field) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateNucleiTCPRequests(node *yaml.Node) bool {
-	return validateYAMLSequence(node, func(request *yaml.Node) bool {
+	return validateYAMLSequenceLimit(node, maxNucleiRequestsPerTemplate, func(request *yaml.Node) bool {
 		return validateYAMLMapping(request, map[string]func(*yaml.Node) bool{
 			"inputs": func(value *yaml.Node) bool {
-				return validateYAMLSequence(value, func(input *yaml.Node) bool {
+				return validateYAMLSequenceLimit(value, maxNucleiInputsPerRequest, func(input *yaml.Node) bool {
 					return validateYAMLMapping(input, map[string]func(*yaml.Node) bool{
 						"data": func(data *yaml.Node) bool { return yamlScalar(data) && safeReadOnlyTCPInput(data.Value) },
 					})
@@ -664,14 +824,20 @@ func validateNucleiTCPRequests(node *yaml.Node) bool {
 }
 
 func validateNucleiMatchers(node *yaml.Node) bool {
-	return validateYAMLSequence(node, func(matcher *yaml.Node) bool {
+	return validateYAMLSequenceLimit(node, maxNucleiMatchersPerRequest, func(matcher *yaml.Node) bool {
 		return validateYAMLMapping(matcher, map[string]func(*yaml.Node) bool{
 			"type": yamlScalar, "part": yamlScalar, "condition": validateMatcherCondition,
-			"words": yamlScalarOrSequence, "regex": yamlScalarOrSequence, "binary": yamlScalarOrSequence,
-			"status": yamlScalarOrSequence, "size": yamlScalarOrSequence, "dsl": yamlScalarOrSequence,
+			"words": boundedMatcherValues, "regex": boundedMatcherValues, "binary": boundedMatcherValues,
+			"status": boundedMatcherValues, "size": boundedMatcherValues, "dsl": boundedMatcherValues,
 			"negative": yamlBoolean, "case-insensitive": yamlBoolean, "internal": yamlBoolean,
 			"encoding": yamlScalar, "name": yamlScalar,
 		})
+	})
+}
+
+func boundedMatcherValues(node *yaml.Node) bool {
+	return validateScalarValuesLimit(node, maxNucleiMatcherValues, func(value string) bool {
+		return len(value) <= maxNucleiMatcherValueBytes && !strings.Contains(strings.ToLower(value), "interactsh")
 	})
 }
 
@@ -712,7 +878,14 @@ func validateYAMLMapping(node *yaml.Node, allowed map[string]func(*yaml.Node) bo
 }
 
 func validateYAMLSequence(node *yaml.Node, validate func(*yaml.Node) bool) bool {
+	return validateYAMLSequenceLimit(node, 0, validate)
+}
+
+func validateYAMLSequenceLimit(node *yaml.Node, limit int, validate func(*yaml.Node) bool) bool {
 	if node == nil || node.Kind != yaml.SequenceNode || len(node.Content) == 0 {
+		return false
+	}
+	if limit > 0 && len(node.Content) > limit {
 		return false
 	}
 	for _, value := range node.Content {
@@ -724,10 +897,14 @@ func validateYAMLSequence(node *yaml.Node, validate func(*yaml.Node) bool) bool 
 }
 
 func validateScalarValues(node *yaml.Node, validate func(string) bool) bool {
+	return validateScalarValuesLimit(node, 0, validate)
+}
+
+func validateScalarValuesLimit(node *yaml.Node, limit int, validate func(string) bool) bool {
 	if yamlScalar(node) {
 		return validate(node.Value)
 	}
-	return validateYAMLSequence(node, func(value *yaml.Node) bool { return yamlScalar(value) && validate(value.Value) })
+	return validateYAMLSequenceLimit(node, limit, func(value *yaml.Node) bool { return yamlScalar(value) && validate(value.Value) })
 }
 
 func yamlScalar(node *yaml.Node) bool {

@@ -1,9 +1,13 @@
 package planner
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestNucleiTemplateIndexSelectsPinnedReadOnlyProductCandidates(t *testing.T) {
@@ -222,6 +226,144 @@ tcp:
 	}
 }
 
+func TestSafeReadOnlyTCPInputValidatesEveryRedisFrame(t *testing.T) {
+	for _, value := range []string{"INFO\r\nQUIT\r\n", "INFO server\r\n", "PING\r\n", `INFO\r\nQUIT\r\n`} {
+		if !safeReadOnlyTCPInput(value) {
+			t.Fatalf("read-only Redis input rejected: %q", value)
+		}
+	}
+	for _, value := range []string{
+		"INFO\r\nFLUSHALL\r\n", "INFO\r\nSET key value\r\n", "PING message\r\n", "INFO server extra\r\n",
+		"INFO\r\nUNKNOWN\r\n", "INFO\x00QUIT", `INFO\r\nFLUSHALL\r\n`, "INFO\rQUIT\r\n",
+	} {
+		if safeReadOnlyTCPInput(value) {
+			t.Fatalf("unsafe Redis input accepted: %q", value)
+		}
+	}
+}
+
+func TestSafeAutomaticHTTPURLRejectsAuthenticationEncodingAndActions(t *testing.T) {
+	for _, value := range []string{"{{BaseURL}}", "{{RootURL}}/php.ini", "{{BaseURL}}/health/check"} {
+		if !safeAutomaticHTTPURL(value) {
+			t.Fatalf("safe URL rejected: %q", value)
+		}
+	}
+	for _, value := range []string{
+		"{{BaseURL}}/check?user=admin&pass=admin", "{{BaseURL}}/check?%75ser=admin", "{{BaseURL}}/check?mode=read",
+		"{{BaseURL}}/%64elete", "{{BaseURL}}/safe%252fdelete", "{{BaseURL}}/reset", "{{BaseURL}}/login",
+		"{{BaseURL}}/{{username}}", "{{BaseURL}}/{{interactsh-url}}",
+	} {
+		if safeAutomaticHTTPURL(value) {
+			t.Fatalf("unsafe URL accepted: %q", value)
+		}
+	}
+}
+
+func TestPolicyFilteredUsesExactCPEVendorVersionAndProtocol(t *testing.T) {
+	root := t.TempDir()
+	writeTemplateIndexFixture(t, root, "unsafe-exact.yaml", `
+id: nginx-unsafe-exact
+info:
+  name: Nginx Unsafe Exact
+  severity: high
+  classification:
+    cpe: cpe:2.3:a:nginx:nginx:1.25.0:*:*:*:*:*:*:*
+  tags: nginx,vuln
+http:
+  - method: GET
+    path: ["{{BaseURL}}"]
+    payloads: {value: [test]}
+`)
+	writeTemplateIndexFixture(t, root, "unsafe-other-vendor.yaml", `
+id: nginx-unsafe-other-vendor
+info:
+  name: Other Vendor Nginx
+  severity: high
+  classification:
+    cpe: cpe:2.3:a:other:nginx:1.25.0:*:*:*:*:*:*:*
+  tags: nginx,vuln
+http:
+  - method: GET
+    path: ["{{BaseURL}}"]
+    payloads: {value: [test]}
+`)
+	index, err := BuildNucleiTemplateIndex(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !index.PolicyFiltered("nginx", "cpe:2.3:a:nginx:nginx:1.25.0:*:*:*:*:*:*:*", "https") {
+		t.Fatal("exact rejected template did not produce policy_filtered")
+	}
+	for _, endpoint := range []struct{ cpe, protocol string }{
+		{"cpe:2.3:a:nginx:nginx:1.24.0:*:*:*:*:*:*:*", "http"},
+		{"cpe:2.3:a:other:nginx:1.24.0:*:*:*:*:*:*:*", "http"},
+		{"cpe:2.3:a:nginx:nginx:1.25.0:*:*:*:*:*:*:*", "tcp"},
+	} {
+		if index.PolicyFiltered("nginx", endpoint.cpe, endpoint.protocol) {
+			t.Fatalf("unrelated rejected template leaked to %s/%s", endpoint.cpe, endpoint.protocol)
+		}
+	}
+}
+
+func TestNucleiTemplateIndexEnforcesFileAndStructureBudgets(t *testing.T) {
+	root := t.TempDir()
+	oversized := bytes.Repeat([]byte("x"), maxNucleiTemplateFileBytes+1)
+	if err := os.WriteFile(filepath.Join(root, "oversized.yaml"), oversized, 0600); err != nil {
+		t.Fatal(err)
+	}
+	requests := strings.Repeat("  - method: GET\n    path: [\"{{BaseURL}}\"]\n", maxNucleiRequestsPerTemplate+1)
+	writeTemplateIndexFixture(t, root, "too-many-requests.yaml", `
+id: too-many-requests
+info:
+  name: Too Many Requests
+  severity: medium
+  metadata: {product: nginx}
+  tags: nginx,exposure
+http:
+`+requests)
+	writeTemplateIndexFixture(t, root, "safe.yaml", `
+id: bounded-safe
+info:
+  name: Bounded Safe
+  severity: medium
+  metadata: {product: nginx}
+  tags: nginx,exposure
+http:
+  - method: GET
+    path: ["{{BaseURL}}"]
+`)
+	index, err := BuildNucleiTemplateIndex(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(index.Templates) != 1 || index.Templates[0].TemplateID != "bounded-safe" {
+		t.Fatalf("budget projection=%#v", index.Templates)
+	}
+
+	matcherValues := strings.Repeat("          - value\n", maxNucleiMatcherValues+1)
+	raw := `
+id: too-many-values
+info:
+  name: Too Many Matcher Values
+  severity: medium
+  metadata: {product: nginx}
+  tags: nginx,exposure
+http:
+  - method: GET
+    path: ["{{BaseURL}}"]
+    matchers:
+      - type: word
+        words:
+` + matcherValues
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(raw), &document); err != nil {
+		t.Fatal(err)
+	}
+	if safeAutomaticNucleiTemplate(document) {
+		t.Fatal("matcher value budget was not enforced")
+	}
+}
+
 func TestNucleiTemplateIndexRevisionIsDeterministicAndContentBound(t *testing.T) {
 	root := t.TempDir()
 	path := writeTemplateIndexFixture(t, root, "php.yaml", `
@@ -269,14 +411,24 @@ func TestRealNucleiTemplateIndexCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(index.Templates) != 177 || index.Revision != "nuclei-template-index-v3:4f4a86d882371294568bc68bac65899f2e0930805362105de3985824717d9f23" {
+	if len(index.Templates) != 411 || index.Revision != "nuclei-template-index-v4:7745b4f28ceba14a7f101b8248da993da9f490ef5995de7cede9b015aae04901" {
 		t.Fatalf("real index changed: templates=%d revision=%q", len(index.Templates), index.Revision)
 	}
 	redis := index.Select("redis", "", "tcp")
 	if len(redis) != 1 {
 		t.Fatalf("real index coverage redis=%d", len(redis))
 	}
-	for _, candidates := range [][]NucleiTemplateIndexEntry{redis} {
+	php := index.Select("php", "cpe:2.3:a:php:php:8.1.2:*:*:*:*:*:*:*", "http")
+	phpINI := false
+	for _, candidate := range php {
+		if candidate.TemplateID == "php-ini" && candidate.Path == "http/exposures/files/php-ini.yaml" && candidate.SHA256 == "933e2e60a0c1fa0d7fb3be463e8af3f3e958188bd7440653c9dfa689562ae806" {
+			phpINI = true
+		}
+	}
+	if !phpINI {
+		t.Fatalf("reviewed PHP template missing from candidates: %#v", php)
+	}
+	for _, candidates := range [][]NucleiTemplateIndexEntry{redis, php} {
 		for _, candidate := range candidates {
 			for _, tag := range candidate.Tags {
 				if _, unsafe := unsafeAutomaticTemplateTags[tag]; unsafe {
@@ -295,7 +447,7 @@ func TestRealNucleiTemplateIndexCoverage(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("real template index: executable=%d redis=%d revision=%s", len(index.Templates), len(redis), index.Revision)
+	t.Logf("real template index: executable=%d redis=%d php=%d revision=%s", len(index.Templates), len(redis), len(php), index.Revision)
 }
 
 func writeTemplateIndexFixture(t *testing.T, root, relative, content string) string {
