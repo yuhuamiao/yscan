@@ -1,149 +1,112 @@
-# yscan
+# CAASM
 
-**轻量化 CAASM（Cyber Asset Attack Surface Management）系统**
+CAASM 是一个面向企业内网的资产发现和风险验证工具，命令行程序名为 `yscan`。
 
-`yscan` 是一个以 Go 实现、面向企业内网的资产持续发现与风险验证工具。它以单机部署和 SQLite 状态模型为基础，把网段发现、端口与服务画像、增量变化跟踪、定向漏洞验证和轻 Web 控制台连接为一条可持续运行的闭环。
+给它一个内网 IP 或 CIDR，它会发现存活主机和开放端口，识别服务及 Web 技术栈，并把每次扫描保存到本地 SQLite 数据库。后续扫描可以直接看到新增资产、端口变化和漏洞变化。日常操作既可以使用命令行，也可以在浏览器控制台完成。
 
-> 当前版本聚焦经授权的企业内网 IPv4 环境。历史域名任务数据仍可读取，但 V2 不提供域名收集、公网测绘、未授权扫描或重型安全运营平台能力。
+CAASM 适合单机或小型服务器部署，不需要 Elasticsearch、Redis、消息队列或 Kubernetes。漏洞验证依赖本机安装的 Nuclei；如果没有 Nuclei，资产发现和服务识别仍可正常使用。
 
-## 为什么是 yscan
+## 主要功能
 
-企业内网资产清单常常滞后于真实网络：临时主机、新开端口、暴露的中间件和遗留服务不会自动出现在 CMDB 中。`yscan` 从 CIDR 或明确目标出发，持续记录资产状态，而不是每次只输出一份临时扫描结果。
+- 扫描单个内网 IP 或内网网段
+- 扫描全部 TCP 端口，或使用明确的端口范围
+- 识别 TCP 服务、HTTP/HTTPS、Web Server、运行时、框架、应用和前端组件
+- 保存版本、CPE、规则来源和安全的证据摘要
+- 按任务比较两次成功扫描的主机、端口和漏洞变化
+- 根据识别结果选择经过安全检查的本地 Nuclei 模板
+- 支持一次性任务、Cron 定时任务、进度查看和取消
+- 提供命令行、HTTP API、Web 控制台及 Markdown 报告
 
-它的轻量化不是功能缩水，而是明确的工程取舍：
+## 使用范围
 
-- **部署轻**：单个 Go 二进制和 SQLite 即可运行，不要求 Kafka、ES、Redis、Kubernetes 或消息总线。
-- **接入轻**：不依赖 CMDB、SOC、EDR、ITSM 等前置对接；给定 CIDR 即可发起首轮巡检。
-- **使用轻**：CLI、HTTP API 和浏览器控制台共享同一任务、资产与报告数据。
-- **运维轻**：状态数据落在本地 SQLite，扫描结果和 Markdown 报告可直接审计与备份。
-- **验证轻**：先缩小到真实存活资产和已识别服务，再调用本地 Nuclei 做定向验证。
-- **界面轻**：控制台只覆盖任务、资产、变化、漏洞与报告，不引入 RBAC、工单、多租户或大屏等重型平台模块。
+CAASM 只接受 RFC1918 私网地址和本机 Loopback IPv4。公网地址、Link-local、组播地址、未指定地址以及跨越内外网边界的 CIDR 会被拒绝。
 
-## 当前能力
+请只扫描你拥有或已经获得明确授权的目标。
 
-| 能力 | 当前实现 | 说明 |
-| --- | --- | --- |
-| 内网资产发现 | IPv4 CIDR 展开、ICMP/TCP 存活探测 | 网段任务有主机数量上限，取消先进入 `cancel_requested`，执行器退出后再进入最终状态 |
-| 服务画像 | 单 IP 全端口或显式端口集合、网段基线或显式端口集合、TCP/Web 统一指纹 | 规则命中保留来源修订、规则 ID、版本/CPE、证据摘要与冲突候选 |
-| 资产状态管理 | SQLite IP 聚合库存与范围主机/端口成员关系 | 记录全局和范围级 `first_seen`、`last_seen`、`is_active`，重叠 CIDR 的主机和端口变化互不覆盖 |
-| 漏洞验证 | 本地 [Nuclei](https://github.com/projectdiscovery/nuclei) 调用与 JSONL 解析 | 使用本地 templates，服务标签只缩小候选范围，默认排除 `intrusive`、`dos`、`auth` |
-| 报告 | Markdown 运行报告 | 每轮 `ScanTaskRun` 终态后生成 `reports/scan-task-<taskId>-run-<runId>.md` |
-| 接口与控制台 | HTTP API + 轻 Web 控制台 | 支持逻辑任务、运行历史、变化、漏洞与运行级报告查看 |
+## 环境要求
 
-## 架构
+- Go `1.26.1` 或更高版本
+- Linux、macOS、Windows 或 WSL
+- 一个可写工作目录，用于 `asm.db` 和 `reports/`
+- 漏洞验证需要本机安装 `nuclei` 和 [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates)
 
-```text
-CLI / HTTP API / Web Console
-            |
-       Task Orchestrator
-            |
-  +---------+----------+
-  |                    |
-Single target      Subnet workflow
-  |                    |
-Full/selected ports Host discovery
-  |                    |
-Protocol profile   Baseline/selected ports
-  |                    |
-Service and banner identification
-            |
-Nuclei targeted validation (optional)
-            |
-SQLite inventory -> change diff -> Markdown report
+## 构建
+
+```bash
+make build
 ```
 
-核心代码按职责拆分，CLI 入口只保留参数解析和任务分发：
-
-| 目录/文件 | 职责 |
-| --- | --- |
-| [`main.go`](main.go) | CLI 参数、任务创建和顶层编排 |
-| [`internal/workflow`](internal/workflow) | 网段工作流、取消检查、进度和漏洞验证调度 |
-| [`internal/pipeline`](internal/pipeline) | CIDR 主机发现和域名收集流水线 |
-| [`internal/scan`](internal/scan) | 并发端口扫描与内网快速画像 |
-| [`internal/identify`](internal/identify) | Banner 读取、基础服务与产品识别 |
-| [`internal/domain`](internal/domain) | crt.sh/搜索引擎/字典收集、DNS 策略和泛解析处理 |
-| [`internal/planner`](internal/planner) | 服务到 Nuclei 模板 tags 的定向候选规划 |
-| [`internal/vuln`](internal/vuln) | Nuclei 二进制、模板目录发现和 JSONL 结果解析 |
-| [`internal/storage`](internal/storage) | SQLite 初始化、迁移、库存、任务、漏洞和变化持久化 |
-| [`internal/api`](internal/api) | HTTP API 与控制台路由挂载 |
-| [`internal/web`](internal/web) | 轻 Web 控制台 |
-| [`internal/report`](internal/report) | Markdown 报告生成与读取 |
-
-## 快速开始
-
-### 环境要求
-
-- Go `1.26.1+`
-- Linux、macOS 或 Windows
-- 本地可写目录，用于 `asm.db`、临时文件和 `reports/`
-- 漏洞验证额外需要本地安装 `nuclei` 和 [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates)
-- 搜索引擎动态页面采集建议准备 Playwright 运行环境；不可用时会降级为 Colly HTTP 采集
-
-### 构建
+也可以直接使用 Go：
 
 ```bash
 go build -o yscan .
 ```
 
-首次运行会在当前工作目录初始化 SQLite 数据库。
+查看帮助不会创建数据库：
 
-### 内网网段巡检
+```bash
+./yscan --help
+```
+
+首次执行扫描、启动 API 或管理指纹库时，程序会在当前目录创建 `asm.db`，并初始化内置指纹规则。
+
+## 快速开始
+
+扫描单个 IP：
+
+```bash
+./yscan scan 192.168.1.10
+```
+
+扫描网段：
 
 ```bash
 ./yscan subnet 192.168.10.0/24
 ```
 
-也可以使用 `scan <cidr>`，两者都会走网段快速画像工作流：发现存活主机、扫描内网基线端口、更新库存并生成变化摘要。
+指定端口：
 
 ```bash
-./yscan scan 192.168.10.0/24
-./yscan subnet 192.168.10.0/24 --vuln
-./yscan subnet 192.168.10.0/24 --port-spec 22,80,443,8000-8100
+./yscan scan 192.168.1.10 --port-spec 22,80,443,8000-8100
+./yscan subnet 192.168.10.0/24 --port-spec 22,80,443
 ```
 
-`scan` 和 `subnet` 都创建 V2 一次性 `ScanTaskRun`，因此 CLI、API 和 Web 会看到同一份任务、资产快照、Diff 与报告。目标仅允许 RFC1918 或本机 Loopback IPv4；公网、Link-local、组播和跨越内外网边界的 CIDR 会在创建任务前被拒绝。
+端口表达式支持单个端口、逗号分隔和闭区间。单 IP 未指定端口时扫描全部 TCP 端口；网段未指定端口时使用内置的常见端口集合。
 
-启用 `--vuln` 前，请确认 Nuclei 二进制和模板目录已就绪：
+每次命令行扫描都会创建任务和运行记录，扫描结束后可以在 CLI、API 和 Web 中查看同一份资产、漏洞和报告数据。
+
+## 漏洞验证
+
+先安装 Nuclei：
 
 ```bash
 go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+```
+
+指定模板目录并启用验证：
+
+```bash
+./yscan --templates /path/to/nuclei-templates scan 192.168.1.10 --vuln
 ./yscan --templates /path/to/nuclei-templates subnet 192.168.10.0/24 --vuln
 ```
 
-模板目录也可以通过 `NUCLEI_TEMPLATES` 指定。未传入 `--templates` 时，程序会依次探测环境变量、用户目录和当前目录下的常见 templates 路径。
+模板目录也可以通过 `NUCLEI_TEMPLATES` 环境变量指定。未显式指定时，程序会检查用户目录和当前目录中的常见模板路径。
 
-所有 Nuclei 调用默认传入 `-exclude-tags intrusive,dos,auth`。服务标签只用于缩小模板候选范围，不代表模板一定无副作用；生产环境仍应审查实际模板内容并先在受控资产上验证。
+CAASM 不会对每个端口执行整套模板。它会先根据服务、产品和 CPE 选择候选模板，再应用只读策略和审核清单。Nuclei 进程默认禁用交互和重定向，限制为每秒 25 个请求、5 个并发，并排除 `intrusive`、`dos`、`auth` 标签。
 
-### 单目标扫描与漏洞验证
+页面会明确区分以下结果：
 
-```bash
-./yscan scan 192.168.1.10
-./yscan --templates /path/to/nuclei-templates scan 192.168.1.10 --vuln
-./yscan scan 192.168.1.10 --port-spec 22,80,443,8080
-```
+- 未启用漏洞验证
+- 没有识别出可映射产品
+- 没有可用模板
+- 模板被安全策略过滤
+- 已执行且没有发现漏洞
+- 已发现漏洞
+- Nuclei 或模板执行失败
 
-旧 V1 的直接 `vuln` 与 `domain` 任务创建入口已关闭。漏洞验证通过 V2 `scan --vuln` 或 ScanTask 配置启用；旧数据只能用 `legacy-list`、`legacy-status` 和 `legacy-findings` 读取。
+Nuclei 可执行文件和模板不会打包进 `yscan`，需要由部署环境单独维护。
 
-### DNS 解析策略
-
-DNS 模式用于处理 V2 工作流中的内网解析视角：
-
-| 模式 | 行为 | 典型场景 |
-| --- | --- | --- |
-| `internal` | 保留私网地址 | 企业办公网、IDC 内网、实验室 |
-| `external` | 过滤 RFC1918、Loopback、Link-local 等地址 | 兼容历史配置，不扩大扫描目标准入范围 |
-| `hybrid` | 同时解析不同视角 | 兼容历史配置，最终扫描目标仍须通过内网校验 |
-
-对于明确的本地代理污染网段，可重复传入 `--dns-deny-cidr`：
-
-```bash
-./yscan --dns-mode internal --dns-deny-cidr 192.168.18.0/24 \
-  subnet 192.168.10.0/24
-```
-
-被动收集结果仍会经过 DNS 活性校验；泛解析过滤只作用于主动字典爆破结果，避免误删被动发现到的资产线索。
-
-## Web 控制台与 API
+## Web 控制台
 
 启动服务：
 
@@ -151,134 +114,164 @@ DNS 模式用于处理 V2 工作流中的内网解析视角：
 ./yscan api 127.0.0.1:8080
 ```
 
-访问地址：
+常用页面：
 
-- 控制台：`http://127.0.0.1:8080/tasks`
-- 资产列表：`http://127.0.0.1:8080/assets`
+- 任务：`http://127.0.0.1:8080/tasks`
+- 一次性扫描：`http://127.0.0.1:8080/executions`
+- 资产：`http://127.0.0.1:8080/assets`
 - 漏洞与报告：`http://127.0.0.1:8080/reports`
+- 指纹管理：`http://127.0.0.1:8080/fingerprints`
 - 健康检查：`http://127.0.0.1:8080/api/healthz`
 
-API 与 CLI 使用同一个 SQLite 数据库。启动 API 时也可以传入全局 Nuclei 与 DNS 参数：
+控制台可以创建一次性扫描和定时任务，设置端口范围、漏洞验证、每日或每周计划，并查看运行阶段、进度、Diff 和报告。活动运行的详情每 3 秒更新一次，可以直接取消。
 
-```bash
-./yscan --templates /path/to/nuclei-templates --dns-mode internal api 127.0.0.1:8080
-```
+### 允许其他主机访问
 
-回环监听无需访问名单。空 host、`0.0.0.0`、`[::]` 或其他非回环地址会暴露内部资产与指纹数据，因此必须至少配置一个受信客户端 CIDR：
+API 没有登录页面。监听非回环地址时，必须至少配置一个允许访问的客户端 CIDR：
 
 ```bash
 ./yscan api 0.0.0.0:8080 --allow-cidr 192.168.10.0/24
-./yscan api '[::]:8080' --allow-cidr 2001:db8:1234::/48
 ```
 
-可重复使用 `--allow-cidr`。监听校验和每个请求的 `RemoteAddr` 授权都会执行；不在名单内的客户端返回 `403`。
+`--allow-cidr` 可以重复使用。不在允许范围内的客户端会收到 `403`。不要把 API 直接暴露到互联网。
+
+## 定时扫描
+
+API 进程同时负责定时任务调度。创建一个每天凌晨 2 点执行的网段任务：
+
+```bash
+./yscan schedule create \
+  --target 192.168.10.0/24 \
+  --scan-type subnet \
+  --mode scheduled \
+  --cron '0 2 * * *' \
+  --timezone Asia/Shanghai \
+  --port-spec 22,80,443
+```
+
+立即执行已有的定时任务：
+
+```bash
+./yscan schedule run <task_id>
+```
+
+暂停或恢复任务：
+
+```bash
+./yscan schedule pause <task_id>
+./yscan schedule resume <task_id>
+```
+
+请不要再用外部 Cron 重复触发同一个定时任务。若调度器发生不可恢复的错误，API 服务会同时退出；配合仓库中的 systemd unit，服务会由 systemd 重新启动。
+
+## CLI 参考
+
+常用命令：
+
+| 命令 | 说明 |
+| --- | --- |
+| `scan <ip\|cidr> [--vuln] [--port-spec <ports>]` | 执行一次扫描并等待完成 |
+| `subnet <cidr> [--vuln] [--port-spec <ports>]` | 执行一次网段扫描并等待完成 |
+| `list` | 列出任务 |
+| `status <task_id>` | 查看任务配置 |
+| `cancel <task_id> <run_id>` | 取消排队中或运行中的一轮扫描 |
+| `findings <task_id> <run_id>` | 查看漏洞结果 |
+| `changes <task_id> <run_id> [baseline_run_id]` | 查看主机、端口和漏洞变化 |
+| `report <task_id> <run_id> [--audit]` | 查看用户报告或审计报告 |
+| `asset <internal_ip>` | 查看资产及端点画像 |
+| `api [addr] [--allow-cidr <cidr>]...` | 启动 API 和 Web 控制台 |
+
+任务管理命令：
+
+| 命令 | 说明 |
+| --- | --- |
+| `schedule create ...` | 创建一次性或定时任务 |
+| `schedule update <task_id> ...` | 修改任务后续运行使用的配置 |
+| `schedule list` | 列出任务 |
+| `schedule show <task_id>` | 查看任务配置和状态 |
+| `schedule runs <task_id>` | 查看运行历史 |
+| `schedule run <task_id>` | 立即执行定时任务 |
+| `schedule run-show <task_id> <run_id>` | 查看运行阶段、进度和错误 |
+| `schedule cancel <task_id> <run_id>` | 取消一轮扫描 |
+| `schedule changes <task_id> <run_id> [baseline_run_id]` | 查看变化 |
+| `schedule findings <task_id> <run_id>` | 查看漏洞结果 |
+| `schedule report <task_id> <run_id> [--audit]` | 查看报告 |
+| `schedule pause\|resume\|archive <task_id>` | 暂停、恢复或归档任务 |
+
+指纹管理命令：
+
+| 命令 | 说明 |
+| --- | --- |
+| `fingerprint list` | 查看指纹来源和当前规则修订 |
+| `fingerprint upgrade [--source <source_key>]` | 升级全部或指定的内置规则来源 |
+| `fingerprint cleanup [--apply]` | 查看或删除没有引用的旧规则修订 |
+| `fingerprint mapping list` | 查看人工维护的模板映射 |
+| `fingerprint mapping import --manifest <path> --templates <root>` | 校验模板哈希并导入映射 |
+| `fingerprint mapping disable --id <id>` | 停用模板映射 |
+
+`legacy-list`、`legacy-status` 和 `legacy-findings` 只用于读取旧格式任务数据，不会创建新的扫描任务。
+
+## HTTP API
+
+下面是日常使用最常见的接口：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/scan-tasks` | 查询 v2 逻辑任务列表 |
-| `POST` | `/api/scan-tasks` | 创建一次性或定期逻辑任务 |
-| `GET` | `/api/scan-tasks/{taskId}` | 查询逻辑任务配置与状态 |
-| `PUT` | `/api/scan-tasks/{taskId}` | 更新后续运行的目标、计划和配置；已有运行保持原配置快照 |
-| `GET` | `/api/scan-tasks/{taskId}/runs` | 查询该逻辑任务的运行历史 |
-| `POST` | `/api/scan-tasks/{taskId}/run-now` | 立即触发一个启用中的定期任务 |
-| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}` | 查询不可变运行快照元数据、状态与 `report_error` |
-| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/changes` | 查询本轮与同任务成功基线的变化 |
-| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/report` | 读取该运行的 Markdown 报告 |
-| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/audit-report` | 读取该运行的审计报告 |
-| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/findings` | 分页读取结构化漏洞结果与验证状态 |
-| `POST` | `/api/scan-tasks/{taskId}/runs/{runId}/cancel` | 请求取消当前运行；终态运行不可取消 |
-| `POST` | `/api/scan-tasks/{taskId}/pause` | 暂停逻辑任务，暂停后不再创建新运行 |
-| `POST` | `/api/scan-tasks/{taskId}/resume` | 恢复已暂停的任务 |
-| `POST` | `/api/scan-tasks/{taskId}/archive` | 归档逻辑任务，归档后不可恢复 |
-| `GET` | `/api/assets?active=true&scope=subnet:192.168.10.0/24` | 查询 IP 聚合库存，可按扫描范围精确过滤 |
-| `GET` | `/api/assets/{ip}` | 查询资产聚合状态、全部范围成员及端口详情 |
-| `GET` | `/api/healthz` | 检查 API 与 SQLite 是否可用 |
-| `GET` | `/api/fingerprints/sources` | 查询规则来源与 active 修订摘要 |
-| `GET` | `/api/fingerprints/imports?page=1&page_size=50` | 分页查询 import 摘要，不返回大型 manifest |
-| `GET` | `/api/fingerprints/imports/{importId}` | 按需查询单个 import 及 manifest |
-| `GET` | `/api/fingerprints/sources/{sourceKey}/rules` | 按规则 ID、产品、状态分页检索原始规则 |
-| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/fingerprints/{imports\|matches\|conclusions}` | 分页查询本轮冻结修订、命中和结论 |
+| `GET` | `/api/healthz` | 健康检查 |
+| `GET` / `POST` | `/api/scan-tasks` | 查询或创建任务 |
+| `GET` / `PUT` | `/api/scan-tasks/{taskId}` | 查询或修改任务 |
+| `POST` | `/api/scan-tasks/{taskId}/run-now` | 立即执行定时任务 |
+| `GET` | `/api/scan-tasks/{taskId}/runs` | 查询运行历史 |
+| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}` | 查询运行状态和进度 |
+| `POST` | `/api/scan-tasks/{taskId}/runs/{runId}/cancel` | 取消运行 |
+| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/changes` | 查询变化 |
+| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/findings` | 查询漏洞结果 |
+| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/report` | 读取用户报告 |
+| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/audit-report` | 读取审计报告 |
+| `GET` | `/api/assets?active=true` | 查询资产 |
+| `GET` | `/api/assets/{ip}` | 查询资产端点详情 |
 
-创建每天执行的网段逻辑任务示例：
+创建每天执行的任务：
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/scan-tasks \
   -H 'Content-Type: application/json' \
-  -d '{"target":"192.168.10.0/24","scan_type":"subnet","mode":"scheduled","cron":"0 2 * * *","timezone":"Asia/Shanghai"}'
+  -d '{
+    "target": "192.168.10.0/24",
+    "scan_type": "subnet",
+    "mode": "scheduled",
+    "cron": "0 2 * * *",
+    "timezone": "Asia/Shanghai",
+    "config": {
+      "port_spec": "22,80,443",
+      "vulnerability_on": false
+    }
+  }'
 ```
 
-`POST` 与 `PUT /api/scan-tasks` 使用同一请求模型：`scan_type` 只能是 `ip` 或 `subnet`；`mode` 为 `once` 或 `scheduled`；`scheduled` 模式必须提供 5 段 `cron` 和 IANA `timezone`；`config.port_spec` 可指定端口集合；通过 `config.vulnerability_on: true` 启用定向漏洞验证。旧 `/api/tasks` 只读，创建和取消会返回 `410 Gone`。
+## 数据与报告
 
-### 任务取消与报告
+CAASM 默认把数据写到启动目录：
 
-取消不是立即伪装成已停止：运行中或排队中的任务先变为 `cancel_requested`，端口扫描、网段工作流和 Nuclei 子进程会收到同一取消上下文；执行器实际退出后，任务才进入 `canceled`。取消前已经保存的结果会保留，但不会被视为成功运行。
-
-每轮 ScanTaskRun 完成时先持久化最终状态、完成时间及已收集结果，再生成 Markdown 报告。成功、失败和取消运行都会尝试生成报告；若报告写入失败，运行状态不会被改写，错误会记录在该运行的 `report_error` 字段中，并可通过运行详情 API 查询。
-
-## 数据与持续巡检
-
-`yscan` 将状态写入当前目录的 SQLite 数据库，并在任务进入最终状态后生成报告：
-
-| 数据 | 位置 | 作用 |
-| --- | --- | --- |
-| SQLite 数据库 | `asm.db` | 逻辑任务、运行快照、IP 聚合库存、范围主机/端口成员、漏洞、变化摘要和服务规则 |
-| Markdown 报告 | `reports/scan-task-<taskId>-run-<runId>.md` | 每轮成功、失败或取消运行的最终摘要、任务内变化、端口变化和漏洞结果 |
-
-持续巡检的关键不是重复扫描，而是在同一扫描范围内比较两次结果：
-
-- 新资产：新的存活主机进入库存。
-- 失活资产：本轮未发现的历史主机标记为非活跃。
-- 新开放端口：本轮出现而上轮没有的端口。
-- 关闭端口：上轮存在而本轮未发现的端口。
-
-范围主机与端口成员关系独立于 IP 聚合库存。一个 IP 同时属于 `/16` 和其中 `/24` 时，两次巡检不会覆盖对方的主机、端口成员状态或变化摘要；全局 IP 状态只要存在一个活跃范围成员就保持活跃，`first_seen` 取最早发现时间，`last_seen` 取所有成员最新的成功发现时间。资产 API 返回 `scope_count`，详情返回每个范围成员；旧 `source` 查询参数仅保留一版兼容别名，不能再用作资产唯一归属。
-
-使用 `yscan schedule create --mode scheduled` 为 CIDR 创建内置定期任务。API 服务进程负责按 Cron 与任务时区创建运行记录、保留运行快照并计算同任务 Diff；控制台“漏洞与报告”页可选择逻辑任务与具体运行查看报告。外部 Cron 或 CI 不应重复触发同一巡检任务。
-
-## CLI 参考
-
-| 命令 | 说明 |
+| 路径 | 内容 |
 | --- | --- |
-| `scan <ip\|cidr> [--vuln] [--port-spec <ports>]` | 创建并同步执行 V2 一次性任务；CIDR 自动使用网段工作流 |
-| `subnet <cidr> [--vuln] [--port-spec <ports>]` | 创建并同步执行 V2 网段一次性任务 |
-| `list` | 列出 V2 逻辑任务 |
-| `status <scan_task_id>` | 查看 V2 逻辑任务配置 |
-| `cancel <scan_task_id> <run_id>` | 取消 V2 排队中或运行中的一轮 |
-| `findings <scan_task_id> <run_id>` | 查看 V2 结构化漏洞结果 |
-| `changes <scan_task_id> <run_id> [baseline_run_id]` | 查看同一逻辑任务内的 Diff |
-| `report <scan_task_id> <run_id> [--audit]` | 读取用户报告或审计报告 |
-| `asset <internal_ip>` | 读取资产端点画像 |
-| `schedule create --target <ip-or-cidr> --scan-type ip\|subnet --mode once\|scheduled ...` | 创建 v2 逻辑任务；scheduled 模式由 API 服务内置调度 |
-| `schedule update <scan_task_id> ...` | 更新逻辑任务后续运行的目标、计划与配置；已有运行保留原快照 |
-| `schedule list` | 列出全部 v2 逻辑任务 |
-| `schedule show <scan_task_id>` | 查看逻辑任务的配置、状态和计划 |
-| `schedule runs <scan_task_id>` | 查看任务的运行历史和报告路径 |
-| `schedule run <scan_task_id>` | 立即触发一个启用中的定期任务 |
-| `schedule run-show <scan_task_id> <run_id>` | 查看运行状态、阶段、进度与报告诊断 |
-| `schedule changes\|findings\|report <scan_task_id> <run_id>` | 查看运行 Diff、漏洞和报告 |
-| `schedule pause\|resume\|archive <scan_task_id>` | 暂停、恢复或归档逻辑任务 |
-| `legacy-list\|legacy-status\|legacy-findings` | 只读访问 V1 历史记录；不能再创建或取消 V1 任务 |
-| `fingerprint list` | 列出规则来源和当前 active import |
-| `fingerprint import --source <source_key> [--recovery-archive <path>]` | 校验并导入一个固定来源或显式恢复归档 |
-| `fingerprint upgrade [--source <source_key>]` | 显式升级全部或单个嵌入来源；逐来源输出成功/失败诊断 |
-| `fingerprint cleanup [--apply]` | 列出无引用的非活动修订；默认 dry-run，只有 `--apply` 才事务删除 |
-| `fingerprint mapping list` | 列出本地审核的规则到 Nuclei 模板映射 |
-| `fingerprint mapping import --manifest <path> --templates <root>` | 校验模板 SHA 后导入审核映射修订 |
-| `fingerprint mapping disable --id <id>` | 停用一条模板映射 |
-| `api [addr] [--allow-cidr <cidr>]...` | 启动 API 和 Web 控制台；非回环监听必须配置受信 CIDR |
+| `asm.db` | 任务、运行、资产、端口、指纹和漏洞数据 |
+| `reports/scan-task-<taskId>-run-<runId>.md` | 给使用者阅读的扫描报告 |
+| `reports/scan-task-<taskId>-run-<runId>-audit.md` | 规则修订、证据和模板选择记录 |
 
-## 安装与服务运行
+用户报告先展示端点、技术栈、漏洞验证状态和发现结果。规则 ID、哈希、匹配条件等排查信息放在审计报告中。
 
-本机构建、测试、安装或生成当前平台发布产物：
+失败或取消的运行也会保留已经收集的结果并尝试生成报告，但不会成为下一次 Diff 的成功基准。
+
+## 安装为系统服务
+
+安装二进制：
 
 ```bash
-make build
-make test
 sudo make install
-make release
 ```
 
-systemd 示例位于 [`deploy/yscan.service`](deploy/yscan.service)。下面的命令创建专用用户和可写状态目录，安装后默认只监听回环地址：
+创建运行用户和数据目录，然后安装 systemd unit：
 
 ```bash
 sudo useradd --system --home /var/lib/caasm --shell /usr/sbin/nologin caasm
@@ -289,48 +282,36 @@ sudo systemctl enable --now yscan
 curl --fail http://127.0.0.1:8080/api/healthz
 ```
 
-`SIGINT` 和 `SIGTERM` 会停止接收新请求、取消当前进程启动的扫描并在最多 10 秒内关闭 HTTP 服务。启动恢复会将上次进程遗留的运行转为明确终态，并生成失败或取消报告。
+服务默认监听 `127.0.0.1:8080`，数据目录为 `/var/lib/caasm`。可以在 `/etc/caasm/yscan.env` 中设置运行环境变量。
 
-全局参数：
+收到 `SIGINT` 或 `SIGTERM` 后，服务会停止接收新请求，取消本进程启动的扫描，等待运行退出后关闭。重新启动时会先处理上次未完成的运行并生成报告，然后才开始监听 API。
 
-| 参数 | 说明 |
-| --- | --- |
-| `--templates <dir>` | 指定 Nuclei templates 根目录 |
-| `--dns-mode internal\|external\|hybrid` | 指定 DNS 解析策略 |
-| `--dns-deny-cidr <cidr>` | 添加 DNS 结果排除网段，可重复传入 |
-
-## 安全边界
-
-- 仅对你拥有或已获得明确授权的资产、网段和域名执行扫描。
-- Nuclei templates 的内容、影响范围和许可证由操作者负责审查；生产环境应先使用受控模板集验证。
-- `yscan` 不是漏洞修复、工单、资产归属、RBAC、多租户或互联网全量测绘平台。
-- 数据库与报告可能包含内部 IP、服务和漏洞信息；提交 Issue、日志或截图前应完成脱敏。
-- API 没有应用层登录机制；非回环部署必须结合 `--allow-cidr`、主机防火墙和受控管理网络，不能直接暴露到互联网。
-
-## v2 路线
-
-v2 不追求无边界堆功能，优先补足“服务识别结果是否可靠、漏洞验证是否足够定向”这条链路。此前两条样例规则、文件快照和硬编码置信度组成的指纹原型已经撤回，不能视为指纹库能力。
-
-M11 随单二进制嵌入 9 个固定第三方来源，共归档 41,192 条原始规则；当前 28,512 条进入统一可执行投影，12,680 条以明确原因保留为 `unsupported`。另有本地旧 `banner` 规则迁移投影。空数据库首次启动会逐来源初始化嵌入规则；首次初始化中失败或缺失的来源会保留诊断并在下次启动单独重试，已有任意历史 import 的来源不会被自动升级。规则升级仍必须显式执行 `fingerprint upgrade`。
-
-可执行范围包括 FingerprintHub Web/Service 的被动条件、WhatWeb 可静态提取条件、Wappalyzer 被动 HTTP 条件、Nmap NULL Probe，以及固定只读白名单中的 TCP payload Probe。仍不执行动态 Ruby、DOM/JavaScript 行为、无法保真投影的隐式关系、UDP Probe、认证/写入/状态变更探针和未审核的 Nuclei 模板。互联网 CVE/POC 自动同步属于后续边界，不在当前版本中。
-
-资产详情和用户报告以同一个观测运行展示端口、协议证据、基础服务、角色化技术栈、版本/CPE、识别来源和漏洞验证摘要。启用漏洞验证时，人工审核映射优先；其余已识别产品会从显式指定的本地 Nuclei 模板目录建立内容固定索引，只选择规范产品名、CPE 或精确产品标签匹配且通过低副作用策略的模板。没有产品、没有映射、模板被策略过滤和执行失败均会单独说明，不会显示成“验证成功且无漏洞”。Nuclei 可执行文件和模板目录不嵌入 CAASM 二进制，仍须由部署环境提供。
-
-## 开发验证
+生成发布文件：
 
 ```bash
-go test ./...
-go test -race ./...
-go vet ./...
-go build -o yscan .
-./scripts/verify-t293.sh
-# 需要 Docker Compose v2、Nuclei，并占用本机 22/80/443/3306/6379/8080
-./scripts/verify-t293-products.sh
-# 需要预先启动脚本所列的真实 Redis、Dropbear、PHP 和 Flask 本地服务
-./scripts/verify-t330.sh
+make release
 ```
 
-## 贡献
+输出位于 `dist/`，`dist/SHA256SUMS` 保存校验值。
 
-提交 Issue 或 Pull Request 前，请说明复现步骤、运行环境、脱敏后的输入与预期行为。涉及漏洞、内部资产信息或高影响扫描行为的问题，请勿公开提交真实目标、凭据、扫描结果或可利用数据。
+## 安全说明
+
+- 只扫描经过授权的内网资产。
+- 数据库和报告可能包含内部 IP、服务版本和漏洞信息，应限制文件访问权限并定期备份。
+- 非回环 API 监听必须使用 `--allow-cidr`，并同时配置主机防火墙或受控管理网络。
+- 启用漏洞验证前，应审查本地 Nuclei 模板及其许可证，并先在测试环境确认影响。
+- CAASM 不提供漏洞修复、工单、RBAC、多租户或互联网资产测绘功能。
+
+## 开发与测试
+
+```bash
+make test
+go test -count=1 ./...
+go test -race -count=1 ./...
+go vet ./...
+go build ./...
+```
+
+## 反馈与贡献
+
+提交 Issue 或 Pull Request 时，请提供复现步骤、运行环境、脱敏后的输入和预期结果。不要公开提交真实内网地址、凭据、扫描报告或漏洞利用数据。
