@@ -18,6 +18,7 @@ func main() {
 	expectedPorts := flag.Int("expected-ports", 6, "expected endpoint profile count")
 	expectedValidations := flag.Int("expected-validations", 6, "expected endpoint validation row count")
 	expectedFindings := flag.Int("expected-findings", 2, "expected vulnerability finding count")
+	taskID := flag.Int64("task-id", 0, "active ScanTask ID used to verify detail refresh")
 	flag.Parse()
 	if strings.TrimSpace(*baseURL) == "" {
 		fatal(errors.New("--base-url is required"))
@@ -60,6 +61,9 @@ func main() {
 		record(fmt.Sprintf("request failed: %s: %v", request.URL(), request.Failure()))
 	})
 
+	if *taskID > 0 {
+		verifyActiveTaskDetail(page, strings.TrimRight(*baseURL, "/"), *taskID)
+	}
 	if _, err := page.Goto(strings.TrimRight(*baseURL, "/") + "/assets"); err != nil {
 		fatal(fmt.Errorf("open assets page: %w", err))
 	}
@@ -98,6 +102,38 @@ func main() {
 		fatal(fmt.Errorf("browser errors: %s", strings.Join(deferredProblems, " | ")))
 	}
 	fmt.Printf("T330 browser journey verified: ip=%s endpoints=%d validations=%d findings=%d\n", *ip, *expectedPorts, *expectedValidations, *expectedFindings)
+}
+
+func verifyActiveTaskDetail(page playwright.Page, baseURL string, taskID int64) {
+	if _, err := page.Goto(baseURL + "/tasks"); err != nil {
+		fatal(fmt.Errorf("open task page: %w", err))
+	}
+	row := page.Locator(fmt.Sprintf(`[data-scan-task-id="%d"]`, taskID))
+	if err := row.WaitFor(); err != nil {
+		fatal(fmt.Errorf("wait for active task row: %w", err))
+	}
+	if err := row.Click(); err != nil {
+		fatal(fmt.Errorf("open active task detail: %w", err))
+	}
+	detail := page.Locator(fmt.Sprintf(`[data-testid="scan-task-detail"][data-task-id="%d"]`, taskID))
+	if err := detail.WaitFor(); err != nil {
+		fatal(fmt.Errorf("wait for active task detail: %w", err))
+	}
+	cancel := page.Locator("#cancel-run")
+	if err := cancel.WaitFor(); err != nil {
+		fatal(fmt.Errorf("wait for active run cancellation: %w", err))
+	}
+
+	page.WaitForTimeout(3_500)
+	assertCount(detail, 1, "active task detail after refresh interval")
+	assertCount(page.Locator("#run-detail"), 1, "active run detail after refresh interval")
+	if count, err := cancel.Count(); err != nil {
+		fatal(fmt.Errorf("count cancellation control after refresh: %w", err))
+	} else if count == 1 {
+		if err := cancel.Click(); err != nil {
+			fatal(fmt.Errorf("cancel active run after detail refresh: %w", err))
+		}
+	}
 }
 
 func assertEndpointValidation(page playwright.Page, port int, status string, executed, findings int) {

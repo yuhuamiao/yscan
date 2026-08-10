@@ -126,7 +126,8 @@
     .endpoint-evidence { color: var(--muted); font: 11px/1.55 "IBM Plex Mono", "SFMono-Regular", monospace; overflow-wrap: anywhere; }
     .endpoint-evidence details summary { cursor: pointer; color: var(--ink); font-family: "IBM Plex Sans", "Noto Sans SC", sans-serif; }
     .reason-list { margin: 0; padding-left: 18px; color: var(--warn); font-size: 12px; line-height: 1.55; }
-    .mono { font-family: "IBM Plex Mono", "SFMono-Regular", monospace; font-size: 11px; }
+	    .mono { font-family: "IBM Plex Mono", "SFMono-Regular", monospace; font-size: 11px; }
+	    progress { width: 100%; height: 9px; accent-color: var(--accent); }
     @media (max-width: 900px) {
       .shell { grid-template-columns: 1fr; }
       .sidebar { position: sticky; top: 0; z-index: 2; flex-direction: row; align-items: center; padding: 10px 14px; border-right: 0; border-bottom: 1px solid var(--line); gap: 20px; }
@@ -185,9 +186,31 @@
       const node = document.getElementById('status-line');
       if (node) { node.textContent = value; node.style.color = error ? 'var(--danger)' : 'var(--muted)'; }
     }
-    function scanTaskSchedule(task) {
-      return task.mode === 'scheduled' ? `${esc(task.cron || '-')} · ${esc(task.timezone || '-')}` : '一次性';
-    }
+	    let routeRefreshTimer = 0;
+	    let selectedScanTaskID = '';
+	    function scanTaskSchedule(task) {
+	      return task.mode === 'scheduled' ? `${esc(task.cron || '-')} · ${esc(task.timezone || '-')}` : '一次性';
+	    }
+	    function activeRun(run) { return run && ['queued', 'running', 'cancel_requested'].includes(run.status); }
+	    function scheduleRefresh(refresh) {
+	      clearTimeout(routeRefreshTimer);
+	      routeRefreshTimer = setTimeout(() => {
+	        if (document.hidden) { scheduleRefresh(refresh); return; }
+	        refresh();
+	      }, 3000);
+	    }
+	    function scheduleRouteRefresh(render, rows) {
+	      clearTimeout(routeRefreshTimer);
+	      if (!rows.some(row => activeRun(row.runs[row.runs.length - 1]))) return;
+	      scheduleRefresh(() => selectedScanTaskID ? showScanTaskDetail(selectedScanTaskID) : render());
+	    }
+	    function scheduleScanTaskDetailRefresh(taskID, runs) {
+	      clearTimeout(routeRefreshTimer);
+	      if (!activeRun(runs[runs.length - 1])) return;
+	      scheduleRefresh(() => {
+	        if (String(selectedScanTaskID) === String(taskID)) showScanTaskDetail(taskID);
+	      });
+	    }
     function renderScanTaskStats(rows) {
       const tasks = rows.map(row => row.task);
       const enabled = tasks.filter(task => task.status === 'enabled').length;
@@ -198,45 +221,62 @@
     function renderScanTaskRows(rows) {
       return rows.map(({task, runs}) => {
         const latest = runs[runs.length - 1];
-        const lastRun = latest ? `#${latest.sequence} ${latest.status} · ${time(latest.finished_at || latest.scheduled_for)}` : '-';
+	        const lastRun = latest ? `#${latest.sequence} ${latest.status} · ${latest.stage || 'queued'} ${Number(latest.progress || 0)}% · ${time(latest.finished_at || latest.scheduled_for)}` : '-';
         return `<tr data-scan-task-id="${task.id}"><td>${task.id}</td><td>${status(task.status)}</td><td>${esc(task.scan_type)}</td><td>${esc(task.target)}</td><td>${scanTaskSchedule(task)}</td><td>${runs.length}</td><td>${esc(lastRun)}</td></tr>`;
       }).join('') || '<tr><td colspan="7" class="empty">暂无持续任务</td></tr>';
     }
-    function scanTaskForm() {
-      return `<form class="panel-body form-grid" id="scan-task-form"><label>扫描类型<select name="scan_type"><option value="subnet">网段扫描</option><option value="ip">单 IP 扫描</option></select></label><label>内网目标<input name="target" placeholder="192.168.10.0/24" required></label><label>Cron 表达式<input name="cron" value="0 2 * * *" placeholder="0 2 * * *" required></label><label>时区<input name="timezone" value="Asia/Shanghai" placeholder="Asia/Shanghai" required></label><label>模板目录<input name="templates" placeholder="留空则自动发现"></label><label class="check"><input type="checkbox" name="vuln">启用漏洞验证</label><button class="button" type="submit">创建定期任务</button></form>`;
-    }
+	    function scheduleFormState(task) {
+	      const cron = task?.cron || '0 2 * * *', parts = cron.trim().split(/\s+/); let mode = 'advanced', clock = '02:00', weekday = '1';
+	      if (parts.length === 5 && /^\d+$/.test(parts[0]) && /^\d+$/.test(parts[1])) { clock = `${String(parts[1]).padStart(2,'0')}:${String(parts[0]).padStart(2,'0')}`; if (parts[2] === '*' && parts[3] === '*' && parts[4] === '*') mode = 'daily'; else if (parts[2] === '*' && parts[3] === '*' && /^[0-6]$/.test(parts[4])) { mode = 'weekly'; weekday = parts[4]; } }
+	      return {cron, mode, clock, weekday};
+	    }
+	    function scanTaskForm(task = null) {
+	      const schedule = scheduleFormState(task), config = task?.config || {}, selected = value => task?.scan_type === value ? ' selected' : '';
+	      return `<form class="panel-body form-grid" id="scan-task-form" data-task-id="${task?.id || ''}"><label>扫描类型<select name="scan_type"><option value="subnet"${selected('subnet')}>网段扫描</option><option value="ip"${selected('ip')}>单 IP 扫描</option></select></label><label>内网目标<input name="target" value="${esc(task?.target || '')}" placeholder="192.168.10.0/24" required></label><label>端口策略<input name="port_spec" value="${esc(config.port_spec || '')}" placeholder="留空使用默认；例如 22,80,443,8000-8100"></label><label>计划模式<select name="schedule_mode"><option value="daily"${schedule.mode === 'daily' ? ' selected' : ''}>每日</option><option value="weekly"${schedule.mode === 'weekly' ? ' selected' : ''}>每周</option><option value="advanced"${schedule.mode === 'advanced' ? ' selected' : ''}>高级 Cron</option></select></label><label data-schedule-field="clock">执行时间<input type="time" name="clock" value="${schedule.clock}"></label><label data-schedule-field="weekday">星期<select name="weekday">${[['1','星期一'],['2','星期二'],['3','星期三'],['4','星期四'],['5','星期五'],['6','星期六'],['0','星期日']].map(([value,label]) => `<option value="${value}"${schedule.weekday === value ? ' selected' : ''}>${label}</option>`).join('')}</select></label><label data-schedule-field="cron">Cron 表达式<input name="cron" value="${esc(schedule.cron)}" placeholder="0 2 * * *"></label><label>时区<input name="timezone" value="${esc(task?.timezone || 'Asia/Shanghai')}" placeholder="Asia/Shanghai" required></label><label>模板目录<input name="templates" value="${esc(config.nuclei_templates || '')}" placeholder="留空则自动发现"></label><label class="check"><input type="checkbox" name="vuln"${config.vulnerability_on ? ' checked' : ''}>启用漏洞验证</label><button class="button" type="submit">${task ? '保存任务' : '创建定期任务'}</button></form>`;
+	    }
     async function renderScanTasks() {
       shell('持续任务', '以逻辑任务管理一次性验证和周期巡检，每轮执行保留独立快照。', '<div class="empty">正在加载持续任务...</div>');
       try {
         const tasks = await request('/api/scan-tasks');
         const rows = await Promise.all(tasks.map(async task => ({task, runs: await request(`/api/scan-tasks/${task.id}/runs`)})));
         shell('持续任务', '以逻辑任务管理一次性验证和周期巡检，每轮执行保留独立快照。', `${renderScanTaskStats(rows)}<div class="split"><section class="panel"><div class="panel-heading"><h2>逻辑任务</h2><button class="button secondary" id="refresh-scan-tasks">刷新</button></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>状态</th><th>类型</th><th>目标</th><th>计划</th><th>运行</th><th>最近一轮</th></tr></thead><tbody>${renderScanTaskRows(rows)}</tbody></table></div></section><aside class="panel"><div class="panel-heading"><h2>新建任务</h2></div>${scanTaskForm()}</aside></div>`);
-        document.getElementById('refresh-scan-tasks').onclick = renderScanTasks;
-        document.querySelectorAll('[data-scan-task-id]').forEach(row => row.onclick = () => showScanTaskDetail(row.dataset.scanTaskId));
-        bindScanTaskForm();
+	        document.getElementById('refresh-scan-tasks').onclick = () => { selectedScanTaskID = ''; renderScanTasks(); };
+	        document.querySelectorAll('[data-scan-task-id]').forEach(row => row.onclick = () => showScanTaskDetail(row.dataset.scanTaskId));
+	        bindScanTaskForm();
+	        scheduleRouteRefresh(renderScanTasks, rows);
       } catch (error) {
         shell('持续任务', '以逻辑任务管理一次性验证和周期巡检，每轮执行保留独立快照。', `<div class="empty">${esc(error.message)}</div>`);
       }
     }
-    function bindScanTaskForm() {
-      const form = document.getElementById('scan-task-form');
-      form.onsubmit = async event => {
+	    function bindScheduleFields(form) {
+	      const update = () => { const mode = form.elements.schedule_mode.value; form.querySelector('[data-schedule-field="clock"]').classList.toggle('hidden', mode === 'advanced'); form.querySelector('[data-schedule-field="weekday"]').classList.toggle('hidden', mode !== 'weekly'); form.querySelector('[data-schedule-field="cron"]').classList.toggle('hidden', mode !== 'advanced'); };
+	      form.elements.schedule_mode.onchange = update; update();
+	    }
+	    function scheduleCron(values) {
+	      const mode = values.get('schedule_mode'); if (mode === 'advanced') return String(values.get('cron') || '').trim();
+	      const [hour, minute] = String(values.get('clock') || '02:00').split(':'); return `${Number(minute)} ${Number(hour)} * * ${mode === 'weekly' ? values.get('weekday') : '*'}`;
+	    }
+	    function bindScanTaskForm(task = null) {
+	      const form = document.getElementById('scan-task-form');
+	      if (!form) return; bindScheduleFields(form);
+	      form.onsubmit = async event => {
         event.preventDefault();
         const values = new FormData(form);
         const payload = {
           target: String(values.get('target') || '').trim(),
           scan_type: values.get('scan_type'),
           mode: 'scheduled',
-          cron: String(values.get('cron') || '').trim(),
+	          cron: scheduleCron(values),
           timezone: String(values.get('timezone') || '').trim(),
-          config: {
-            vulnerability_on: values.get('vuln') === 'on',
+	          config: {
+	            port_spec: String(values.get('port_spec') || '').trim(),
+	            vulnerability_on: values.get('vuln') === 'on',
             nuclei_templates: String(values.get('templates') || '').trim()
           }
         };
         try {
-          const created = await request('/api/scan-tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
-          message(`定期任务 #${created.task.id} 已创建`);
+	          const result = await request(task ? `/api/scan-tasks/${task.id}` : '/api/scan-tasks', {method:task ? 'PUT' : 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+	          message(task ? `任务 #${task.id} 已更新` : `定期任务 #${result.task.id} 已创建`);
           await renderScanTasks();
         } catch (error) { message(error.message, true); }
       };
@@ -254,23 +294,28 @@
       return `<option value="">上一次成功运行</option>${candidates.map(run => `<option value="${run.id}">#${run.sequence} · ${time(run.finished_at || run.scheduled_for)}</option>`).join('')}`;
     }
     async function showScanTaskDetail(id) {
+	      selectedScanTaskID = String(id);
       try {
         const [task, runs] = await Promise.all([request(`/api/scan-tasks/${id}`), request(`/api/scan-tasks/${id}/runs`)]);
         const host = document.querySelector('.split aside');
         if (!host) return;
         const current = runs[runs.length - 1];
-        host.innerHTML = `<div class="panel-heading"><h2>任务 #${task.id}</h2><div class="toolbar" id="scan-task-actions"></div></div><div class="panel-body detail"><dl><dt>状态</dt><dd>${status(task.status)}</dd><dt>类型</dt><dd>${esc(task.scan_type)}</dd><dt>目标</dt><dd>${esc(task.target)}</dd><dt>计划</dt><dd>${scanTaskSchedule(task)}</dd><dt>创建时间</dt><dd>${time(task.created_at)}</dd></dl>${current ? `<label>查看运行<select id="run-select">${runs.map(run => `<option value="${run.id}"${run.id === current.id ? ' selected' : ''}>#${run.sequence} · ${esc(run.status)} · ${time(run.finished_at || run.scheduled_for)}</option>`).join('')}</select></label><label>比较基线<select id="baseline-select">${baselineOptions(runs, current.id)}</select></label><div id="run-detail" class="detail"></div><div id="run-changes" class="change-group"><p class="section-note">正在加载任务内差异...</p></div>` : '<p class="section-note">该逻辑任务尚未产生运行记录。</p>'}</div>`;
+	        host.innerHTML = `<div class="panel-heading" data-testid="scan-task-detail" data-task-id="${task.id}"><h2>任务 #${task.id}</h2><div class="toolbar" id="scan-task-actions"></div></div><div class="panel-body detail"><dl><dt>状态</dt><dd>${status(task.status)}</dd><dt>类型</dt><dd>${esc(task.scan_type)}</dd><dt>目标</dt><dd>${esc(task.target)}</dd><dt>端口策略</dt><dd>${esc(task.config?.port_spec || '默认')}</dd><dt>计划</dt><dd>${scanTaskSchedule(task)}</dd><dt>创建时间</dt><dd>${time(task.created_at)}</dd></dl>${current ? `<label>查看运行<select id="run-select">${runs.map(run => `<option value="${run.id}"${run.id === current.id ? ' selected' : ''}>#${run.sequence} · ${esc(run.status)} · ${esc(run.stage || 'queued')} ${Number(run.progress || 0)}% · ${time(run.finished_at || run.scheduled_for)}</option>`).join('')}</select></label><label>比较基线<select id="baseline-select">${baselineOptions(runs, current.id)}</select></label><div id="run-detail" class="detail"></div><div id="run-changes" class="change-group"><p class="section-note">正在加载任务内差异...</p></div>` : '<p class="section-note">该逻辑任务尚未产生运行记录，可点击“立即运行”。</p>'}</div>`;
         bindScanTaskActions(task);
         if (current) bindRunComparison(task.id, runs);
+	        scheduleScanTaskDetailRefresh(task.id, runs);
       } catch (error) { message(error.message, true); }
     }
-    function bindScanTaskActions(task) {
-      const host = document.getElementById('scan-task-actions');
-      const actions = task.status === 'enabled' ? ['pause', 'archive'] : task.status === 'paused' ? ['resume', 'archive'] : [];
-      host.innerHTML = actions.map(action => `<button class="button ${action === 'archive' ? 'danger' : 'secondary'}" data-scan-task-action="${action}">${action === 'pause' ? '暂停' : action === 'resume' ? '恢复' : '归档'}</button>`).join('');
-      host.querySelectorAll('[data-scan-task-action]').forEach(button => button.onclick = async () => {
-        try { await request(`/api/scan-tasks/${task.id}/${button.dataset.scanTaskAction}`, {method:'POST'}); await renderScanTasks(); } catch (error) { message(error.message, true); }
-      });
+	    function bindScanTaskActions(task) {
+	      const host = document.getElementById('scan-task-actions');
+	      const actions = task.status === 'enabled' ? (task.mode === 'scheduled' ? ['edit', 'run-now', 'pause', 'archive'] : ['archive']) : task.status === 'paused' ? ['edit', 'resume', 'archive'] : [];
+	      const labels = {edit:'编辑', 'run-now':'立即运行', pause:'暂停', resume:'恢复', archive:'归档'};
+	      host.innerHTML = actions.map(action => `<button class="button ${action === 'archive' ? 'danger' : 'secondary'}" data-scan-task-action="${action}">${labels[action]}</button>`).join('');
+	      host.querySelectorAll('[data-scan-task-action]').forEach(button => button.onclick = async () => {
+	        const action = button.dataset.scanTaskAction;
+	        if (action === 'edit') { selectedScanTaskID = ''; clearTimeout(routeRefreshTimer); const panel = document.querySelector('.split aside'); panel.innerHTML = `<div class="panel-heading"><h2>编辑任务 #${task.id}</h2></div>${scanTaskForm(task)}`; bindScanTaskForm(task); return; }
+	        try { await request(`/api/scan-tasks/${task.id}/${action}`, {method:'POST'}); selectedScanTaskID = action === 'run-now' ? String(task.id) : ''; await renderScanTasks(); if (action === 'run-now') await showScanTaskDetail(task.id); } catch (error) { message(error.message, true); }
+	      });
     }
     function bindRunComparison(taskID, runs) {
       const runSelect = document.getElementById('run-select');
@@ -288,7 +333,8 @@
       const changesHost = document.getElementById('run-changes');
       try {
         const run = await request(`/api/scan-tasks/${taskID}/runs/${runID}`);
-        detail.innerHTML = `<dl><dt>本轮状态</dt><dd>${status(run.status)}</dd><dt>计划时间</dt><dd>${time(run.scheduled_for)}</dd><dt>开始/结束</dt><dd>${time(run.started_at)} / ${time(run.finished_at)}</dd><dt>报告</dt><dd>${run.report_path ? '可在“漏洞与报告”查看' : '-'}</dd><dt>扫描错误</dt><dd>${esc(run.error_message || '-')}</dd><dt>报告错误</dt><dd>${esc(run.report_error || '-')}</dd></dl>`;
+	        detail.innerHTML = `<dl><dt>本轮状态</dt><dd>${status(run.status)}</dd><dt>触发方式</dt><dd>${esc(run.trigger || '-')}</dd><dt>执行阶段</dt><dd>${esc(run.stage || 'queued')} · ${Number(run.progress || 0)}%</dd><dt>进度</dt><dd><progress max="100" value="${Number(run.progress || 0)}"></progress></dd><dt>计划时间</dt><dd>${time(run.scheduled_for)}</dd><dt>开始/结束</dt><dd>${time(run.started_at)} / ${time(run.finished_at)}</dd><dt>报告</dt><dd>${run.report_path ? '可在“漏洞与报告”查看' : '-'}</dd><dt>扫描错误</dt><dd>${esc(run.error_message || '-')}</dd><dt>报告错误</dt><dd>${esc(run.report_error || '-')}</dd></dl>${['queued','running'].includes(run.status) ? '<button class="button danger" id="cancel-run">取消本轮运行</button>' : ''}`;
+	        const cancel = document.getElementById('cancel-run'); if (cancel) cancel.onclick = async () => { try { await request(`/api/scan-tasks/${taskID}/runs/${runID}/cancel`, {method:'POST'}); await showScanTaskDetail(taskID); } catch (error) { message(error.message, true); } };
         if (run.status !== 'success') {
           changesHost.innerHTML = '<p class="section-note">仅成功运行具有可比较的快照。</p>';
           return;
@@ -306,14 +352,15 @@
       try {
         const tasks = (await request('/api/scan-tasks')).filter(task => task.mode === 'once');
         const rows = await Promise.all(tasks.map(async task => ({task, runs: await request(`/api/scan-tasks/${task.id}/runs`)})));
-        shell('即时执行', '创建一次性内网扫描，使用 V2 指纹、资产和运行快照链路。', `${renderScanTaskStats(rows)}<div class="split"><section class="panel"><div class="panel-heading"><h2>一次性运行</h2><button class="button secondary" id="refresh-tasks">刷新</button></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>状态</th><th>类型</th><th>目标</th><th>运行</th><th>最近一轮</th></tr></thead><tbody>${rows.map(({task, runs}) => { const latest = runs[runs.length - 1]; return `<tr data-scan-task-id="${task.id}"><td>${task.id}</td><td>${status(task.status)}</td><td>${esc(task.scan_type)}</td><td>${esc(task.target)}</td><td>${runs.length}</td><td>${latest ? `${esc(latest.status)} · ${time(latest.finished_at || latest.scheduled_for)}` : '-'}</td></tr>`; }).join('') || '<tr><td colspan="6" class="empty">暂无一次性运行</td></tr>'}</tbody></table></div></section><aside class="panel"><div class="panel-heading"><h2>新建一次性扫描</h2></div><form class="panel-body form-grid" id="task-form"><label>扫描类型<select name="scan_type"><option value="ip">单 IP 扫描</option><option value="subnet">网段扫描</option></select></label><label>内网目标<input name="target" placeholder="192.168.10.10" required></label><label>模板目录<input name="templates" placeholder="留空则自动发现"></label><label class="check"><input type="checkbox" name="vuln">启用漏洞验证</label><button class="button" type="submit">立即执行</button></form></aside></div>`);
-        document.getElementById('refresh-tasks').onclick = renderImmediateExecutions;
+	        shell('即时执行', '创建一次性内网扫描，使用 V2 指纹、资产和运行快照链路。', `${renderScanTaskStats(rows)}<div class="split"><section class="panel"><div class="panel-heading"><h2>一次性运行</h2><button class="button secondary" id="refresh-tasks">刷新</button></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>状态</th><th>类型</th><th>目标</th><th>运行</th><th>最近一轮</th></tr></thead><tbody>${rows.map(({task, runs}) => { const latest = runs[runs.length - 1]; return `<tr data-scan-task-id="${task.id}"><td>${task.id}</td><td>${status(task.status)}</td><td>${esc(task.scan_type)}</td><td>${esc(task.target)}</td><td>${runs.length}</td><td>${latest ? `${esc(latest.status)} · ${esc(latest.stage || 'queued')} ${Number(latest.progress || 0)}% · ${time(latest.finished_at || latest.scheduled_for)}` : '-'}</td></tr>`; }).join('') || '<tr><td colspan="6" class="empty">暂无一次性运行</td></tr>'}</tbody></table></div></section><aside class="panel"><div class="panel-heading"><h2>新建一次性扫描</h2></div><form class="panel-body form-grid" id="task-form"><label>扫描类型<select name="scan_type"><option value="ip">单 IP 扫描</option><option value="subnet">网段扫描</option></select></label><label>内网目标<input name="target" placeholder="192.168.10.10" required></label><label>端口策略<input name="port_spec" placeholder="留空使用默认；例如 22,80,443"></label><label>模板目录<input name="templates" placeholder="留空则自动发现"></label><label class="check"><input type="checkbox" name="vuln">启用漏洞验证</label><button class="button" type="submit">立即执行</button></form></aside></div>`);
+        document.getElementById('refresh-tasks').onclick = () => { selectedScanTaskID = ''; renderImmediateExecutions(); };
         document.querySelectorAll('[data-scan-task-id]').forEach(row => row.onclick = () => showScanTaskDetail(row.dataset.scanTaskId));
         document.getElementById('task-form').onsubmit = async event => {
           event.preventDefault(); const form = new FormData(event.currentTarget);
-          const payload = {target: String(form.get('target') || '').trim(), scan_type: form.get('scan_type'), mode: 'once', config: {vulnerability_on: form.get('vuln') === 'on', nuclei_templates: String(form.get('templates') || '').trim()}};
+	          const payload = {target: String(form.get('target') || '').trim(), scan_type: form.get('scan_type'), mode: 'once', config: {port_spec: String(form.get('port_spec') || '').trim(), vulnerability_on: form.get('vuln') === 'on', nuclei_templates: String(form.get('templates') || '').trim()}};
           try { const created = await request('/api/scan-tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)}); message(`一次性运行 #${created.run ? created.run.id : created.task.id} 已创建`); setTimeout(renderImmediateExecutions, 450); } catch (error) { message(error.message, true); }
-        };
+	        };
+	        scheduleRouteRefresh(renderImmediateExecutions, rows);
       } catch (error) { shell('即时执行', '创建一次性内网扫描，使用 V2 指纹、资产和运行快照链路。', `<div class="empty">${esc(error.message)}</div>`); }
     }
     async function renderAssets() {
@@ -432,7 +479,7 @@
         findings.innerHTML = `<dl><dt>验证状态</dt><dd>${status(validation.status || 'unavailable')} · ${esc(labels[validation.status] || '状态不可用')}</dd><dt>覆盖</dt><dd>${validation.executed_endpoint_count || 0} / ${validation.candidate_endpoint_count || 0} 个端点 · ${validation.template_count || 0} 个模板</dd><dt>发现</dt><dd>${result.total || 0}</dd>${validation.error ? `<dt>错误</dt><dd>${esc(validation.error)}</dd>` : ''}</dl>${(result.items || []).map(item => `<section class="change-group"><h3>${esc(item.name || item.template_id || '未命名漏洞')}</h3><p>${status(item.severity || 'unknown')} · ${esc(item.target)}</p><p class="section-note">${esc(item.template_id || '-')} · ${esc(item.matched_at || '-')}</p>${item.description ? `<p>${esc(item.description)}</p>` : ''}</section>`).join('') || ''}`;
       } catch (error) { findings.innerHTML = `<div class="empty">${esc(error.message)}</div>`; }
     }
-    function route() { ({'/assets':renderAssets, '/fingerprints':renderFingerprints, '/reports':renderReports, '/executions':renderImmediateExecutions, '/tasks':renderScanTasks}[location.pathname] || renderScanTasks)(); }
+	    function route() { clearTimeout(routeRefreshTimer); selectedScanTaskID = ''; ({'/assets':renderAssets, '/fingerprints':renderFingerprints, '/reports':renderReports, '/executions':renderImmediateExecutions, '/tasks':renderScanTasks}[location.pathname] || renderScanTasks)(); }
     document.addEventListener('click', event => { const link = event.target.closest('a[data-route]'); if (link) { event.preventDefault(); history.pushState({}, '', link.href); route(); } });
     window.addEventListener('popstate', route); route();
   </script>

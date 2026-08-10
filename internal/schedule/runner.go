@@ -30,6 +30,7 @@ type Runner struct {
 	Clock        Clock
 	PollInterval time.Duration
 	OnClaim      func(context.Context, model.ScanTaskRun)
+	OnRecovered  func(model.ScanTaskRun) error
 }
 
 func NewRunner(db *sql.DB, clock Clock) *Runner {
@@ -55,7 +56,7 @@ func (runner *Runner) RunOnce(ctx context.Context) (*model.ScanTaskRun, error) {
 	if err := storage.FinalizeQueuedCancellation(runner.DB); err != nil {
 		return nil, err
 	}
-	if recovered, err := storage.ClaimQueuedOneTimeScanTaskRun(runner.DB); err != nil {
+	if recovered, err := storage.ClaimQueuedScanTaskRun(runner.DB); err != nil {
 		return nil, err
 	} else if recovered != nil {
 		return recovered, nil
@@ -104,6 +105,8 @@ func (runner *Runner) recordPolicyRun(ctx context.Context, candidate dueCandidat
 	arguments := []interface{}{
 		candidate.scheduledFor.UTC().Format(time.RFC3339Nano),
 		status,
+		model.ScanTaskRunTriggerScheduled,
+		model.ScanTaskRunStageCompleted,
 		candidate.task.ID,
 		model.ScanTaskModeScheduled,
 		model.ScanTaskStatusEnabled,
@@ -119,11 +122,11 @@ func (runner *Runner) recordPolicyRun(ctx context.Context, candidate dueCandidat
 
 	query := `
 		INSERT INTO scan_task_runs
-			(scan_task_id, sequence, scheduled_for, status, target, scan_type, config_json, config_hash, finished_at, created_at, updated_at)
+			(scan_task_id, sequence, scheduled_for, status, trigger, stage, progress, target, scan_type, config_json, config_hash, finished_at, created_at, updated_at)
 		SELECT
 			scan_tasks.id,
 			COALESCE((SELECT MAX(sequence) FROM scan_task_runs WHERE scan_task_id = scan_tasks.id), 0) + 1,
-			?, ?, scan_tasks.target, scan_tasks.scan_type, scan_tasks.config_json, scan_tasks.config_hash, datetime('now'), datetime('now'), datetime('now')
+			?, ?, ?, ?, 100, scan_tasks.target, scan_tasks.scan_type, scan_tasks.config_json, scan_tasks.config_hash, datetime('now'), datetime('now'), datetime('now')
 		FROM scan_tasks
 		WHERE scan_tasks.id = ?
 			AND scan_tasks.mode = ?
@@ -144,6 +147,13 @@ func (runner *Runner) Run(ctx context.Context) error {
 	if err := runner.RecoverStartupState(); err != nil {
 		return err
 	}
+	return runner.RunLoop(ctx)
+}
+
+// RunLoop runs scheduling after startup recovery has completed. Service
+// entrypoints that expose task creation must call RecoverStartupState before
+// they begin accepting requests, then use this method to avoid a second pass.
+func (runner *Runner) RunLoop(ctx context.Context) error {
 	interval := runner.PollInterval
 	if interval <= 0 {
 		interval = defaultPollInterval
@@ -177,7 +187,19 @@ func (runner *Runner) RecoverStartupState() error {
 	if runner.DB == nil {
 		return errors.New("schedule runner database is required")
 	}
-	return storage.FinalizeInterruptedScanTaskRuns(runner.DB)
+	recovered, err := storage.FinalizeInterruptedScanTaskRunsWithResult(runner.DB)
+	if err != nil {
+		return err
+	}
+	if runner.OnRecovered == nil {
+		return nil
+	}
+	for _, run := range recovered {
+		if err := runner.OnRecovered(run); err != nil {
+			return fmt.Errorf("finalize recovered scan task run %d: %w", run.ID, err)
+		}
+	}
+	return nil
 }
 
 type dueCandidate struct {
@@ -236,11 +258,11 @@ func (runner *Runner) claimDueTask(ctx context.Context, candidate dueCandidate) 
 	defer func() { _ = tx.Rollback() }()
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO scan_task_runs
-			(scan_task_id, sequence, scheduled_for, status, target, scan_type, config_json, config_hash, started_at, created_at, updated_at)
+			(scan_task_id, sequence, scheduled_for, status, trigger, stage, progress, target, scan_type, config_json, config_hash, started_at, created_at, updated_at)
 		SELECT
 			scan_tasks.id,
 			COALESCE((SELECT MAX(sequence) FROM scan_task_runs WHERE scan_task_id = scan_tasks.id), 0) + 1,
-			?, ?, scan_tasks.target, scan_tasks.scan_type, scan_tasks.config_json, scan_tasks.config_hash, datetime('now'), datetime('now'), datetime('now')
+			?, ?, ?, ?, 1, scan_tasks.target, scan_tasks.scan_type, scan_tasks.config_json, scan_tasks.config_hash, datetime('now'), datetime('now'), datetime('now')
 		FROM scan_tasks
 		WHERE scan_tasks.id = ?
 			AND scan_tasks.mode = ?
@@ -252,6 +274,8 @@ func (runner *Runner) claimDueTask(ctx context.Context, candidate dueCandidate) 
 		ON CONFLICT(scan_task_id, scheduled_for) DO NOTHING`,
 		candidate.scheduledFor.UTC().Format(time.RFC3339Nano),
 		model.ScanTaskRunStatusRunning,
+		model.ScanTaskRunTriggerScheduled,
+		model.ScanTaskRunStageStarting,
 		candidate.task.ID,
 		model.ScanTaskModeScheduled,
 		model.ScanTaskStatusEnabled,

@@ -69,7 +69,7 @@ func TestRunnerRecoversQueuedOneTimeRunAfterRestart(t *testing.T) {
 func TestRunnerStartupFinalizesOrphanedRunningRunBeforeScheduling(t *testing.T) {
 	db := openRunnerTestDB(t)
 	task := createRunnerTask(t, db, "192.168.11.0/24", "2026-07-24 00:00:00")
-	orphan, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-07-24T02:00:00Z"})
+	orphan, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-07-24T02:00:00Z", Trigger: model.ScanTaskRunTriggerScheduled})
 	if err != nil {
 		t.Fatalf("create orphan run: %v", err)
 	}
@@ -77,12 +77,20 @@ func TestRunnerStartupFinalizesOrphanedRunningRunBeforeScheduling(t *testing.T) 
 		t.Fatalf("mark orphan running: %v", err)
 	}
 	runner := NewRunner(db, ClockFunc(func() time.Time { return time.Date(2026, time.July, 25, 2, 0, 0, 0, time.UTC) }))
+	var recovered []model.ScanTaskRun
+	runner.OnRecovered = func(run model.ScanTaskRun) error {
+		recovered = append(recovered, run)
+		return nil
+	}
 	if err := runner.RecoverStartupState(); err != nil {
 		t.Fatalf("recover startup state: %v", err)
 	}
 	finished, err := storage.GetScanTaskRun(db, orphan.ID)
 	if err != nil || finished.Status != model.ScanTaskRunStatusFailed || finished.ErrorMessage != "interrupted by service restart" || finished.FinishedAt == "" {
 		t.Fatalf("finished orphan=%#v err=%v", finished, err)
+	}
+	if len(recovered) != 1 || recovered[0].ID != orphan.ID || recovered[0].Status != model.ScanTaskRunStatusFailed {
+		t.Fatalf("recovery callback=%#v", recovered)
 	}
 	next, err := runner.RunOnce(context.Background())
 	if err != nil || next == nil || next.Status != model.ScanTaskRunStatusRunning || next.ScheduledFor != "2026-07-25T02:00:00Z" {
@@ -93,7 +101,7 @@ func TestRunnerStartupFinalizesOrphanedRunningRunBeforeScheduling(t *testing.T) 
 func TestRunnerStartupFinalizesOrphanedScheduledQueuedRun(t *testing.T) {
 	db := openRunnerTestDB(t)
 	task := createRunnerTask(t, db, "192.168.12.0/24", "2026-07-24 00:00:00")
-	orphan, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-07-24T02:00:00Z"})
+	orphan, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-07-24T02:00:00Z", Trigger: model.ScanTaskRunTriggerScheduled})
 	if err != nil {
 		t.Fatalf("create queued scheduled run: %v", err)
 	}
@@ -182,6 +190,43 @@ func TestRunnerLoopUsesInjectedClockAndStopsWithContext(t *testing.T) {
 	}
 	cancel()
 	waitGroup.Wait()
+}
+
+func TestRunnerLoopPreservesRunCreatedAfterStartupRecovery(t *testing.T) {
+	db := openRunnerTestDB(t)
+	runner := NewRunner(db, nil)
+	if err := runner.RecoverStartupState(); err != nil {
+		t.Fatalf("recover startup state: %v", err)
+	}
+	task, err := storage.CreateScanTask(db, model.ScanTask{
+		Target:   "192.168.10.10",
+		ScanType: model.ScanTypeIP,
+		Mode:     model.ScanTaskModeOnce,
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	run, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{
+		ScanTaskID:   task.ID,
+		ScheduledFor: "2026-07-24T02:00:00Z",
+		Status:       model.ScanTaskRunStatusRunning,
+	})
+	if err != nil {
+		t.Fatalf("create current-process run: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := runner.RunLoop(ctx); err != nil {
+		t.Fatalf("run scheduling loop: %v", err)
+	}
+	persisted, err := storage.GetScanTaskRun(db, run.ID)
+	if err != nil {
+		t.Fatalf("get current-process run: %v", err)
+	}
+	if persisted.Status != model.ScanTaskRunStatusRunning || persisted.ErrorMessage != "" {
+		t.Fatalf("pure scheduling loop repeated startup recovery: %#v", persisted)
+	}
 }
 
 func TestRunnerRecordsMisfireWithoutReplayingScan(t *testing.T) {
@@ -285,7 +330,7 @@ func openRunnerTestDB(t *testing.T) *sql.DB {
 
 	statements := []string{
 		`CREATE TABLE scan_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, scan_type TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, cron TEXT, timezone TEXT, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, archived_at DATETIME)`,
-		`CREATE TABLE scan_task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_task_id INTEGER NOT NULL, sequence INTEGER NOT NULL, scheduled_for DATETIME NOT NULL, status TEXT NOT NULL, target TEXT NOT NULL, scan_type TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', error_message TEXT, report_path TEXT, audit_report_path TEXT, report_error TEXT, started_at DATETIME, finished_at DATETIME, snapshot_written_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, UNIQUE(scan_task_id, sequence), UNIQUE(scan_task_id, scheduled_for))`,
+		`CREATE TABLE scan_task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_task_id INTEGER NOT NULL, sequence INTEGER NOT NULL, scheduled_for DATETIME NOT NULL, status TEXT NOT NULL, trigger TEXT NOT NULL DEFAULT 'scheduled', stage TEXT NOT NULL DEFAULT 'queued', progress INTEGER NOT NULL DEFAULT 0, target TEXT NOT NULL, scan_type TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', error_message TEXT, report_path TEXT, audit_report_path TEXT, report_error TEXT, started_at DATETIME, finished_at DATETIME, snapshot_written_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, UNIQUE(scan_task_id, sequence), UNIQUE(scan_task_id, scheduled_for))`,
 		`CREATE TABLE fingerprint_imports (id INTEGER PRIMARY KEY, is_active INTEGER NOT NULL)`,
 		`CREATE TABLE scan_task_run_fingerprint_imports (scan_task_run_id INTEGER NOT NULL, fingerprint_import_id INTEGER NOT NULL, PRIMARY KEY(scan_task_run_id, fingerprint_import_id))`,
 	}

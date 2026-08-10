@@ -91,6 +91,10 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	hadRunTrigger, err := sqliteTableHasColumn(db, "scan_task_runs", "trigger")
+	if err != nil {
+		return err
+	}
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS schema_migrations (
 			name TEXT PRIMARY KEY,
@@ -152,6 +156,9 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 			sequence INTEGER NOT NULL,
 			scheduled_for DATETIME NOT NULL,
 			status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'cancel_requested', 'success', 'failed', 'canceled', 'skipped_overlap', 'skipped_misfire')),
+			trigger TEXT NOT NULL DEFAULT 'scheduled',
+			stage TEXT NOT NULL DEFAULT 'queued',
+			progress INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
 			target TEXT NOT NULL,
 			scan_type TEXT NOT NULL CHECK (scan_type IN ('ip', 'subnet')),
 			config_json TEXT NOT NULL DEFAULT '{}',
@@ -489,6 +496,9 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 		`ALTER TABLE scan_task_runs ADD COLUMN report_error TEXT`,
 		`ALTER TABLE scan_task_runs ADD COLUMN audit_report_path TEXT`,
 		`ALTER TABLE scan_task_runs ADD COLUMN snapshot_written_at DATETIME`,
+		`ALTER TABLE scan_task_runs ADD COLUMN stage TEXT NOT NULL DEFAULT 'queued'`,
+		`ALTER TABLE scan_task_runs ADD COLUMN progress INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100)`,
+		`ALTER TABLE scan_task_runs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'scheduled'`,
 		`ALTER TABLE scan_task_run_vulnerabilities ADD COLUMN description TEXT`,
 		`ALTER TABLE scan_task_run_protocol_evidence ADD COLUMN outcome TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE scan_task_run_protocol_evidence ADD COLUMN diagnostic TEXT NOT NULL DEFAULT ''`,
@@ -554,6 +564,11 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 			return err
 		}
 	}
+	if !hadRunTrigger {
+		if err := backfillScanTaskRunLifecycle(db); err != nil {
+			return err
+		}
+	}
 	if err := migrateProtocolEvidenceSchema(db); err != nil {
 		return err
 	}
@@ -572,6 +587,30 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 		return err
 	}
 	return nil
+}
+
+func backfillScanTaskRunLifecycle(db *sql.DB) error {
+	_, err := db.Exec(`
+		UPDATE scan_task_runs
+		SET trigger = CASE
+				WHEN scan_task_id IN (SELECT id FROM scan_tasks WHERE mode = 'once') THEN 'initial'
+				ELSE 'scheduled'
+			END,
+			stage = CASE status
+				WHEN 'running' THEN 'profiling'
+				WHEN 'success' THEN 'completed'
+				WHEN 'failed' THEN 'failed'
+				WHEN 'canceled' THEN 'canceled'
+				WHEN 'skipped_overlap' THEN 'completed'
+				WHEN 'skipped_misfire' THEN 'completed'
+				ELSE 'queued'
+			END,
+			progress = CASE
+				WHEN status IN ('success', 'skipped_overlap', 'skipped_misfire') THEN 100
+				WHEN status = 'running' THEN 1
+				ELSE 0
+			END`)
+	return err
 }
 
 func backfillFingerprintConclusionEvidenceStatus(db *sql.DB) error {
@@ -1003,6 +1042,9 @@ CREATE TABLE IF NOT EXISTS scan_task_runs (
     sequence      INTEGER NOT NULL,
     scheduled_for DATETIME NOT NULL,
     status        TEXT NOT NULL CHECK (status IN ('queued', 'running', 'cancel_requested', 'success', 'failed', 'canceled', 'skipped_overlap', 'skipped_misfire')),
+    trigger       TEXT NOT NULL DEFAULT 'scheduled',
+    stage         TEXT NOT NULL DEFAULT 'queued',
+    progress      INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
     target        TEXT NOT NULL,
     scan_type     TEXT NOT NULL CHECK (scan_type IN ('ip', 'subnet')),
     config_json   TEXT NOT NULL DEFAULT '{}',

@@ -13,10 +13,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"golandproject/yscan/internal/diff"
 	"golandproject/yscan/internal/model"
-	"golandproject/yscan/internal/pipeline"
 	"golandproject/yscan/internal/report"
 	"golandproject/yscan/internal/schedule"
 	"golandproject/yscan/internal/storage"
@@ -29,19 +30,14 @@ type ScanTaskCreator interface {
 	Create(context.Context, model.ScanTask) (model.ScanTask, *model.ScanTaskRun, error)
 }
 
+type ScanTaskRunOperator interface {
+	ScanTaskCreator
+	RunNow(context.Context, int64) (model.ScanTaskRun, bool, error)
+}
+
 type ScanTaskRunStarter func(context.Context, model.ScanTaskRun)
 
 type AccessPolicy struct{ TrustedCIDRs []string }
-
-type createTaskRequest struct {
-	Type   string `json:"type"`
-	Target string `json:"target"`
-}
-
-type createTaskResponse struct {
-	TaskID int64  `json:"task_id"`
-	Status string `json:"status"`
-}
 
 type createScanTaskRequest struct {
 	Target   string               `json:"target"`
@@ -79,7 +75,12 @@ func StartServerWithScanTasks(db *sql.DB, addr string, runTask TaskRunner, creat
 }
 
 func StartServerWithScanTasksAndAccessPolicy(db *sql.DB, addr string, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter, policy AccessPolicy) error {
-	handler, err := newHandlerWithScanTasks(db, runTask, creator, startRun)
+	return StartServerWithScanTasksAndAccessPolicyContext(context.Background(), db, addr, runTask, creator, startRun, policy)
+}
+
+func StartServerWithScanTasksAndAccessPolicyContext(ctx context.Context, db *sql.DB, addr string, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter, policy AccessPolicy) error {
+	var activeRuns sync.WaitGroup
+	handler, err := newHandlerWithScanTasksContextAndGroup(ctx, db, runTask, creator, startRun, &activeRuns)
 	if err != nil {
 		return err
 	}
@@ -87,8 +88,34 @@ func StartServerWithScanTasksAndAccessPolicy(db *sql.DB, addr string, runTask Ta
 		return err
 	}
 
+	server := &http.Server{Addr: addr, Handler: policy.Wrap(handler), ReadHeaderTimeout: 10 * time.Second}
+	listenResult := make(chan error, 1)
+	go func() { listenResult <- server.ListenAndServe() }()
 	log.Printf("API server listening on %s", addr)
-	return http.ListenAndServe(addr, policy.Wrap(handler))
+	select {
+	case err := <-listenResult:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownContext); err != nil {
+			return fmt.Errorf("graceful API shutdown: %w", err)
+		}
+		runsStopped := make(chan struct{})
+		go func() { activeRuns.Wait(); close(runsStopped) }()
+		select {
+		case <-runsStopped:
+		case <-shutdownContext.Done():
+			return errors.New("graceful API shutdown timed out waiting for active scans")
+		}
+		if err := <-listenResult; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	}
 }
 
 func (policy AccessPolicy) Validate(addr string) error {
@@ -145,11 +172,39 @@ func newHandler(db *sql.DB, runTask TaskRunner) (http.Handler, error) {
 }
 
 func newHandlerWithScanTasks(db *sql.DB, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter) (http.Handler, error) {
+	return newHandlerWithScanTasksContext(context.Background(), db, runTask, creator, startRun)
+}
+
+func newHandlerWithScanTasksContext(serviceContext context.Context, db *sql.DB, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter) (http.Handler, error) {
+	return newHandlerWithScanTasksContextAndGroup(serviceContext, db, runTask, creator, startRun, nil)
+}
+
+func newHandlerWithScanTasksContextAndGroup(serviceContext context.Context, db *sql.DB, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter, activeRuns *sync.WaitGroup) (http.Handler, error) {
 	if runTask == nil {
 		return nil, fmt.Errorf("task runner is required")
 	}
+	if serviceContext == nil {
+		serviceContext = context.Background()
+	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		if db == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "error": "database is unavailable"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
 
 	mux.HandleFunc("/api/tasks", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -161,45 +216,7 @@ func newHandlerWithScanTasks(db *sql.DB, runTask TaskRunner, creator ScanTaskCre
 			}
 			writeJSON(w, http.StatusOK, tasks)
 		case http.MethodPost:
-			var req createTaskRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
-				return
-			}
-
-			req.Type = strings.TrimSpace(req.Type)
-			req.Target = strings.TrimSpace(req.Target)
-			if req.Type == "" || req.Target == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "type and target are required"})
-				return
-			}
-
-			supported := map[string]bool{
-				model.TaskTypeScanIP:          true,
-				model.TaskTypeScanIPVuln:      true,
-				model.TaskTypeScanSubnet:      true,
-				model.TaskTypeScanSubnetVuln:  true,
-				model.TaskTypeVulnIP:          true,
-				model.TaskTypeCollectDomain:   true,
-				model.TaskTypeCollectAndScan:  true,
-				model.TaskTypeCollectScanVuln: true,
-			}
-			if !supported[req.Type] {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported task type"})
-				return
-			}
-			if (req.Type == model.TaskTypeScanSubnet || req.Type == model.TaskTypeScanSubnetVuln) && !pipeline.IsIPv4CIDR(req.Target) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "subnet task target must be an IPv4 CIDR"})
-				return
-			}
-
-			taskID, err := runTask(req.Type, req.Target)
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-				return
-			}
-
-			writeJSON(w, http.StatusAccepted, createTaskResponse{TaskID: taskID, Status: model.TaskStatusQueued})
+			writeJSON(w, http.StatusGone, map[string]string{"error": "legacy task creation is disabled; use /api/scan-tasks"})
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		}
@@ -236,11 +253,7 @@ func newHandlerWithScanTasks(db *sql.DB, runTask TaskRunner, creator ScanTaskCre
 					writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 					return
 				}
-				if err := storage.CancelTask(db, taskID); err != nil {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-					return
-				}
-				writeJSON(w, http.StatusOK, map[string]interface{}{"task_id": taskID, "status": model.TaskStatusCancelRequested})
+				writeJSON(w, http.StatusGone, map[string]string{"error": "legacy task cancellation is disabled; use /api/scan-tasks"})
 				return
 			case "findings":
 				if r.Method != http.MethodGet {
@@ -325,7 +338,7 @@ func newHandlerWithScanTasks(db *sql.DB, runTask TaskRunner, creator ScanTaskCre
 				return
 			}
 			if run != nil && startRun != nil {
-				go startRun(context.Background(), *run)
+				launchScanTaskRun(serviceContext, activeRuns, startRun, *run)
 			}
 			writeJSON(w, http.StatusCreated, createScanTaskResponse{Task: task, Run: run})
 		default:
@@ -400,6 +413,25 @@ func newHandlerWithScanTasks(db *sql.DB, runTask TaskRunner, creator ScanTaskCre
 				return
 			}
 			writeJSON(w, http.StatusOK, runs)
+		case "run-now":
+			if r.Method != http.MethodPost {
+				writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+				return
+			}
+			operator, ok := creator.(ScanTaskRunOperator)
+			if !ok {
+				writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "run-now is unavailable"})
+				return
+			}
+			run, launch, err := operator.RunNow(r.Context(), taskID)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			if launch && startRun != nil {
+				launchScanTaskRun(serviceContext, activeRuns, startRun, run)
+			}
+			writeJSON(w, http.StatusAccepted, map[string]interface{}{"run": run, "started": launch})
 		case "pause", "resume", "archive":
 			if r.Method != http.MethodPost {
 				writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -589,6 +621,18 @@ func newHandlerWithScanTasks(db *sql.DB, runTask TaskRunner, creator ScanTaskCre
 	mux.Handle("/", web.Handler())
 
 	return mux, nil
+}
+
+func launchScanTaskRun(ctx context.Context, activeRuns *sync.WaitGroup, startRun ScanTaskRunStarter, run model.ScanTaskRun) {
+	if activeRuns != nil {
+		activeRuns.Add(1)
+	}
+	go func() {
+		if activeRuns != nil {
+			defer activeRuns.Done()
+		}
+		startRun(ctx, run)
+	}()
 }
 
 func optionalPositiveInt(value string, fallback int) (int, error) {

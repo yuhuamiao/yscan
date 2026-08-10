@@ -1,0 +1,25 @@
+[Unit]
+Description=CAASM internal asset management service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=caasm
+Group=caasm
+WorkingDirectory=/var/lib/caasm
+EnvironmentFile=-/etc/caasm/yscan.env
+ExecStart=/usr/local/bin/yscan api 127.0.0.1:8080
+ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5; do /usr/bin/curl --fail --silent http://127.0.0.1:8080/api/healthz >/dev/null && exit 0; sleep 1; done; exit 1'
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/caasm
+
+[Install]
+WantedBy=multi-user.target

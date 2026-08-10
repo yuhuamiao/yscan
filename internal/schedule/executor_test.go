@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +39,27 @@ func TestExecutorPersistsSnapshotAndSuccessfulRun(t *testing.T) {
 	snapshot, err := storage.GetScanTaskRunSnapshot(db, run.ID)
 	if err != nil || len(snapshot.Hosts) != 1 || snapshot.Hosts[0].IP != "192.168.10.10" {
 		t.Fatalf("stored snapshot = %#v, error = %v", snapshot, err)
+	}
+}
+
+func TestExecutorRejectsLegacyPublicTargetBeforeNetworkWork(t *testing.T) {
+	db := openExecutorTestDB(t)
+	task := createRunnerTask(t, db, "8.8.8.8", "2026-07-24 00:00:00")
+	run, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-07-24T02:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executed := false
+	executor := NewExecutor(db, ScanTaskRunExecutorFunc(func(context.Context, model.ScanTaskRun) (model.ScanTaskRunSnapshot, error) {
+		executed = true
+		return model.ScanTaskRunSnapshot{}, nil
+	}))
+	if err := executor.ExecuteRun(context.Background(), run.ID); err != nil {
+		t.Fatalf("reject public run: %v", err)
+	}
+	failed, err := storage.GetScanTaskRun(db, run.ID)
+	if err != nil || executed || failed.Status != model.ScanTaskRunStatusFailed || !strings.Contains(failed.ErrorMessage, "internal IPv4") {
+		t.Fatalf("failed=%#v executed=%v err=%v", failed, executed, err)
 	}
 }
 

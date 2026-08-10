@@ -62,7 +62,7 @@ func TestTaskServiceCreatesScheduledTaskWithoutInitialRun(t *testing.T) {
 	}
 }
 
-func TestTaskServiceNormalizesSubnetAndAcceptsExplicitIPv4Targets(t *testing.T) {
+func TestTaskServiceNormalizesSubnetAndRejectsPublicIPv4Targets(t *testing.T) {
 	db := openRunnerTestDB(t)
 	service := NewTaskService(db, ClockFunc(func() time.Time { return time.Date(2026, time.July, 24, 2, 0, 0, 0, time.UTC) }))
 	task, _, err := service.Create(context.Background(), model.ScanTask{
@@ -75,13 +75,16 @@ func TestTaskServiceNormalizesSubnetAndAcceptsExplicitIPv4Targets(t *testing.T) 
 	if err != nil || task.Target != "192.168.10.0/24" {
 		t.Fatalf("normalized task = %#v, error = %v", task, err)
 	}
-	public, _, err := service.Create(context.Background(), model.ScanTask{
+	if _, _, err := service.Create(context.Background(), model.ScanTask{
 		Target:   "8.8.8.8",
 		ScanType: model.ScanTypeIP,
 		Mode:     model.ScanTaskModeOnce,
-	})
-	if err != nil || public.Target != "8.8.8.8" {
-		t.Fatalf("public IP task = %#v, error = %v", public, err)
+	}); err == nil {
+		t.Fatal("public IP task must be rejected")
+	}
+	loopback, _, err := service.Create(context.Background(), model.ScanTask{Target: "127.0.0.1", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeOnce})
+	if err != nil || loopback.Target != "127.0.0.1" {
+		t.Fatalf("loopback acceptance task=%#v err=%v", loopback, err)
 	}
 	if _, _, err := service.Create(context.Background(), model.ScanTask{
 		Target:   "not-an-ip",
@@ -89,6 +92,16 @@ func TestTaskServiceNormalizesSubnetAndAcceptsExplicitIPv4Targets(t *testing.T) 
 		Mode:     model.ScanTaskModeOnce,
 	}); err == nil {
 		t.Fatal("non-IP target must be rejected")
+	}
+	for _, target := range []string{"169.254.1.1", "224.0.0.1", "0.0.0.0"} {
+		if _, err := NormalizeInternalScanTarget(model.ScanTypeIP, target); err == nil {
+			t.Fatalf("non-internal IP accepted: %s", target)
+		}
+	}
+	for _, target := range []string{"10.0.0.0/7", "127.0.0.0/7", "192.168.0.0/15", "8.8.8.0/24"} {
+		if _, err := NormalizeInternalScanTarget(model.ScanTypeSubnet, target); err == nil {
+			t.Fatalf("CIDR crossing internal boundary accepted: %s", target)
+		}
 	}
 }
 
@@ -133,5 +146,27 @@ func TestTaskServiceRejectsInvalidPortSpecOnCreateAndUpdate(t *testing.T) {
 	task.Config.PortSpec = "invalid"
 	if _, err := service.Update(context.Background(), task); err == nil {
 		t.Fatal("invalid update port_spec was accepted")
+	}
+}
+
+func TestTaskServiceRunNowStartsInitialAndScheduledManualRuns(t *testing.T) {
+	db := openRunnerTestDB(t)
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 123, time.UTC)
+	service := NewTaskService(db, ClockFunc(func() time.Time { return now }))
+	once, initial, err := service.Create(context.Background(), model.ScanTask{Target: "192.168.44.10", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeOnce})
+	if err != nil || initial == nil {
+		t.Fatalf("create once task=%#v run=%#v err=%v", once, initial, err)
+	}
+	returned, start, err := service.RunNow(context.Background(), once.ID)
+	if err != nil || !start || returned.ID != initial.ID || returned.Trigger != model.ScanTaskRunTriggerInitial {
+		t.Fatalf("run initial now=%#v start=%t err=%v", returned, start, err)
+	}
+	scheduled, _, err := service.Create(context.Background(), model.ScanTask{Target: "192.168.45.0/24", ScanType: model.ScanTypeSubnet, Mode: model.ScanTaskModeScheduled, Cron: "0 2 * * *", Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manual, start, err := service.RunNow(context.Background(), scheduled.ID)
+	if err != nil || !start || manual.Trigger != model.ScanTaskRunTriggerManual || manual.ScheduledFor != now.Format(time.RFC3339Nano) {
+		t.Fatalf("scheduled run now=%#v start=%t err=%v", manual, start, err)
 	}
 }

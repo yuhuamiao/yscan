@@ -46,10 +46,34 @@ func CancelScanTaskRun(db *sql.DB, scanTaskID, runID int64) error {
 	return ErrScanTaskRunNotCancelable
 }
 
+// UpdateScanTaskRunProgress persists a bounded user-facing execution phase.
+// Terminal status remains authoritative; progress never changes run outcome.
+func UpdateScanTaskRunProgress(db *sql.DB, runID int64, stage string, progress int) error {
+	stage = strings.TrimSpace(stage)
+	if !model.IsScanTaskRunStage(stage) {
+		return fmt.Errorf("invalid scan task run stage: %s", stage)
+	}
+	if progress < 0 || progress > 100 {
+		return fmt.Errorf("scan task run progress must be between 0 and 100: %d", progress)
+	}
+	result, err := db.Exec(`UPDATE scan_task_runs SET stage = ?, progress = ?, updated_at = datetime('now') WHERE id = ?`, stage, progress, runID)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return ErrScanTaskRunNotFound
+	}
+	return nil
+}
+
 // FinalizeQueuedCancellation turns an accepted request for work that never
 // started into its terminal audit state.
 func FinalizeQueuedCancellation(db *sql.DB) error {
-	_, err := db.Exec(`UPDATE scan_task_runs SET status = ?, error_message = ?, finished_at = datetime('now'), updated_at = datetime('now') WHERE status = ? AND started_at IS NULL`, model.ScanTaskRunStatusCanceled, "canceled by request", model.ScanTaskRunStatusCancelRequested)
+	_, err := db.Exec(`UPDATE scan_task_runs SET status = ?, stage = ?, error_message = ?, finished_at = datetime('now'), updated_at = datetime('now') WHERE status = ? AND started_at IS NULL`, model.ScanTaskRunStatusCanceled, model.ScanTaskRunStageCanceled, "canceled by request", model.ScanTaskRunStatusCancelRequested)
 	return err
 }
 
@@ -57,27 +81,70 @@ func FinalizeQueuedCancellation(db *sql.DB) error {
 // scheduler starts. No in-memory worker survives a process restart, so active
 // rows from a prior process must not retain the global execution slot.
 func FinalizeInterruptedScanTaskRuns(db *sql.DB) error {
+	_, err := FinalizeInterruptedScanTaskRunsWithResult(db)
+	return err
+}
+
+// FinalizeInterruptedScanTaskRunsWithResult returns only rows transitioned by
+// this startup recovery, allowing the caller to create terminal reports after
+// the transaction has committed.
+func FinalizeInterruptedScanTaskRunsWithResult(db *sql.DB) ([]model.ScanTaskRun, error) {
 	tx, err := db.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`UPDATE scan_task_runs SET status = ?, error_message = ?, finished_at = datetime('now'), updated_at = datetime('now') WHERE status = ?`, model.ScanTaskRunStatusCanceled, "canceled during service restart", model.ScanTaskRunStatusCancelRequested); err != nil {
-		return err
+	rows, err := tx.Query(`
+		SELECT id FROM scan_task_runs
+		WHERE status IN (?, ?)
+			OR (status = ? AND trigger = ? AND scan_task_id IN (SELECT id FROM scan_tasks WHERE mode = ?))
+		ORDER BY id`, model.ScanTaskRunStatusRunning, model.ScanTaskRunStatusCancelRequested, model.ScanTaskRunStatusQueued, model.ScanTaskRunTriggerScheduled, model.ScanTaskModeScheduled)
+	if err != nil {
+		return nil, err
 	}
-	if _, err := tx.Exec(`UPDATE scan_task_runs SET status = ?, error_message = ?, finished_at = datetime('now'), updated_at = datetime('now') WHERE status = ?`, model.ScanTaskRunStatusFailed, "interrupted by service restart", model.ScanTaskRunStatusRunning); err != nil {
-		return err
+	var recoveredIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		recoveredIDs = append(recoveredIDs, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`UPDATE scan_task_runs SET status = ?, stage = ?, error_message = ?, finished_at = datetime('now'), updated_at = datetime('now') WHERE status = ?`, model.ScanTaskRunStatusCanceled, model.ScanTaskRunStageCanceled, "canceled during service restart", model.ScanTaskRunStatusCancelRequested); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`UPDATE scan_task_runs SET status = ?, stage = ?, error_message = ?, finished_at = datetime('now'), updated_at = datetime('now') WHERE status = ?`, model.ScanTaskRunStatusFailed, model.ScanTaskRunStageFailed, "interrupted by service restart", model.ScanTaskRunStatusRunning); err != nil {
+		return nil, err
 	}
 	if _, err := tx.Exec(`
 		UPDATE scan_task_runs
-		SET status = ?, error_message = ?, finished_at = datetime('now'), updated_at = datetime('now')
+		SET status = ?, stage = ?, progress = 100, error_message = ?, finished_at = datetime('now'), updated_at = datetime('now')
 		WHERE status = ?
+			AND trigger = ?
 			AND scan_task_id IN (SELECT id FROM scan_tasks WHERE mode = ?)`,
-		model.ScanTaskRunStatusSkippedMisfire, "skipped because service restarted before execution", model.ScanTaskRunStatusQueued, model.ScanTaskModeScheduled,
+		model.ScanTaskRunStatusSkippedMisfire, model.ScanTaskRunStageCompleted, "skipped because service restarted before execution", model.ScanTaskRunStatusQueued, model.ScanTaskRunTriggerScheduled, model.ScanTaskModeScheduled,
 	); err != nil {
-		return err
+		return nil, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	recovered := make([]model.ScanTaskRun, 0, len(recoveredIDs))
+	for _, id := range recoveredIDs {
+		run, err := GetScanTaskRun(db, id)
+		if err != nil {
+			return nil, err
+		}
+		recovered = append(recovered, run)
+	}
+	return recovered, nil
 }
 
 // ExpiredScanTaskRun is a terminal run eligible for retention cleanup. The
@@ -121,6 +188,17 @@ func CreateScanTaskRun(db *sql.DB, run model.ScanTaskRun) (model.ScanTaskRun, er
 	if task.Status != model.ScanTaskStatusEnabled {
 		return model.ScanTaskRun{}, fmt.Errorf("%w: %s", ErrScanTaskNotEnabled, task.Status)
 	}
+	run.Trigger = strings.TrimSpace(run.Trigger)
+	if run.Trigger == "" {
+		if task.Mode == model.ScanTaskModeOnce {
+			run.Trigger = model.ScanTaskRunTriggerInitial
+		} else {
+			run.Trigger = model.ScanTaskRunTriggerManual
+		}
+	}
+	if run.Trigger != model.ScanTaskRunTriggerInitial && run.Trigger != model.ScanTaskRunTriggerManual && run.Trigger != model.ScanTaskRunTriggerScheduled {
+		return model.ScanTaskRun{}, fmt.Errorf("invalid scan task run trigger: %s", run.Trigger)
+	}
 	if task.Mode == model.ScanTaskModeOnce {
 		var existingRuns int
 		if err := tx.QueryRow(`SELECT COUNT(1) FROM scan_task_runs WHERE scan_task_id = ?`, run.ScanTaskID).Scan(&existingRuns); err != nil {
@@ -149,12 +227,13 @@ func CreateScanTaskRun(db *sql.DB, run model.ScanTaskRun) (model.ScanTaskRun, er
 
 	result, err := tx.Exec(`
 		INSERT INTO scan_task_runs
-			(scan_task_id, sequence, scheduled_for, status, target, scan_type, config_json, config_hash, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+			(scan_task_id, sequence, scheduled_for, status, trigger, target, scan_type, config_json, config_hash, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
 		run.ScanTaskID,
 		run.Sequence,
 		run.ScheduledFor,
 		run.Status,
+		run.Trigger,
 		run.Target,
 		run.ScanType,
 		string(configJSON),
@@ -205,10 +284,9 @@ func ListScanTaskRuns(db *sql.DB, scanTaskID int64) ([]model.ScanTaskRun, error)
 	return runs, nil
 }
 
-// ClaimQueuedOneTimeScanTaskRun recovers one persisted once run after a
-// process restart. The queued -> running transition is the claim token, so
-// competing schedulers cannot execute the same recovered run.
-func ClaimQueuedOneTimeScanTaskRun(db *sql.DB) (*model.ScanTaskRun, error) {
+// ClaimQueuedScanTaskRun claims an initial or explicitly manual run. Cron
+// occurrences use the due-run path and are never silently backfilled here.
+func ClaimQueuedScanTaskRun(db *sql.DB) (*model.ScanTaskRun, error) {
 	tx, err := db.Begin()
 	if err != nil {
 		return nil, err
@@ -219,14 +297,14 @@ func ClaimQueuedOneTimeScanTaskRun(db *sql.DB) (*model.ScanTaskRun, error) {
 		SELECT run.id
 		FROM scan_task_runs AS run
 		JOIN scan_tasks AS task ON task.id = run.scan_task_id
-		WHERE run.status = ? AND task.mode = ? AND task.status = ?
+		WHERE run.status = ? AND run.trigger IN (?, ?) AND task.status = ?
 			AND NOT EXISTS (
 				SELECT 1 FROM scan_task_runs AS active
 				WHERE active.id <> run.id AND active.status IN (?, ?)
 			)
 		ORDER BY run.created_at ASC, run.id ASC
 		LIMIT 1`,
-		model.ScanTaskRunStatusQueued, model.ScanTaskModeOnce, model.ScanTaskStatusEnabled,
+		model.ScanTaskRunStatusQueued, model.ScanTaskRunTriggerInitial, model.ScanTaskRunTriggerManual, model.ScanTaskStatusEnabled,
 		model.ScanTaskRunStatusRunning, model.ScanTaskRunStatusCancelRequested,
 	).Scan(&runID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -235,7 +313,7 @@ func ClaimQueuedOneTimeScanTaskRun(db *sql.DB) (*model.ScanTaskRun, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := tx.Exec(`UPDATE scan_task_runs SET status = ?, started_at = COALESCE(started_at, datetime('now')), updated_at = datetime('now') WHERE id = ? AND status = ?`, model.ScanTaskRunStatusRunning, runID, model.ScanTaskRunStatusQueued)
+	result, err := tx.Exec(`UPDATE scan_task_runs SET status = ?, stage = ?, progress = CASE WHEN progress < 1 THEN 1 ELSE progress END, started_at = COALESCE(started_at, datetime('now')), updated_at = datetime('now') WHERE id = ? AND status = ?`, model.ScanTaskRunStatusRunning, model.ScanTaskRunStageStarting, runID, model.ScanTaskRunStatusQueued)
 	if err != nil {
 		return nil, err
 	}
@@ -263,6 +341,10 @@ func ClaimQueuedOneTimeScanTaskRun(db *sql.DB) (*model.ScanTaskRun, error) {
 		return nil, err
 	}
 	return &run, nil
+}
+
+func ClaimQueuedOneTimeScanTaskRun(db *sql.DB) (*model.ScanTaskRun, error) {
+	return ClaimQueuedScanTaskRun(db)
 }
 
 // ListExpiredTerminalScanTaskRuns returns terminal runs older than cutoff.
@@ -716,7 +798,7 @@ func isMissingTemplateCandidateTable(err error) bool {
 }
 
 const scanTaskRunSelect = `
-	SELECT id, scan_task_id, sequence, scheduled_for, status, target, scan_type, config_json, config_hash,
+	SELECT id, scan_task_id, sequence, scheduled_for, status, trigger, stage, progress, target, scan_type, config_json, config_hash,
 		error_message, report_path, audit_report_path, report_error, started_at, finished_at, snapshot_written_at, created_at, updated_at
 	FROM scan_task_runs`
 
@@ -733,6 +815,9 @@ func scanScanTaskRun(scanner scanTaskRunScanner) (model.ScanTaskRun, error) {
 		&run.Sequence,
 		&run.ScheduledFor,
 		&run.Status,
+		&run.Trigger,
+		&run.Stage,
+		&run.Progress,
 		&run.Target,
 		&run.ScanType,
 		&configJSON,

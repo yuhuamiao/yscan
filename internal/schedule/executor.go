@@ -82,6 +82,9 @@ func (executor *Executor) ExecuteClaimedRun(ctx context.Context, runID int64) er
 
 func (executor *Executor) executeStartedRun(ctx context.Context, run model.ScanTaskRun) error {
 	runID := run.ID
+	if _, err := NormalizeInternalScanTarget(run.ScanType, run.Target); err != nil {
+		return executor.completeRun(runID, model.ScanTaskRunStatusFailed, err.Error())
+	}
 	runCtx, stopRunContext := executor.runContext(ctx, runID)
 	defer stopRunContext()
 	snapshot, executionErr := executor.Run.Execute(runCtx, run)
@@ -103,6 +106,9 @@ func (executor *Executor) executeStartedRun(ctx context.Context, run model.ScanT
 		return executor.completeRun(runID, status, message)
 	}
 	snapshot.RunID = runID
+	if err := storage.UpdateScanTaskRunProgress(executor.DB, runID, model.ScanTaskRunStageSnapshot, 95); err != nil {
+		return err
+	}
 	if err := storage.SaveScanTaskRunSnapshot(executor.DB, snapshot); err != nil {
 		terminalErr := executor.completeRun(runID, model.ScanTaskRunStatusFailed, fmt.Sprintf("persist run snapshot: %v", err))
 		if terminalErr != nil {
@@ -161,13 +167,15 @@ func (executor *Executor) HandleClaim(ctx context.Context, run model.ScanTaskRun
 func (executor *Executor) markRunning(ctx context.Context, runID int64) error {
 	result, err := executor.DB.ExecContext(ctx, `
 		UPDATE scan_task_runs
-		SET status = ?, started_at = COALESCE(started_at, datetime('now')), updated_at = datetime('now')
+		SET status = ?, stage = ?, progress = CASE WHEN progress < 1 THEN 1 ELSE progress END,
+			started_at = COALESCE(started_at, datetime('now')), updated_at = datetime('now')
 		WHERE id = ? AND status = ?
 			AND NOT EXISTS (
 				SELECT 1 FROM scan_task_runs AS active
 				WHERE active.id <> scan_task_runs.id AND active.status IN (?, ?)
 			)`,
 		model.ScanTaskRunStatusRunning,
+		model.ScanTaskRunStageStarting,
 		runID,
 		model.ScanTaskRunStatusQueued,
 		model.ScanTaskRunStatusRunning,
@@ -197,10 +205,17 @@ func (executor *Executor) markRunning(ctx context.Context, runID int64) error {
 }
 
 func (executor *Executor) markTerminal(runID int64, status, message string) error {
+	stage := model.ScanTaskRunStageFailed
+	if status == model.ScanTaskRunStatusSuccess {
+		stage = model.ScanTaskRunStageSnapshot
+	} else if status == model.ScanTaskRunStatusCanceled {
+		stage = model.ScanTaskRunStageCanceled
+	}
 	result, err := executor.DB.Exec(`
 		UPDATE scan_task_runs
 		SET
 			status = CASE WHEN status = ? THEN ? ELSE ? END,
+			stage = CASE WHEN status = ? THEN ? ELSE ? END,
 			error_message = CASE WHEN status = ? THEN ? ELSE ? END,
 			finished_at = datetime('now'),
 			updated_at = datetime('now')
@@ -208,6 +223,9 @@ func (executor *Executor) markTerminal(runID int64, status, message string) erro
 		model.ScanTaskRunStatusCancelRequested,
 		model.ScanTaskRunStatusCanceled,
 		status,
+		model.ScanTaskRunStatusCancelRequested,
+		model.ScanTaskRunStageCanceled,
+		stage,
 		model.ScanTaskRunStatusCancelRequested,
 		"canceled by request",
 		message,

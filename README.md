@@ -4,7 +4,7 @@
 
 `yscan` 是一个以 Go 实现、面向企业内网的资产持续发现与风险验证工具。它以单机部署和 SQLite 状态模型为基础，把网段发现、端口与服务画像、增量变化跟踪、定向漏洞验证和轻 Web 控制台连接为一条可持续运行的闭环。
 
-> 当前版本聚焦经授权的企业内网环境。域名收集能力保留用于授权测试与资产核验，但本项目不提供互联网测绘、未授权扫描或重型安全运营平台能力。
+> 当前版本聚焦经授权的企业内网 IPv4 环境。历史域名任务数据仍可读取，但 V2 不提供域名收集、公网测绘、未授权扫描或重型安全运营平台能力。
 
 ## 为什么是 yscan
 
@@ -27,7 +27,6 @@
 | 服务画像 | 单 IP 全端口或显式端口集合、网段基线或显式端口集合、TCP/Web 统一指纹 | 规则命中保留来源修订、规则 ID、版本/CPE、证据摘要与冲突候选 |
 | 资产状态管理 | SQLite IP 聚合库存与范围主机/端口成员关系 | 记录全局和范围级 `first_seen`、`last_seen`、`is_active`，重叠 CIDR 的主机和端口变化互不覆盖 |
 | 漏洞验证 | 本地 [Nuclei](https://github.com/projectdiscovery/nuclei) 调用与 JSONL 解析 | 使用本地 templates，服务标签只缩小候选范围，默认排除 `intrusive`、`dos`、`auth` |
-| 域名资产收集 | crt.sh、搜索引擎、DNS 字典爆破、DNS 活性验证 | 支持 `internal`、`external`、`hybrid` DNS 策略，以及泛解析/CNAME 聚合干扰处理 |
 | 报告 | Markdown 运行报告 | 每轮 `ScanTaskRun` 终态后生成 `reports/scan-task-<taskId>-run-<runId>.md` |
 | 接口与控制台 | HTTP API + 轻 Web 控制台 | 支持逻辑任务、运行历史、变化、漏洞与运行级报告查看 |
 
@@ -40,11 +39,11 @@ CLI / HTTP API / Web Console
             |
   +---------+----------+
   |                    |
-Subnet workflow     Domain workflow
+Single target      Subnet workflow
   |                    |
-Host discovery      Passive / active discovery
+Full/selected ports Host discovery
   |                    |
-Quick port profile  DNS validation and filtering
+Protocol profile   Baseline/selected ports
   |                    |
 Service and banner identification
             |
@@ -99,7 +98,10 @@ go build -o yscan .
 ```bash
 ./yscan scan 192.168.10.0/24
 ./yscan subnet 192.168.10.0/24 --vuln
+./yscan subnet 192.168.10.0/24 --port-spec 22,80,443,8000-8100
 ```
+
+`scan` 和 `subnet` 都创建 V2 一次性 `ScanTaskRun`，因此 CLI、API 和 Web 会看到同一份任务、资产快照、Diff 与报告。目标仅允许 RFC1918 或本机 Loopback IPv4；公网、Link-local、组播和跨越内外网边界的 CIDR 会在创建任务前被拒绝。
 
 启用 `--vuln` 前，请确认 Nuclei 二进制和模板目录已就绪：
 
@@ -112,38 +114,31 @@ go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 
 所有 Nuclei 调用默认传入 `-exclude-tags intrusive,dos,auth`。服务标签只用于缩小模板候选范围，不代表模板一定无副作用；生产环境仍应审查实际模板内容并先在受控资产上验证。
 
-### 单目标扫描与直接验证
+### 单目标扫描与漏洞验证
 
 ```bash
 ./yscan scan 192.168.1.10
 ./yscan --templates /path/to/nuclei-templates scan 192.168.1.10 --vuln
-./yscan --templates /path/to/nuclei-templates vuln 192.168.1.10:8080
+./yscan scan 192.168.1.10 --port-spec 22,80,443,8080
 ```
 
-`vuln <ip>` 会优先使用数据库中该 IP 的历史开放端口；没有历史结果时默认使用 `80`。
+旧 V1 的直接 `vuln` 与 `domain` 任务创建入口已关闭。漏洞验证通过 V2 `scan --vuln` 或 ScanTask 配置启用；旧数据只能用 `legacy-list`、`legacy-status` 和 `legacy-findings` 读取。
 
-### 域名资产收集
+### DNS 解析策略
 
-```bash
-./yscan --dns-mode internal domain corp.local
-./yscan --dns-mode internal domain corp.local --scan
-./yscan --templates /path/to/nuclei-templates --dns-mode external \
-  domain example.com --scan --vuln
-```
-
-DNS 模式用于处理内网、代理/TUN 和外网解析视角的冲突：
+DNS 模式用于处理 V2 工作流中的内网解析视角：
 
 | 模式 | 行为 | 典型场景 |
 | --- | --- | --- |
 | `internal` | 保留私网地址 | 企业办公网、IDC 内网、实验室 |
-| `external` | 过滤 RFC1918、Loopback、Link-local 等地址 | 经授权的外部资产核验、TUN/透明代理环境 |
-| `hybrid` | 同时保留公网与私网地址 | 解析边界尚不明确的混合网络 |
+| `external` | 过滤 RFC1918、Loopback、Link-local 等地址 | 兼容历史配置，不扩大扫描目标准入范围 |
+| `hybrid` | 同时解析不同视角 | 兼容历史配置，最终扫描目标仍须通过内网校验 |
 
 对于明确的本地代理污染网段，可重复传入 `--dns-deny-cidr`：
 
 ```bash
-./yscan --dns-mode external --dns-deny-cidr 192.168.18.0/24 \
-  domain example.com --scan
+./yscan --dns-mode internal --dns-deny-cidr 192.168.18.0/24 \
+  subnet 192.168.10.0/24
 ```
 
 被动收集结果仍会经过 DNS 活性校验；泛解析过滤只作用于主动字典爆破结果，避免误删被动发现到的资产线索。
@@ -161,6 +156,7 @@ DNS 模式用于处理内网、代理/TUN 和外网解析视角的冲突：
 - 控制台：`http://127.0.0.1:8080/tasks`
 - 资产列表：`http://127.0.0.1:8080/assets`
 - 漏洞与报告：`http://127.0.0.1:8080/reports`
+- 健康检查：`http://127.0.0.1:8080/api/healthz`
 
 API 与 CLI 使用同一个 SQLite 数据库。启动 API 时也可以传入全局 Nuclei 与 DNS 参数：
 
@@ -184,15 +180,19 @@ API 与 CLI 使用同一个 SQLite 数据库。启动 API 时也可以传入全�
 | `GET` | `/api/scan-tasks/{taskId}` | 查询逻辑任务配置与状态 |
 | `PUT` | `/api/scan-tasks/{taskId}` | 更新后续运行的目标、计划和配置；已有运行保持原配置快照 |
 | `GET` | `/api/scan-tasks/{taskId}/runs` | 查询该逻辑任务的运行历史 |
+| `POST` | `/api/scan-tasks/{taskId}/run-now` | 立即触发一个启用中的定期任务 |
 | `GET` | `/api/scan-tasks/{taskId}/runs/{runId}` | 查询不可变运行快照元数据、状态与 `report_error` |
 | `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/changes` | 查询本轮与同任务成功基线的变化 |
 | `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/report` | 读取该运行的 Markdown 报告 |
+| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/audit-report` | 读取该运行的审计报告 |
+| `GET` | `/api/scan-tasks/{taskId}/runs/{runId}/findings` | 分页读取结构化漏洞结果与验证状态 |
 | `POST` | `/api/scan-tasks/{taskId}/runs/{runId}/cancel` | 请求取消当前运行；终态运行不可取消 |
 | `POST` | `/api/scan-tasks/{taskId}/pause` | 暂停逻辑任务，暂停后不再创建新运行 |
 | `POST` | `/api/scan-tasks/{taskId}/resume` | 恢复已暂停的任务 |
 | `POST` | `/api/scan-tasks/{taskId}/archive` | 归档逻辑任务，归档后不可恢复 |
 | `GET` | `/api/assets?active=true&scope=subnet:192.168.10.0/24` | 查询 IP 聚合库存，可按扫描范围精确过滤 |
 | `GET` | `/api/assets/{ip}` | 查询资产聚合状态、全部范围成员及端口详情 |
+| `GET` | `/api/healthz` | 检查 API 与 SQLite 是否可用 |
 | `GET` | `/api/fingerprints/sources` | 查询规则来源与 active 修订摘要 |
 | `GET` | `/api/fingerprints/imports?page=1&page_size=50` | 分页查询 import 摘要，不返回大型 manifest |
 | `GET` | `/api/fingerprints/imports/{importId}` | 按需查询单个 import 及 manifest |
@@ -207,7 +207,7 @@ curl -X POST http://127.0.0.1:8080/api/scan-tasks \
   -d '{"target":"192.168.10.0/24","scan_type":"subnet","mode":"scheduled","cron":"0 2 * * *","timezone":"Asia/Shanghai"}'
 ```
 
-`POST` 与 `PUT /api/scan-tasks` 使用同一请求模型：`scan_type` 只能是 `ip` 或 `subnet`；`mode` 为 `once` 或 `scheduled`；`scheduled` 模式必须提供 5 段 `cron` 和 IANA `timezone`；通过 `config.vulnerability_on: true` 启用定向漏洞验证。v1 的 `scan_ip`、`collect_domain` 等 `task_type` 仅用于历史兼容接口，不适用于 v2 ScanTask API。
+`POST` 与 `PUT /api/scan-tasks` 使用同一请求模型：`scan_type` 只能是 `ip` 或 `subnet`；`mode` 为 `once` 或 `scheduled`；`scheduled` 模式必须提供 5 段 `cron` 和 IANA `timezone`；`config.port_spec` 可指定端口集合；通过 `config.vulnerability_on: true` 启用定向漏洞验证。旧 `/api/tasks` 只读，创建和取消会返回 `410 Gone`。
 
 ### 任务取消与报告
 
@@ -239,20 +239,25 @@ curl -X POST http://127.0.0.1:8080/api/scan-tasks \
 
 | 命令 | 说明 |
 | --- | --- |
-| `scan <ip\|cidr> [--vuln]` | 扫描单 IP；CIDR 自动进入网段快速画像 |
-| `subnet <cidr> [--vuln]` | 显式创建网段巡检任务 |
-| `vuln <ip\|ip:port>` | 使用本地 Nuclei 直接验证目标 |
-| `domain <domain> [--scan] [--vuln]` | 收集域名资产，可继续端口扫描和漏洞验证 |
-| `list` | 列出历史任务 |
-| `status <task_id>` | 查看任务状态 |
-| `cancel <task_id>` | 取消任务 |
-| `findings <task_id> [severity]` | 查看漏洞结果 |
+| `scan <ip\|cidr> [--vuln] [--port-spec <ports>]` | 创建并同步执行 V2 一次性任务；CIDR 自动使用网段工作流 |
+| `subnet <cidr> [--vuln] [--port-spec <ports>]` | 创建并同步执行 V2 网段一次性任务 |
+| `list` | 列出 V2 逻辑任务 |
+| `status <scan_task_id>` | 查看 V2 逻辑任务配置 |
+| `cancel <scan_task_id> <run_id>` | 取消 V2 排队中或运行中的一轮 |
+| `findings <scan_task_id> <run_id>` | 查看 V2 结构化漏洞结果 |
+| `changes <scan_task_id> <run_id> [baseline_run_id]` | 查看同一逻辑任务内的 Diff |
+| `report <scan_task_id> <run_id> [--audit]` | 读取用户报告或审计报告 |
+| `asset <internal_ip>` | 读取资产端点画像 |
 | `schedule create --target <ip-or-cidr> --scan-type ip\|subnet --mode once\|scheduled ...` | 创建 v2 逻辑任务；scheduled 模式由 API 服务内置调度 |
 | `schedule update <scan_task_id> ...` | 更新逻辑任务后续运行的目标、计划与配置；已有运行保留原快照 |
 | `schedule list` | 列出全部 v2 逻辑任务 |
 | `schedule show <scan_task_id>` | 查看逻辑任务的配置、状态和计划 |
 | `schedule runs <scan_task_id>` | 查看任务的运行历史和报告路径 |
+| `schedule run <scan_task_id>` | 立即触发一个启用中的定期任务 |
+| `schedule run-show <scan_task_id> <run_id>` | 查看运行状态、阶段、进度与报告诊断 |
+| `schedule changes\|findings\|report <scan_task_id> <run_id>` | 查看运行 Diff、漏洞和报告 |
 | `schedule pause\|resume\|archive <scan_task_id>` | 暂停、恢复或归档逻辑任务 |
+| `legacy-list\|legacy-status\|legacy-findings` | 只读访问 V1 历史记录；不能再创建或取消 V1 任务 |
 | `fingerprint list` | 列出规则来源和当前 active import |
 | `fingerprint import --source <source_key> [--recovery-archive <path>]` | 校验并导入一个固定来源或显式恢复归档 |
 | `fingerprint upgrade [--source <source_key>]` | 显式升级全部或单个嵌入来源；逐来源输出成功/失败诊断 |
@@ -261,6 +266,30 @@ curl -X POST http://127.0.0.1:8080/api/scan-tasks \
 | `fingerprint mapping import --manifest <path> --templates <root>` | 校验模板 SHA 后导入审核映射修订 |
 | `fingerprint mapping disable --id <id>` | 停用一条模板映射 |
 | `api [addr] [--allow-cidr <cidr>]...` | 启动 API 和 Web 控制台；非回环监听必须配置受信 CIDR |
+
+## 安装与服务运行
+
+本机构建、测试、安装或生成当前平台发布产物：
+
+```bash
+make build
+make test
+sudo make install
+make release
+```
+
+systemd 示例位于 [`deploy/yscan.service`](deploy/yscan.service)。下面的命令创建专用用户和可写状态目录，安装后默认只监听回环地址：
+
+```bash
+sudo useradd --system --home /var/lib/caasm --shell /usr/sbin/nologin caasm
+sudo install -d -o caasm -g caasm -m 0750 /var/lib/caasm /etc/caasm
+sudo install -m 0644 deploy/yscan.service /etc/systemd/system/yscan.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now yscan
+curl --fail http://127.0.0.1:8080/api/healthz
+```
+
+`SIGINT` 和 `SIGTERM` 会停止接收新请求、取消当前进程启动的扫描并在最多 10 秒内关闭 HTTP 服务。启动恢复会将上次进程遗留的运行转为明确终态，并生成失败或取消报告。
 
 全局参数：
 

@@ -112,25 +112,89 @@ func (service *TaskService) Update(ctx context.Context, task model.ScanTask) (mo
 	return storage.UpdateScanTask(service.DB, task)
 }
 
-// NormalizeInternalScanTarget is the shared admission boundary for v2 CLI and
-// API task creation. One-time IP tasks accept an explicit IPv4 address; subnet
-// tasks retain the internal-CIDR boundary used by scheduled discovery.
+// RunNow materializes an explicitly requested occurrence. The boolean tells
+// the caller whether it should launch the returned queued run in this process.
+func (service *TaskService) RunNow(ctx context.Context, taskID int64) (model.ScanTaskRun, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return model.ScanTaskRun{}, false, err
+	}
+	if service.DB == nil || service.Clock == nil {
+		return model.ScanTaskRun{}, false, errors.New("scan task service is not initialized")
+	}
+	task, err := storage.GetScanTask(service.DB, taskID)
+	if err != nil {
+		return model.ScanTaskRun{}, false, err
+	}
+	if task.Status != model.ScanTaskStatusEnabled {
+		return model.ScanTaskRun{}, false, fmt.Errorf("%w: %s", storage.ErrScanTaskNotEnabled, task.Status)
+	}
+	runs, err := storage.ListScanTaskRuns(service.DB, taskID)
+	if err != nil {
+		return model.ScanTaskRun{}, false, err
+	}
+	for index := len(runs) - 1; index >= 0; index-- {
+		switch runs[index].Status {
+		case model.ScanTaskRunStatusQueued:
+			return runs[index], true, nil
+		case model.ScanTaskRunStatusRunning, model.ScanTaskRunStatusCancelRequested:
+			return runs[index], false, nil
+		}
+	}
+	if task.Mode == model.ScanTaskModeOnce {
+		return model.ScanTaskRun{}, false, storage.ErrOneTimeScanTaskRunExists
+	}
+	run, err := storage.CreateScanTaskRun(service.DB, model.ScanTaskRun{
+		ScanTaskID: task.ID, Trigger: model.ScanTaskRunTriggerManual,
+		ScheduledFor: service.Clock.Now().UTC().Format(time.RFC3339Nano),
+	})
+	return run, err == nil, err
+}
+
+// NormalizeInternalScanTarget is the shared admission boundary for every v2
+// entry point. Loopback remains available for local acceptance fixtures;
+// routable targets must stay wholly inside one RFC1918 range.
 func NormalizeInternalScanTarget(scanType, target string) (string, error) {
 	target = strings.TrimSpace(target)
 	switch scanType {
 	case model.ScanTypeIP:
 		ip := net.ParseIP(target).To4()
-		if ip == nil {
-			return "", fmt.Errorf("scan target must be an IPv4 address: %s", target)
+		if !isInternalIPv4(ip) {
+			return "", fmt.Errorf("scan target must be an internal IPv4 address: %s", target)
 		}
 		return ip.String(), nil
 	case model.ScanTypeSubnet:
 		ip, network, err := net.ParseCIDR(target)
-		if err != nil || ip.To4() == nil || network == nil || network.IP.To4() == nil || !network.IP.IsPrivate() {
+		if err != nil || ip.To4() == nil || network == nil || !isInternalIPv4Network(network) {
 			return "", fmt.Errorf("scan target must be an internal IPv4 CIDR: %s", target)
 		}
 		return network.String(), nil
 	default:
 		return "", fmt.Errorf("unsupported scan type: %s", scanType)
 	}
+}
+
+func isInternalIPv4(ip net.IP) bool {
+	ip = ip.To4()
+	if ip == nil {
+		return false
+	}
+	return ip[0] == 10 || ip[0] == 127 ||
+		(ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) ||
+		(ip[0] == 192 && ip[1] == 168)
+}
+
+func isInternalIPv4Network(network *net.IPNet) bool {
+	if network == nil {
+		return false
+	}
+	first := network.IP.To4()
+	ones, bits := network.Mask.Size()
+	if first == nil || bits != 32 || ones < 0 {
+		return false
+	}
+	last := append(net.IP(nil), first...)
+	for index := range last {
+		last[index] |= ^network.Mask[index]
+	}
+	return isInternalIPv4(first) && isInternalIPv4(last)
 }

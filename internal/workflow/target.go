@@ -129,6 +129,9 @@ func runTargetTaskRun(ctx context.Context, options TargetTaskRunOptions, depende
 	if err := checkCanceled(ctx, options.CheckCanceled); err != nil {
 		return partialTargetSnapshot(options.Run.ID, target, openPorts, options.Run.Config.VulnerabilityOn), err
 	}
+	if err := updateProgress(options.UpdateProgress, 55); err != nil {
+		return partialTargetSnapshot(options.Run.ID, target, openPorts, options.Run.Config.VulnerabilityOn), err
+	}
 	fingerprintMatches := make([]model.FingerprintRunMatch, 0)
 	if dependencies.collectFingerprints != nil {
 		openPorts, fingerprintMatches, err = dependencies.collectFingerprints(ctx, options.DB, options.Run, target, openPorts)
@@ -137,6 +140,11 @@ func runTargetTaskRun(ctx context.Context, options TargetTaskRunOptions, depende
 			snapshot.FingerprintMatches = fingerprintMatches
 			return snapshot, err
 		}
+	}
+	if err := updateProgress(options.UpdateProgress, 75); err != nil {
+		snapshot := partialTargetSnapshot(options.Run.ID, target, openPorts, options.Run.Config.VulnerabilityOn)
+		snapshot.FingerprintMatches = fingerprintMatches
+		return snapshot, err
 	}
 	active := len(snapshotPorts(target, openPorts)) > 0
 	snapshot := partialTargetSnapshot(options.Run.ID, target, openPorts, options.Run.Config.VulnerabilityOn)
@@ -159,6 +167,9 @@ func runTargetTaskRun(ctx context.Context, options TargetTaskRunOptions, depende
 		return snapshot, err
 	}
 	if options.Run.Config.VulnerabilityOn {
+		if err := updateProgress(options.UpdateProgress, 85); err != nil {
+			return snapshot, err
+		}
 		validation := newRunValidationTracker()
 		validation.register(target, openPorts, fingerprintMatches)
 		templateRoot := options.Run.Config.NucleiTemplates

@@ -213,9 +213,22 @@ done
 printf 'T330 user and audit reports verified\n'
 rg -q 'protocol_evidence' assets.html
 rg -q 'technologies' assets.html
+curl --fail --silent --request POST "$base_url/api/scan-tasks/$task_id/resume" > resumed-task.json
+curl --fail --silent --request POST "$base_url/api/scan-tasks/$task_id/run-now" > active-run.json
+jq -e '.started == true and .run.id > 0' active-run.json >/dev/null
+active_run_id=$(jq -r '.run.id' active-run.json)
+for _ in $(seq 1 30); do
+  curl --fail --silent "$base_url/api/scan-tasks/$task_id/runs/$active_run_id" > active-run-status.json
+  if jq -e '.status == "running"' active-run-status.json >/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+jq -e '.status == "running"' active-run-status.json >/dev/null
 (cd "$repo_root" && go run ./internal/web/cmd/t330browser \
   --base-url "$base_url" \
   --ip 127.0.0.1 \
+  --task-id "$task_id" \
   --browser "$chromium_path" \
   --expected-ports 6 \
   --expected-validations 6 \

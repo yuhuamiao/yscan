@@ -8,8 +8,10 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golandproject/yscan/internal/api"
@@ -583,18 +585,29 @@ type logicalScanTaskRunExecutor struct {
 }
 
 func (executor logicalScanTaskRunExecutor) Execute(ctx context.Context, run model.ScanTaskRun) (model.ScanTaskRunSnapshot, error) {
+	updateProgress := func(progress int) error {
+		stage := model.ScanTaskRunStageProfiling
+		if progress <= 10 {
+			stage = model.ScanTaskRunStageDiscovery
+		} else if run.Config.VulnerabilityOn && progress >= 85 {
+			stage = model.ScanTaskRunStageValidation
+		}
+		if progress >= 100 {
+			progress = 94
+			stage = model.ScanTaskRunStageSnapshot
+		}
+		return storage.UpdateScanTaskRunProgress(executor.db, run.ID, stage, progress)
+	}
 	switch run.ScanType {
 	case model.ScanTypeIP:
 		return runTargetTaskRun(ctx, workflow.TargetTaskRunOptions{
-			DB:      executor.db,
-			Run:     run,
-			Network: executor.baseTask.Network,
+			DB: executor.db, Run: run, Network: executor.baseTask.Network,
+			UpdateProgress: updateProgress,
 		})
 	case model.ScanTypeSubnet:
 		return runSubnetTaskRun(ctx, workflow.SubnetTaskRunOptions{
-			DB:      executor.db,
-			Run:     run,
-			Network: executor.baseTask.Network,
+			DB: executor.db, Run: run, Network: executor.baseTask.Network,
+			UpdateProgress: updateProgress,
 		})
 	default:
 		return model.ScanTaskRunSnapshot{}, fmt.Errorf("unsupported scan task run type: %s", run.ScanType)
@@ -628,13 +641,35 @@ func executeLogicalScanTaskRun(ctx context.Context, db *sql.DB, baseTask model.S
 	if !isTerminalScanTaskRunStatus(completed.Status) {
 		return executionErr
 	}
+	if err := storage.UpdateScanTaskRunProgress(db, completed.ID, model.ScanTaskRunStageReporting, 99); err != nil {
+		return fmt.Errorf("update run reporting progress: %w", err)
+	}
 	if _, err := generateScanTaskRunReport(db, completed.ScanTaskID, completed.ID, report.DefaultDirectory); err != nil {
 		log.Printf("scan task run %d report failed: %v", completed.ID, err)
 		if persistErr := storage.UpdateScanTaskRunReportError(db, completed.ID, err.Error()); persistErr != nil {
 			log.Printf("scan task run %d report diagnostic persistence failed: %v", completed.ID, persistErr)
 		}
 	}
+	terminalStage, terminalProgress := model.ScanTaskRunStageCompleted, 100
+	if completed.Status == model.ScanTaskRunStatusFailed {
+		terminalStage, terminalProgress = model.ScanTaskRunStageFailed, completed.Progress
+	} else if completed.Status == model.ScanTaskRunStatusCanceled {
+		terminalStage, terminalProgress = model.ScanTaskRunStageCanceled, completed.Progress
+	}
+	if err := storage.UpdateScanTaskRunProgress(db, completed.ID, terminalStage, terminalProgress); err != nil {
+		return fmt.Errorf("finalize run progress: %w", err)
+	}
 	return executionErr
+}
+
+func generateRecoveredScanTaskRunReport(db *sql.DB, run model.ScanTaskRun) error {
+	if _, err := generateScanTaskRunReport(db, run.ScanTaskID, run.ID, report.DefaultDirectory); err != nil {
+		if persistErr := storage.UpdateScanTaskRunReportError(db, run.ID, err.Error()); persistErr != nil {
+			return fmt.Errorf("generate recovery report: %v; persist diagnostic: %w", err, persistErr)
+		}
+		log.Printf("recovered scan task run %d report failed: %v", run.ID, err)
+	}
+	return nil
 }
 
 func isTerminalScanTaskRunStatus(status string) bool {
@@ -676,19 +711,35 @@ func taskExecutionContext(db *sql.DB, taskID int64) (context.Context, func()) {
 }
 
 func main() {
+	if err := runMain(); err != nil {
+		log.Print(err)
+		os.Exit(1)
+	}
+}
+
+func runMain() error {
+	return runMainArgs(os.Args[1:])
+}
+
+func runMainArgs(rawArgs []string) error {
+	args, cfg := parseCLIConfig(rawArgs)
+	if len(args) == 0 || isTopLevelHelp(args) {
+		printCLIUsage()
+		return nil
+	}
+
 	db, err := storage.InitDB()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer db.Close()
-	args, cfg := parseCLIConfig(os.Args[1:])
 	if _, err := fingerprint.InitializeEmbeddedSourcesIfEmpty(context.Background(), db); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	if commandNeedsLegacyBannerMatcher(args) {
 		engine, err := fingerprint.LoadActiveLegacyBannerEngine(db)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		identify.SetFingerprintMatcher(func(banner string) string { return engine.MatchBanner(banner) })
 	}
@@ -698,114 +749,163 @@ func main() {
 	task.NucleiTemplates = cfg.Templates
 	task.DNSResolveMode = cfg.DNSResolveMode
 	task.DNSDenyCIDRs = cfg.DNSDenyCIDRs
-	if len(args) > 0 {
-		runByArgs(args, task, db)
-		return
-	}
-
-	runInteractive(task, db)
+	return runByArgs(args, task, db)
 }
 
-func commandNeedsLegacyBannerMatcher(args []string) bool {
+func isTopLevelHelp(args []string) bool {
 	if len(args) == 0 {
 		return true
 	}
 	switch strings.ToLower(strings.TrimSpace(args[0])) {
-	case "scan", "subnet", "vuln", "domain", "api":
+	case "help", "--help", "-h":
 		return true
 	default:
 		return false
 	}
 }
 
-func runByArgs(args []string, task model.Scanner, db *sql.DB) {
+func commandNeedsLegacyBannerMatcher(args []string) bool {
+	return false
+}
+
+func parseQuickScanFlags(args []string) (bool, string, error) {
+	withVulnerabilities := false
+	portSpec := ""
+	for index := 0; index < len(args); index++ {
+		switch strings.TrimSpace(args[index]) {
+		case "--vuln":
+			withVulnerabilities = true
+		case "--port-spec", "--ports":
+			if index+1 >= len(args) {
+				return false, "", fmt.Errorf("%s requires a value", args[index])
+			}
+			portSpec = strings.TrimSpace(args[index+1])
+			index++
+		default:
+			return false, "", fmt.Errorf("unsupported scan flag: %s", args[index])
+		}
+	}
+	return withVulnerabilities, portSpec, nil
+}
+
+func runQuickV2Scan(ctx context.Context, db *sql.DB, baseTask model.Scanner, target, scanType string, withVulnerabilities bool, portSpec string) error {
+	service := schedule.NewTaskService(db, nil)
+	task, run, err := service.Create(ctx, model.ScanTask{
+		Target: target, ScanType: scanType, Mode: model.ScanTaskModeOnce,
+		Config: model.ScanTaskConfig{
+			PortSpec: portSpec, VulnerabilityOn: withVulnerabilities,
+			NucleiTemplates: baseTask.NucleiTemplates, DNSResolveMode: baseTask.DNSResolveMode,
+			DNSDenyCIDRs: append([]string(nil), baseTask.DNSDenyCIDRs...),
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if run == nil {
+		return errors.New("one-time V2 scan did not create a run")
+	}
+	fmt.Printf("ScanTask %d created; run %d queued (%s %s)\n", task.ID, run.ID, task.ScanType, task.Target)
+	if err := executeLogicalScanTaskRun(ctx, db, baseTask, *run); err != nil {
+		return err
+	}
+	completed, err := storage.GetScanTaskRun(db, run.ID)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("ScanTask run %d finished: %s (report: %s)\n", completed.ID, completed.Status, completed.ReportPath)
+	if completed.Status != model.ScanTaskRunStatusSuccess {
+		return fmt.Errorf("scan task run %d finished with status %s: %s", completed.ID, completed.Status, completed.ErrorMessage)
+	}
+	return nil
+}
+
+func printCLIUsage() {
+	fmt.Println("usage: yscan scan <internal-ip|cidr> [--vuln] [--port-spec <ports>]")
+	fmt.Println("       yscan subnet <internal-cidr> [--vuln] [--port-spec <ports>]")
+	fmt.Println("       yscan schedule help")
+	fmt.Println("       yscan api [listen_addr] [--allow-cidr <cidr>]...")
+	fmt.Println("       yscan legacy-list|legacy-status|legacy-findings ...")
+}
+
+func runByArgs(args []string, task model.Scanner, db *sql.DB) error {
 	command := strings.ToLower(strings.TrimSpace(args[0]))
 	switch command {
+	case "help", "--help", "-h":
+		printCLIUsage()
+		return nil
 	case "scan":
 		if len(args) < 2 {
-			fmt.Println("usage: yscan [--templates <dir>] [--dns-mode internal|external|hybrid] scan <ip|cidr> [--vuln]")
-			return
+			return errors.New("usage: yscan [--templates <dir>] scan <internal-ip|cidr> [--vuln] [--port-spec <ports>]")
 		}
 		target := strings.TrimSpace(args[1])
-		withVuln := hasFlag(args[2:], "--vuln")
+		withVuln, portSpec, err := parseQuickScanFlags(args[2:])
+		if err != nil {
+			return err
+		}
 		if withVuln {
 			warnIfNucleiMissing()
 			warnIfNucleiTemplatesMissing(task.NucleiTemplates)
 		}
-		runTask(db, task, taskTypeForScan(target, withVuln), target)
+		scanType := model.ScanTypeIP
+		if strings.Contains(target, "/") {
+			scanType = model.ScanTypeSubnet
+		}
+		return runQuickV2Scan(context.Background(), db, task, target, scanType, withVuln, portSpec)
 
 	case "subnet":
 		if len(args) < 2 {
-			fmt.Println("usage: yscan [--templates <dir>] subnet <cidr> [--vuln]")
-			return
+			return errors.New("usage: yscan [--templates <dir>] subnet <internal-cidr> [--vuln] [--port-spec <ports>]")
 		}
 		target := strings.TrimSpace(args[1])
-		if !pipeline.IsIPv4CIDR(target) {
-			fmt.Printf("invalid cidr: %s\n", target)
-			return
+		withVuln, portSpec, err := parseQuickScanFlags(args[2:])
+		if err != nil {
+			return err
 		}
-		withVuln := hasFlag(args[2:], "--vuln")
 		if withVuln {
 			warnIfNucleiMissing()
 			warnIfNucleiTemplatesMissing(task.NucleiTemplates)
 		}
-		runTask(db, task, taskTypeForSubnet(withVuln), target)
+		return runQuickV2Scan(context.Background(), db, task, target, model.ScanTypeSubnet, withVuln, portSpec)
 
 	case "vuln":
-		if len(args) < 2 {
-			fmt.Println("usage: yscan [--templates <dir>] [--dns-mode internal|external|hybrid] vuln <ip|ip:port>")
-			return
-		}
-		warnIfNucleiMissing()
-		warnIfNucleiTemplatesMissing(task.NucleiTemplates)
-		runTask(db, task, model.TaskTypeVulnIP, strings.TrimSpace(args[1]))
+		return errors.New("legacy direct vulnerability tasks are disabled; use 'yscan scan <internal-ip> --vuln'")
 
 	case "domain":
-		if len(args) < 2 {
-			fmt.Println("usage: yscan [--templates <dir>] [--dns-mode internal|external|hybrid] [--dns-deny-cidr <cidr>] domain <domain> [--scan] [--vuln]")
-			return
-		}
-		domainName := strings.TrimSpace(args[1])
-		warnIfExternalDNSPolicy(task)
-		if hasFlag(args[2:], "--scan") {
-			if hasFlag(args[2:], "--vuln") {
-				warnIfNucleiMissing()
-				warnIfNucleiTemplatesMissing(task.NucleiTemplates)
-				runTask(db, task, model.TaskTypeCollectScanVuln, domainName)
-				return
-			}
-			runTask(db, task, model.TaskTypeCollectAndScan, domainName)
-			return
-		}
-		runTask(db, task, model.TaskTypeCollectDomain, domainName)
+		return errors.New("domain collection is outside the V2 internal CAASM product boundary")
 
-	case "cancel":
-		if len(args) < 2 {
-			fmt.Println("usage: yscan cancel <task_id>")
-			return
-		}
-		taskID, err := strconv.ParseInt(strings.TrimSpace(args[1]), 10, 64)
-		if err != nil {
-			fmt.Printf("invalid task id: %v\n", err)
-			return
-		}
-		if err := storage.CancelTask(db, taskID); err != nil {
-			log.Printf("取消任务失败: %v", err)
-			return
-		}
-		fmt.Printf("Task %d cancellation requested\n", taskID)
-
+	case "list":
+		return runScheduleCommand([]string{"list"}, task, db)
 	case "status":
+		return runScheduleCommand(append([]string{"show"}, args[1:]...), task, db)
+	case "cancel", "findings", "report", "changes", "asset":
+		return runScheduleCommand(append([]string{command}, args[1:]...), task, db)
+	case "legacy-list":
+		printTaskList(db)
+		return nil
+	case "legacy-status":
 		if len(args) < 2 {
-			fmt.Println("usage: yscan status <task_id>")
-			return
+			return errors.New("usage: yscan legacy-status <legacy_task_id>")
 		}
 		taskID, err := strconv.ParseInt(strings.TrimSpace(args[1]), 10, 64)
 		if err != nil {
-			fmt.Printf("invalid task id: %v\n", err)
-			return
+			return fmt.Errorf("invalid legacy task id: %w", err)
 		}
 		printTaskStatus(db, taskID)
+		return nil
+	case "legacy-findings":
+		if len(args) < 2 {
+			return errors.New("usage: yscan legacy-findings <legacy_task_id> [severity]")
+		}
+		taskID, err := strconv.ParseInt(strings.TrimSpace(args[1]), 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid legacy task id: %w", err)
+		}
+		severity := ""
+		if len(args) >= 3 {
+			severity = args[2]
+		}
+		printTaskFindings(db, taskID, severity)
+		return nil
 
 	case "api":
 		addr := "127.0.0.1:8080"
@@ -815,71 +915,93 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) {
 		}
 		for index := 2; index < len(args); index++ {
 			if args[index] != "--allow-cidr" || index+1 >= len(args) {
-				fmt.Println("usage: yscan api [listen_addr] [--allow-cidr <cidr>]...")
-				return
+				return errors.New("usage: yscan api [listen_addr] [--allow-cidr <cidr>]...")
 			}
 			policy.TrustedCIDRs = append(policy.TrustedCIDRs, strings.TrimSpace(args[index+1]))
 			index++
 		}
-		schedulerContext, stopScheduler := context.WithCancel(context.Background())
-		defer stopScheduler()
+		serviceContext, stopService := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stopService()
 		runner := schedule.NewRunner(db, nil)
 		runner.OnClaim = func(ctx context.Context, run model.ScanTaskRun) {
 			if err := executeLogicalScanTaskRun(ctx, db, task, run); err != nil {
 				log.Printf("scheduled ScanTask run %d failed: %v", run.ID, err)
 			}
 		}
-		go func() {
-			if err := runner.Run(schedulerContext); err != nil {
-				log.Printf("schedule runner stopped: %v", err)
-			}
-		}()
+		runner.OnRecovered = func(run model.ScanTaskRun) error { return generateRecoveredScanTaskRunReport(db, run) }
 		service := schedule.NewTaskService(db, nil)
-		if err := api.StartServerWithScanTasksAndAccessPolicy(db, addr, func(taskType, target string) (int64, error) {
-			return runTaskAsync(db, task, taskType, target)
-		}, service, func(ctx context.Context, run model.ScanTaskRun) {
-			if err := executeLogicalScanTaskRun(ctx, db, task, run); err != nil {
-				if errors.Is(err, schedule.ErrGlobalConcurrencyUnavailable) {
-					return
+		return recoverThenRunAPIAndScheduler(serviceContext, runner.RecoverStartupState, func(ctx context.Context) error {
+			return api.StartServerWithScanTasksAndAccessPolicyContext(ctx, db, addr, func(taskType, target string) (int64, error) {
+				return runTaskAsync(db, task, taskType, target)
+			}, service, func(ctx context.Context, run model.ScanTaskRun) {
+				if err := executeLogicalScanTaskRun(ctx, db, task, run); err != nil {
+					if errors.Is(err, schedule.ErrGlobalConcurrencyUnavailable) {
+						return
+					}
+					log.Printf("one-time ScanTask run %d failed: %v", run.ID, err)
 				}
-				log.Printf("one-time ScanTask run %d failed: %v", run.ID, err)
-			}
-		}, policy); err != nil {
-			log.Printf("API server stopped: %v", err)
-		}
+			}, policy)
+		}, runner.RunLoop)
 
 	case "schedule":
-		runScheduleCommand(args[1:], task, db)
+		return runScheduleCommand(args[1:], task, db)
 
 	case "fingerprint":
-		runFingerprintCommand(args[1:], db)
-
-	case "findings":
-		if len(args) < 2 {
-			fmt.Println("usage: yscan findings <task_id> [severity]")
-			return
-		}
-		taskID, err := strconv.ParseInt(strings.TrimSpace(args[1]), 10, 64)
-		if err != nil {
-			fmt.Printf("invalid task id: %v\n", err)
-			return
-		}
-		severity := ""
-		if len(args) >= 3 {
-			severity = args[2]
-		}
-		printTaskFindings(db, taskID, severity)
-
-	case "list":
-		printTaskList(db)
+		return runFingerprintCommand(args[1:], db)
 
 	default:
-		fmt.Println("please enter a true command.")
+		return fmt.Errorf("unknown command: %s", command)
 	}
 }
 
-func runScheduleCommand(args []string, baseTask model.Scanner, db *sql.DB) {
-	if err := schedule.RunCLI(context.Background(), db, args, schedule.CLIConfig{
+type serviceComponentResult struct {
+	name string
+	err  error
+}
+
+func recoverThenRunAPIAndScheduler(parent context.Context, recoverStartup func() error, runAPI, runScheduler func(context.Context) error) error {
+	if err := recoverStartup(); err != nil {
+		return fmt.Errorf("schedule startup recovery: %w", err)
+	}
+	return runAPIAndScheduler(parent, runAPI, runScheduler)
+}
+
+func runAPIAndScheduler(parent context.Context, runAPI, runScheduler func(context.Context) error) error {
+	serviceContext, stopService := context.WithCancel(parent)
+	defer stopService()
+
+	results := make(chan serviceComponentResult, 2)
+	start := func(name string, run func(context.Context) error) {
+		go func() { results <- serviceComponentResult{name: name, err: run(serviceContext)} }()
+	}
+	start("API server", runAPI)
+	start("schedule runner", runScheduler)
+
+	first := <-results
+	parentStopped := parent.Err() != nil
+	stopService()
+	select {
+	case second := <-results:
+		if parentStopped {
+			for _, result := range []serviceComponentResult{first, second} {
+				if result.err != nil && !errors.Is(result.err, context.Canceled) {
+					return fmt.Errorf("%s stopped: %w", result.name, result.err)
+				}
+			}
+			return nil
+		}
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("%s stopped, but the other service component did not stop within 10 seconds", first.name)
+	}
+
+	if first.err != nil {
+		return fmt.Errorf("%s stopped: %w", first.name, first.err)
+	}
+	return fmt.Errorf("%s stopped unexpectedly", first.name)
+}
+
+func runScheduleCommand(args []string, baseTask model.Scanner, db *sql.DB) error {
+	return schedule.RunCLI(context.Background(), db, args, schedule.CLIConfig{
 		NucleiTemplates: baseTask.NucleiTemplates,
 		DNSResolveMode:  baseTask.DNSResolveMode,
 		DNSDenyCIDRs:    baseTask.DNSDenyCIDRs,
@@ -889,167 +1011,16 @@ func runScheduleCommand(args []string, baseTask model.Scanner, db *sql.DB) {
 			warnIfNucleiTemplatesMissing(run.Config.NucleiTemplates)
 		}
 		return executeLogicalScanTaskRun(ctx, db, baseTask, run)
-	}, os.Stdout); err != nil {
-		log.Printf("schedule command failed: %v", err)
-	}
+	}, os.Stdout)
 }
 
-func runFingerprintCommand(args []string, db *sql.DB) {
+func runFingerprintCommand(args []string, db *sql.DB) error {
 	// T258+ supplies embedded production manifests and adapters. Until then the
 	// command remains usable for listing the migrated legacy source, while
 	// import/upgrade correctly reject unknown non-embedded source revisions.
 	registry, err := fingerprint.NewEmbeddedRegistry(db)
 	if err != nil {
-		log.Printf("load embedded fingerprint registry: %v", err)
-		return
+		return fmt.Errorf("load embedded fingerprint registry: %w", err)
 	}
-	if err := fingerprint.RunCLI(context.Background(), registry, args, os.Stdout); err != nil {
-		log.Printf("fingerprint command failed: %v", err)
-	}
-}
-
-func runInteractive(task model.Scanner, db *sql.DB) {
-	var command string
-	fmt.Print("Please enter a command(domain/scan/subnet/vuln/status/cancel/list/findings): ")
-	fmt.Scan(&command)
-
-	if command == "scan" {
-		fmt.Print("Please enter your ip or cidr:")
-		fmt.Scan(&task.IP)
-		var vulnFlag string
-		fmt.Print("Enable vuln scan? (y/N):")
-		fmt.Scan(&vulnFlag)
-		withVuln := strings.EqualFold(strings.TrimSpace(vulnFlag), "y")
-		if withVuln {
-			warnIfNucleiMissing()
-			warnIfNucleiTemplatesMissing(task.NucleiTemplates)
-		}
-		runTask(db, task, taskTypeForScan(task.IP, withVuln), task.IP)
-		return
-	}
-
-	if command == "vuln" {
-		fmt.Print("Please enter target (ip or ip:port):")
-		fmt.Scan(&task.IP)
-		warnIfNucleiMissing()
-		runTask(db, task, model.TaskTypeVulnIP, task.IP)
-		return
-	}
-
-	if command == "subnet" {
-		var cidr string
-		fmt.Print("Please enter your cidr:")
-		fmt.Scan(&cidr)
-		if !pipeline.IsIPv4CIDR(cidr) {
-			fmt.Printf("invalid cidr: %s\n", cidr)
-			return
-		}
-		var vulnFlag string
-		fmt.Print("Enable vuln scan? (y/N):")
-		fmt.Scan(&vulnFlag)
-		withVuln := strings.EqualFold(strings.TrimSpace(vulnFlag), "y")
-		if withVuln {
-			warnIfNucleiMissing()
-			warnIfNucleiTemplatesMissing(task.NucleiTemplates)
-		}
-		runTask(db, task, taskTypeForSubnet(withVuln), cidr)
-		return
-	}
-
-	if command == "domain" {
-		var domainName string
-		fmt.Print("Please enter your domain: ")
-		fmt.Scan(&domainName)
-
-		answer := "n"
-		fmt.Print("Subdomain collecting is done. Do the domains need to scan?(y/N): ")
-		fmt.Scan(&answer)
-		if strings.EqualFold(strings.TrimSpace(answer), "y") {
-			var vulnFlag string
-			fmt.Print("Enable vuln scan for collected ips? (y/N):")
-			fmt.Scan(&vulnFlag)
-			if strings.EqualFold(strings.TrimSpace(vulnFlag), "y") {
-				warnIfNucleiMissing()
-				runTask(db, task, model.TaskTypeCollectScanVuln, domainName)
-				return
-			}
-			runTask(db, task, model.TaskTypeCollectAndScan, domainName)
-			return
-		}
-		runTask(db, task, model.TaskTypeCollectDomain, domainName)
-		return
-	}
-
-	if command == "status" {
-		var taskIDStr string
-		fmt.Print("Please enter your task id:")
-		fmt.Scan(&taskIDStr)
-		taskID, err := strconv.ParseInt(strings.TrimSpace(taskIDStr), 10, 64)
-		if err != nil {
-			fmt.Printf("invalid task id: %v\n", err)
-			return
-		}
-		printTaskStatus(db, taskID)
-		return
-	}
-
-	if command == "cancel" {
-		var taskIDStr string
-		fmt.Print("Please enter your task id:")
-		fmt.Scan(&taskIDStr)
-		taskID, err := strconv.ParseInt(strings.TrimSpace(taskIDStr), 10, 64)
-		if err != nil {
-			fmt.Printf("invalid task id: %v\n", err)
-			return
-		}
-		if err := storage.CancelTask(db, taskID); err != nil {
-			log.Printf("取消任务失败: %v", err)
-			return
-		}
-		fmt.Printf("Task %d cancellation requested\n", taskID)
-		return
-	}
-
-	if command == "findings" {
-		var taskIDStr string
-		fmt.Print("Please enter your task id:")
-		fmt.Scan(&taskIDStr)
-		taskID, err := strconv.ParseInt(strings.TrimSpace(taskIDStr), 10, 64)
-		if err != nil {
-			fmt.Printf("invalid task id: %v\n", err)
-			return
-		}
-		var severity string
-		fmt.Print("Please enter severity filter(optional, use - for none, e.g. high):")
-		fmt.Scan(&severity)
-		if strings.TrimSpace(severity) == "-" {
-			severity = ""
-		}
-		printTaskFindings(db, taskID, severity)
-		return
-	}
-
-	if command == "list" {
-		printTaskList(db)
-		return
-	}
-
-	fmt.Println("please enter a true command.")
-}
-
-func taskTypeForScan(target string, withVuln bool) string {
-	if pipeline.IsIPv4CIDR(target) {
-		return taskTypeForSubnet(withVuln)
-	}
-	if withVuln {
-		return model.TaskTypeScanIPVuln
-	}
-	return model.TaskTypeScanIP
-}
-
-func taskTypeForSubnet(withVuln bool) string {
-	if withVuln {
-		return model.TaskTypeScanSubnetVuln
-	}
-	return model.TaskTypeScanSubnet
+	return fingerprint.RunCLI(context.Background(), registry, args, os.Stdout)
 }

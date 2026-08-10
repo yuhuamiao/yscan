@@ -73,3 +73,42 @@ func TestScanTaskRunSchemaUsesScheduledForUniquenessAndRunSnapshots(t *testing.T
 		}
 	}
 }
+
+func TestRunLifecycleMigrationBackfillsOnceWithoutRewritingNewTriggers(t *testing.T) {
+	db := openTestDB(t)
+	for _, statement := range []string{
+		`CREATE TABLE scan_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, scan_type TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, cron TEXT, timezone TEXT, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT (datetime('now')), updated_at DATETIME NOT NULL DEFAULT (datetime('now')), archived_at DATETIME)`,
+		`CREATE TABLE scan_task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_task_id INTEGER NOT NULL, sequence INTEGER NOT NULL, scheduled_for DATETIME NOT NULL, status TEXT NOT NULL, target TEXT NOT NULL, scan_type TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', error_message TEXT, report_path TEXT, started_at DATETIME, finished_at DATETIME, created_at DATETIME NOT NULL DEFAULT (datetime('now')), updated_at DATETIME NOT NULL DEFAULT (datetime('now')), UNIQUE(scan_task_id, sequence), UNIQUE(scan_task_id, scheduled_for))`,
+		`INSERT INTO scan_tasks (id, target, scan_type, mode, status) VALUES (1, '192.168.10.10', 'ip', 'once', 'enabled')`,
+		`INSERT INTO scan_tasks (id, target, scan_type, mode, status, cron, timezone) VALUES (2, '192.168.10.0/24', 'subnet', 'scheduled', 'enabled', '0 2 * * *', 'UTC')`,
+		`INSERT INTO scan_task_runs (id, scan_task_id, sequence, scheduled_for, status, target, scan_type) VALUES (1, 1, 1, '2026-08-01T00:00:00Z', 'queued', '192.168.10.10', 'ip')`,
+		`INSERT INTO scan_task_runs (id, scan_task_id, sequence, scheduled_for, status, target, scan_type) VALUES (2, 2, 1, '2026-08-01T02:00:00Z', 'success', '192.168.10.0/24', 'subnet')`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatalf("upgrade legacy run schema: %v", err)
+	}
+	var onceTrigger, onceStage, scheduledTrigger, scheduledStage string
+	var onceProgress, scheduledProgress int
+	if err := db.QueryRow(`SELECT trigger, stage, progress FROM scan_task_runs WHERE id = 1`).Scan(&onceTrigger, &onceStage, &onceProgress); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT trigger, stage, progress FROM scan_task_runs WHERE id = 2`).Scan(&scheduledTrigger, &scheduledStage, &scheduledProgress); err != nil {
+		t.Fatal(err)
+	}
+	if onceTrigger != "initial" || onceStage != "queued" || onceProgress != 0 || scheduledTrigger != "scheduled" || scheduledStage != "completed" || scheduledProgress != 100 {
+		t.Fatalf("once=%s/%s/%d scheduled=%s/%s/%d", onceTrigger, onceStage, onceProgress, scheduledTrigger, scheduledStage, scheduledProgress)
+	}
+	if _, err := db.Exec(`UPDATE scan_task_runs SET trigger = 'manual' WHERE id = 2`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatalf("repeat migration: %v", err)
+	}
+	if err := db.QueryRow(`SELECT trigger FROM scan_task_runs WHERE id = 2`).Scan(&scheduledTrigger); err != nil || scheduledTrigger != "manual" {
+		t.Fatalf("repeat migration trigger=%q err=%v", scheduledTrigger, err)
+	}
+}

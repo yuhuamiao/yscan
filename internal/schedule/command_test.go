@@ -96,6 +96,10 @@ func TestRunCLIUpdatesTaskAndDocumentsUpdateCommand(t *testing.T) {
 		t.Fatalf("update output=%q", output.String())
 	}
 	output.Reset()
+	if err := RunCLI(context.Background(), db, []string{"show", strconv.FormatInt(created.ID, 10)}, CLIConfig{}, nil, output); err != nil || !strings.Contains(output.String(), "ports=443") {
+		t.Fatalf("show updated task output=%q err=%v", output.String(), err)
+	}
+	output.Reset()
 	if err := RunCLI(context.Background(), db, nil, CLIConfig{}, nil, output); err != nil {
 		t.Fatalf("usage: %v", err)
 	}
@@ -114,5 +118,37 @@ func TestRunCLIKeepsOneTimeRunQueuedWhenGlobalSlotIsBusy(t *testing.T) {
 	runs, err := storage.ListScanTaskRuns(db, 1)
 	if err != nil || len(runs) != 1 || runs[0].Status != model.ScanTaskRunStatusQueued {
 		t.Fatalf("queued runs=%#v err=%v", runs, err)
+	}
+}
+
+func TestRunCLITriggersShowsAndCancelsV2Run(t *testing.T) {
+	db := openRunnerTestDB(t)
+	service := NewTaskService(db, nil)
+	task, _, err := service.Create(context.Background(), model.ScanTask{Target: "192.168.44.0/24", ScanType: model.ScanTypeSubnet, Mode: model.ScanTaskModeScheduled, Cron: "0 2 * * *", Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := &bytes.Buffer{}
+	var started model.ScanTaskRun
+	if err := RunCLI(context.Background(), db, []string{"run", strconv.FormatInt(task.ID, 10)}, CLIConfig{}, func(_ context.Context, run model.ScanTaskRun) error { started = run; return nil }, output); err != nil {
+		t.Fatalf("run now: %v", err)
+	}
+	if started.Trigger != model.ScanTaskRunTriggerManual || !strings.Contains(output.String(), `"progress": 0`) {
+		t.Fatalf("started=%#v output=%s", started, output.String())
+	}
+	output.Reset()
+	if err := RunCLI(context.Background(), db, []string{"run-show", strconv.FormatInt(task.ID, 10), strconv.FormatInt(started.ID, 10)}, CLIConfig{}, nil, output); err != nil || !strings.Contains(output.String(), `"stage": "queued"`) {
+		t.Fatalf("run-show output=%s err=%v", output.String(), err)
+	}
+	output.Reset()
+	if err := RunCLI(context.Background(), db, []string{"cancel", strconv.FormatInt(task.ID, 10), strconv.FormatInt(started.ID, 10)}, CLIConfig{}, nil, output); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	canceled, err := storage.GetScanTaskRun(db, started.ID)
+	if err != nil || canceled.Status != model.ScanTaskRunStatusCancelRequested {
+		t.Fatalf("canceled=%#v err=%v", canceled, err)
+	}
+	if err := RunCLI(context.Background(), db, []string{"unknown"}, CLIConfig{}, nil, output); err == nil {
+		t.Fatal("unsupported CLI command must return a failing result")
 	}
 }

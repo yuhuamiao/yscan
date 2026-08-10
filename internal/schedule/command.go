@@ -35,6 +35,9 @@ func RunCLI(ctx context.Context, db *sql.DB, args []string, config CLIConfig, st
 	service := NewTaskService(db, nil)
 	command := strings.ToLower(strings.TrimSpace(args[0]))
 	switch command {
+	case "help", "--help", "-h":
+		writeUsage(output)
+		return nil
 	case "update":
 		if len(args) < 3 {
 			return writeCommandError(output, errors.New("usage: yscan schedule update <scan_task_id> --target <target> --scan-type ip|subnet --mode once|scheduled ..."))
@@ -92,6 +95,28 @@ func RunCLI(ctx context.Context, db *sql.DB, args []string, config CLIConfig, st
 
 	case "list":
 		return writeTaskList(output, db)
+	case "run":
+		id, err := parseTaskID(args, "usage: yscan schedule run <scan_task_id>")
+		if err != nil {
+			return writeCommandError(output, err)
+		}
+		run, launch, err := service.RunNow(ctx, id)
+		if err != nil {
+			return err
+		}
+		if launch {
+			if startRun == nil {
+				return errors.New("scan task runner is required")
+			}
+			if err := startRun(ctx, run); err != nil {
+				if errors.Is(err, ErrGlobalConcurrencyUnavailable) {
+					_, writeErr := fmt.Fprintf(output, "ScanTask run %d queued: waiting for global execution slot\n", run.ID)
+					return writeErr
+				}
+				return err
+			}
+		}
+		return writeRunDetailJSON(output, db, id, run.ID)
 	case "show":
 		id, err := parseTaskID(args, "usage: yscan schedule show <scan_task_id>")
 		if err != nil {
@@ -104,6 +129,33 @@ func RunCLI(ctx context.Context, db *sql.DB, args []string, config CLIConfig, st
 			return writeCommandError(output, err)
 		}
 		return writeTaskRuns(output, db, id)
+	case "run-show":
+		taskID, runID, err := parseTaskRunIDs(args, "usage: yscan schedule run-show <scan_task_id> <run_id>")
+		if err != nil {
+			return writeCommandError(output, err)
+		}
+		return writeRunDetailJSON(output, db, taskID, runID)
+	case "cancel":
+		taskID, runID, err := parseTaskRunIDs(args, "usage: yscan schedule cancel <scan_task_id> <run_id>")
+		if err != nil {
+			return writeCommandError(output, err)
+		}
+		if err := storage.CancelScanTaskRun(db, taskID, runID); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(output, "ScanTask run %d cancellation requested\n", runID)
+		return err
+	case "changes":
+		return runChangesCommand(output, db, args)
+	case "findings":
+		return runFindingsCommand(output, db, args)
+	case "report":
+		return runReportCommand(output, db, args)
+	case "asset":
+		if len(args) != 2 {
+			return writeCommandError(output, errors.New("usage: yscan schedule asset <internal_ip>"))
+		}
+		return writeAssetDetailJSON(output, db, args[1])
 	case "pause", "resume", "archive":
 		id, err := parseTaskID(args, "usage: yscan schedule "+command+" <scan_task_id>")
 		if err != nil {
@@ -116,7 +168,7 @@ func RunCLI(ctx context.Context, db *sql.DB, args []string, config CLIConfig, st
 		return err
 	default:
 		writeUsage(output)
-		return nil
+		return fmt.Errorf("unsupported schedule command: %s", command)
 	}
 }
 
@@ -219,7 +271,11 @@ func writeTask(output io.Writer, db *sql.DB, taskID int64) error {
 			return err
 		}
 	}
-	_, err = fmt.Fprintf(output, "  Config   : vulnerability=%t templates=%s\n", task.Config.VulnerabilityOn, task.Config.NucleiTemplates)
+	portSpec := task.Config.PortSpec
+	if portSpec == "" {
+		portSpec = "default"
+	}
+	_, err = fmt.Fprintf(output, "  Config   : ports=%s vulnerability=%t templates=%s\n", portSpec, task.Config.VulnerabilityOn, task.Config.NucleiTemplates)
 	return err
 }
 
@@ -228,11 +284,11 @@ func writeTaskRuns(output io.Writer, db *sql.DB, taskID int64) error {
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(output, "RUN ID   STATUS     SCHEDULED FOR            REPORT"); err != nil {
+	if _, err := fmt.Fprintln(output, "RUN ID   STATUS     STAGE        PROGRESS TRIGGER    SCHEDULED FOR            REPORT"); err != nil {
 		return err
 	}
 	for _, run := range runs {
-		if _, err := fmt.Fprintf(output, "%-8d %-10s %-24s %-24s\n", run.ID, run.Status, run.ScheduledFor, run.ReportPath); err != nil {
+		if _, err := fmt.Fprintf(output, "%-8d %-10s %-12s %3d%%     %-10s %-24s %-24s\n", run.ID, run.Status, run.Stage, run.Progress, run.Trigger, run.ScheduledFor, run.ReportPath); err != nil {
 			return err
 		}
 	}
@@ -242,10 +298,14 @@ func writeTaskRuns(output io.Writer, db *sql.DB, taskID int64) error {
 func writeUsage(output io.Writer) {
 	fmt.Fprintln(output, "usage: yscan schedule create --target <internal-ip-or-cidr> --scan-type ip|subnet --mode once|scheduled [--cron '0 2 * * *' --timezone Asia/Shanghai] [--vuln]")
 	fmt.Fprintln(output, "       yscan schedule update <scan_task_id> --target <internal-ip-or-cidr> --scan-type ip|subnet --mode once|scheduled [--cron '0 2 * * *' --timezone Asia/Shanghai] [--vuln]")
-	fmt.Fprintln(output, "       yscan schedule list|show|runs|pause|resume|archive <scan_task_id>")
+	fmt.Fprintln(output, "       yscan schedule list|show|runs|run|pause|resume|archive <scan_task_id>")
+	fmt.Fprintln(output, "       yscan schedule run-show|cancel|changes|findings|report <scan_task_id> <run_id>")
+	fmt.Fprintln(output, "       yscan schedule asset <internal_ip>")
 }
 
 func writeCommandError(output io.Writer, err error) error {
-	_, writeErr := fmt.Fprintln(output, err)
-	return writeErr
+	if _, writeErr := fmt.Fprintln(output, err); writeErr != nil {
+		return writeErr
+	}
+	return err
 }

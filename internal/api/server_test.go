@@ -23,14 +23,12 @@ import (
 	"golandproject/yscan/internal/storage"
 )
 
-func TestSubnetTaskTypesAreAccepted(t *testing.T) {
+func TestLegacyTaskCreationIsReadOnly(t *testing.T) {
 	for _, taskType := range []string{model.TaskTypeScanSubnet, model.TaskTypeScanSubnetVuln} {
 		t.Run(taskType, func(t *testing.T) {
-			var gotType, gotTarget string
-			handler, err := newHandler(nil, func(taskType, target string) (int64, error) {
-				gotType = taskType
-				gotTarget = target
-				return 42, nil
+			handler, err := newHandler(nil, func(string, string) (int64, error) {
+				t.Fatal("legacy task runner must not be called")
+				return 0, nil
 			})
 			if err != nil {
 				t.Fatalf("newHandler: %v", err)
@@ -40,11 +38,8 @@ func TestSubnetTaskTypesAreAccepted(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, req)
 
-			if recorder.Code != http.StatusAccepted {
+			if recorder.Code != http.StatusGone {
 				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
-			}
-			if gotType != taskType || gotTarget != "192.168.1.0/24" {
-				t.Fatalf("runner received (%q, %q)", gotType, gotTarget)
 			}
 		})
 	}
@@ -182,7 +177,7 @@ func TestSubnetTaskRejectsNonCIDRTarget(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 
-	if recorder.Code != http.StatusBadRequest {
+	if recorder.Code != http.StatusGone {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 }
@@ -293,6 +288,19 @@ func TestScanTaskAPICreatesAndManagesInternalTasks(t *testing.T) {
 	if created.Task.Target != "192.168.10.0/24" || created.Run != nil {
 		t.Fatalf("created scheduled task = %#v", created)
 	}
+	runNow := httptest.NewRecorder()
+	handler.ServeHTTP(runNow, httptest.NewRequest(http.MethodPost, "/api/scan-tasks/"+strconv.FormatInt(created.Task.ID, 10)+"/run-now", nil))
+	if runNow.Code != http.StatusAccepted || !strings.Contains(runNow.Body.String(), `"started":true`) {
+		t.Fatalf("run-now response = %d %s", runNow.Code, runNow.Body.String())
+	}
+	select {
+	case run := <-started:
+		if run.ScanTaskID != created.Task.ID || run.Trigger != model.ScanTaskRunTriggerManual {
+			t.Fatalf("manual run = %#v", run)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("scheduled task run-now did not request start")
+	}
 
 	pause := httptest.NewRecorder()
 	handler.ServeHTTP(pause, httptest.NewRequest(http.MethodPost, "/api/scan-tasks/"+strconv.FormatInt(created.Task.ID, 10)+"/pause", nil))
@@ -316,7 +324,7 @@ func TestScanTaskAPICreatesAndManagesInternalTasks(t *testing.T) {
 
 	public := httptest.NewRecorder()
 	handler.ServeHTTP(public, httptest.NewRequest(http.MethodPost, "/api/scan-tasks", bytes.NewBufferString(`{"target":"8.8.8.8","scan_type":"ip","mode":"once"}`)))
-	if public.Code != http.StatusCreated {
+	if public.Code != http.StatusBadRequest {
 		t.Fatalf("public IP task status = %d, body = %s", public.Code, public.Body.String())
 	}
 
@@ -329,6 +337,41 @@ func TestScanTaskAPICreatesAndManagesInternalTasks(t *testing.T) {
 		if recorder.Code != http.StatusBadRequest {
 			t.Fatalf("invalid schedule task status = %d, body = %s", recorder.Code, recorder.Body.String())
 		}
+	}
+}
+
+func TestHealthCheckAndRunStarterUseServiceContext(t *testing.T) {
+	db := openScanTaskAPIDB(t)
+	service := schedule.NewTaskService(db, nil)
+	serviceContext, cancel := context.WithCancel(context.Background())
+	started := make(chan context.Context, 1)
+	handler, err := newHandlerWithScanTasksContext(serviceContext, db, func(string, string) (int64, error) { return 1, nil }, service, func(ctx context.Context, _ model.ScanTaskRun) {
+		started <- ctx
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	health := httptest.NewRecorder()
+	handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/api/healthz", nil))
+	if health.Code != http.StatusOK || !strings.Contains(health.Body.String(), `"status":"ok"`) {
+		t.Fatalf("health response=%d %s", health.Code, health.Body.String())
+	}
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, httptest.NewRequest(http.MethodPost, "/api/scan-tasks", bytes.NewBufferString(`{"target":"127.0.0.1","scan_type":"ip","mode":"once","config":{"port_spec":"80"}}`)))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create response=%d %s", created.Code, created.Body.String())
+	}
+	var runContext context.Context
+	select {
+	case runContext = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("run starter was not called")
+	}
+	cancel()
+	select {
+	case <-runContext.Done():
+	case <-time.After(time.Second):
+		t.Fatal("run starter context did not follow service shutdown")
 	}
 }
 
@@ -590,7 +633,7 @@ func openScanTaskAPIDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { _ = db.Close() })
 	for _, statement := range []string{
 		`CREATE TABLE scan_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, scan_type TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, cron TEXT, timezone TEXT, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, archived_at DATETIME)`,
-		`CREATE TABLE scan_task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_task_id INTEGER NOT NULL, sequence INTEGER NOT NULL, scheduled_for DATETIME NOT NULL, status TEXT NOT NULL, target TEXT NOT NULL, scan_type TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', error_message TEXT, report_path TEXT, audit_report_path TEXT, report_error TEXT, started_at DATETIME, finished_at DATETIME, snapshot_written_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, UNIQUE(scan_task_id, sequence), UNIQUE(scan_task_id, scheduled_for))`,
+		`CREATE TABLE scan_task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_task_id INTEGER NOT NULL, sequence INTEGER NOT NULL, scheduled_for DATETIME NOT NULL, status TEXT NOT NULL, trigger TEXT NOT NULL DEFAULT 'scheduled', stage TEXT NOT NULL DEFAULT 'queued', progress INTEGER NOT NULL DEFAULT 0, target TEXT NOT NULL, scan_type TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}', config_hash TEXT NOT NULL DEFAULT '', error_message TEXT, report_path TEXT, audit_report_path TEXT, report_error TEXT, started_at DATETIME, finished_at DATETIME, snapshot_written_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, UNIQUE(scan_task_id, sequence), UNIQUE(scan_task_id, scheduled_for))`,
 		`CREATE TABLE scan_task_run_hosts (scan_task_run_id INTEGER NOT NULL, ip TEXT NOT NULL, is_active INTEGER NOT NULL, PRIMARY KEY(scan_task_run_id, ip))`,
 		`CREATE TABLE scan_task_run_ports (scan_task_run_id INTEGER NOT NULL, ip TEXT NOT NULL, port INTEGER NOT NULL, service_type TEXT NOT NULL, product TEXT, banner TEXT, PRIMARY KEY(scan_task_run_id, ip, port))`,
 		`CREATE TABLE scan_task_run_protocol_evidence (scan_task_run_id INTEGER NOT NULL, ip TEXT NOT NULL, port INTEGER NOT NULL, evidence_type TEXT NOT NULL, probe_name TEXT NOT NULL DEFAULT '', protocol TEXT NOT NULL, responded INTEGER NOT NULL DEFAULT 0, outcome TEXT NOT NULL DEFAULT '', diagnostic TEXT NOT NULL DEFAULT '', status_code INTEGER, server TEXT, title TEXT, banner_captured_length INTEGER NOT NULL DEFAULT 0, banner_sha256 TEXT, banner_truncated INTEGER NOT NULL DEFAULT 0, header_captured_length INTEGER NOT NULL DEFAULT 0, header_sha256 TEXT, header_truncated INTEGER NOT NULL DEFAULT 0, body_captured_length INTEGER NOT NULL DEFAULT 0, body_sha256 TEXT, body_truncated INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(scan_task_run_id, ip, port, evidence_type, protocol, probe_name))`,

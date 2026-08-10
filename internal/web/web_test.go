@@ -26,12 +26,47 @@ func TestImmediateExecutionUsesV2ScanTasks(t *testing.T) {
 
 func TestScheduledTaskFormStaysScheduledOnly(t *testing.T) {
 	page := string(indexHTML)
-	form := pageSection(t, page, "function scanTaskForm()", "function changeList(")
+	form := pageSection(t, page, "function scanTaskForm(task = null)", "function changeList(")
 	if !strings.Contains(form, "mode: 'scheduled'") {
 		t.Fatal("scheduled task form must submit scheduled mode")
 	}
 	if strings.Contains(form, "name=\"mode\"") {
 		t.Fatal("scheduled task form must not expose an immediate execution mode")
+	}
+	for _, expected := range []string{"name=\"port_spec\"", "name=\"schedule_mode\"", "每日", "每周", "高级 Cron", "method:task ? 'PUT' : 'POST'"} {
+		if !strings.Contains(form, expected) {
+			t.Fatalf("scheduled task form missing %q", expected)
+		}
+	}
+}
+
+func TestTaskControlsExposeRunNowProgressCancelAndRefresh(t *testing.T) {
+	page := string(indexHTML)
+	for _, expected := range []string{"run-now", "立即运行", "run.progress", "run.stage", "<progress", "/cancel`, {method:'POST'}", "scheduleRouteRefresh", "scheduleScanTaskDetailRefresh", "3000"} {
+		if !strings.Contains(page, expected) {
+			t.Fatalf("task controls missing %q", expected)
+		}
+	}
+}
+
+func TestActiveRunDetailRefreshDoesNotReturnToTaskList(t *testing.T) {
+	page := string(indexHTML)
+	refresh := pageSection(t, page, "let routeRefreshTimer = 0", "function renderScanTaskStats(rows)")
+	for _, expected := range []string{
+		"let selectedScanTaskID = ''",
+		"selectedScanTaskID ? showScanTaskDetail(selectedScanTaskID) : render()",
+		"String(selectedScanTaskID) === String(taskID)",
+	} {
+		if !strings.Contains(refresh, expected) {
+			t.Fatalf("detail refresh state machine missing %q", expected)
+		}
+	}
+	if strings.Contains(refresh, "if (!document.hidden) render()") {
+		t.Fatal("active-run timer still unconditionally replaces detail with the task list")
+	}
+	detail := pageSection(t, page, "async function showScanTaskDetail(id)", "function bindScanTaskActions(task)")
+	if !strings.Contains(detail, "selectedScanTaskID = String(id)") || !strings.Contains(detail, "scheduleScanTaskDetailRefresh(task.id, runs)") || !strings.Contains(detail, "data-testid=\"scan-task-detail\"") {
+		t.Fatal("task detail does not retain selection and schedule its own refresh")
 	}
 }
 

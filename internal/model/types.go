@@ -42,6 +42,20 @@ const (
 	ScanTaskRunStatusCanceled        = "canceled"
 	ScanTaskRunStatusSkippedOverlap  = "skipped_overlap"
 	ScanTaskRunStatusSkippedMisfire  = "skipped_misfire"
+	ScanTaskRunTriggerInitial        = "initial"
+	ScanTaskRunTriggerManual         = "manual"
+	ScanTaskRunTriggerScheduled      = "scheduled"
+
+	ScanTaskRunStageQueued     = "queued"
+	ScanTaskRunStageStarting   = "starting"
+	ScanTaskRunStageDiscovery  = "discovery"
+	ScanTaskRunStageProfiling  = "profiling"
+	ScanTaskRunStageValidation = "validation"
+	ScanTaskRunStageSnapshot   = "snapshot"
+	ScanTaskRunStageReporting  = "reporting"
+	ScanTaskRunStageCompleted  = "completed"
+	ScanTaskRunStageFailed     = "failed"
+	ScanTaskRunStageCanceled   = "canceled"
 
 	ScanTaskRunValidationDisabled     = "disabled"
 	ScanTaskRunValidationNotStarted   = "not_started"
@@ -131,6 +145,9 @@ type ScanTaskRun struct {
 	Sequence          int            `json:"sequence"`
 	ScheduledFor      string         `json:"scheduled_for"`
 	Status            string         `json:"status"`
+	Trigger           string         `json:"trigger"`
+	Stage             string         `json:"stage"`
+	Progress          int            `json:"progress"`
 	Target            string         `json:"target"`
 	ScanType          string         `json:"scan_type"`
 	Config            ScanTaskConfig `json:"config"`
@@ -564,6 +581,18 @@ func IsScanTaskRunStatus(status string) bool {
 		ScanTaskRunStatusCanceled,
 		ScanTaskRunStatusSkippedOverlap,
 		ScanTaskRunStatusSkippedMisfire:
+		return true
+	default:
+		return false
+	}
+}
+
+func IsScanTaskRunStage(stage string) bool {
+	switch stage {
+	case ScanTaskRunStageQueued, ScanTaskRunStageStarting, ScanTaskRunStageDiscovery,
+		ScanTaskRunStageProfiling, ScanTaskRunStageValidation, ScanTaskRunStageSnapshot,
+		ScanTaskRunStageReporting, ScanTaskRunStageCompleted, ScanTaskRunStageFailed,
+		ScanTaskRunStageCanceled:
 		return true
 	default:
 		return false
