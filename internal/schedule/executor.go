@@ -42,9 +42,9 @@ func NewExecutor(db *sql.DB, run ScanTaskRunExecutor) *Executor {
 	return &Executor{DB: db, Run: run, Retention: NewRetentionPolicy(db, nil)}
 }
 
-// ExecuteRun owns the queued -> running -> terminal transition. Scan errors
-// are persisted as a failed/canceled run and deliberately do not propagate to
-// the scheduler loop, so one bad target cannot block later plan occurrences.
+// ExecuteRun owns the queued -> running scan transition. Scan errors are
+// persisted as failed/canceled. A reporting-aware caller may defer successful
+// terminal publication until its reports are ready.
 func (executor *Executor) ExecuteRun(ctx context.Context, runID int64) error {
 	if executor.DB == nil {
 		return errors.New("scan task executor database is required")
@@ -123,7 +123,7 @@ func (executor *Executor) executeStartedRun(ctx context.Context, run model.ScanT
 	if cancelRequested {
 		return executor.completeRun(runID, model.ScanTaskRunStatusCanceled, "canceled by request")
 	}
-	return executor.completeRun(runID, model.ScanTaskRunStatusSuccess, "")
+	return storage.UpdateScanTaskRunProgress(executor.DB, runID, model.ScanTaskRunStageReporting, 99)
 }
 
 func snapshotHasObservations(snapshot model.ScanTaskRunSnapshot) bool {
@@ -251,6 +251,21 @@ func (executor *Executor) markTerminal(runID int64, status, message string) erro
 // still use the completed result.
 func (executor *Executor) completeRun(runID int64, status, message string) error {
 	if err := executor.markTerminal(runID, status, message); err != nil {
+		return err
+	}
+	if executor.Retention == nil {
+		return nil
+	}
+	if _, err := executor.Retention.Prune(context.Background()); err != nil {
+		log.Printf("scan task run retention cleanup failed: %v", err)
+	}
+	return nil
+}
+
+// FinalizeSuccessfulRun publishes success only after the caller has completed
+// report preparation. Retention runs after the terminal state is durable.
+func (executor *Executor) FinalizeSuccessfulRun(runID int64, reportError string) error {
+	if err := storage.FinalizeSuccessfulScanTaskRun(executor.DB, runID, reportError); err != nil {
 		return err
 	}
 	if executor.Retention == nil {

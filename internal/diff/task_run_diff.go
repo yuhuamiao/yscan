@@ -53,11 +53,21 @@ func CompareScanTaskRuns(db *sql.DB, baselineRunID, currentRunID int64) (model.S
 // successful run that has an immutable snapshot. The first successful run uses
 // an empty baseline so its observed assets are reported as newly discovered.
 func CompareRunWithPreviousSuccess(db *sql.DB, currentRunID int64) (model.ScanTaskRunChanges, error) {
+	return compareRunWithPreviousSuccess(db, currentRunID, false)
+}
+
+// CompareReportingRunWithPreviousSuccess is reserved for report preparation.
+// Public API and CLI callers must continue to require an already-successful run.
+func CompareReportingRunWithPreviousSuccess(db *sql.DB, currentRunID int64) (model.ScanTaskRunChanges, error) {
+	return compareRunWithPreviousSuccess(db, currentRunID, true)
+}
+
+func compareRunWithPreviousSuccess(db *sql.DB, currentRunID int64, allowReporting bool) (model.ScanTaskRunChanges, error) {
 	currentRun, err := storage.GetScanTaskRun(db, currentRunID)
 	if err != nil {
 		return model.ScanTaskRunChanges{}, err
 	}
-	if currentRun.Status != model.ScanTaskRunStatusSuccess {
+	if currentRun.Status != model.ScanTaskRunStatusSuccess && !(allowReporting && isReportingRun(currentRun)) {
 		return model.ScanTaskRunChanges{}, ErrScanTaskRunNotSuccessful
 	}
 	current, err := storage.GetScanTaskRunSnapshot(db, currentRunID)
@@ -94,6 +104,10 @@ func CompareRunWithPreviousSuccess(db *sql.DB, currentRunID int64) (model.ScanTa
 		model.ScanTaskRunSnapshot{Hosts: []model.ScanTaskRunHost{}, Ports: []model.ScanTaskRunPort{}, Vulnerabilities: []model.ScanTaskRunVulnerability{}},
 		current,
 	), nil
+}
+
+func isReportingRun(run model.ScanTaskRun) bool {
+	return run.Status == model.ScanTaskRunStatusRunning && run.Stage == model.ScanTaskRunStageReporting
 }
 
 func configChangedRunChanges(scanTaskID, baselineRunID, currentRunID int64) model.ScanTaskRunChanges {

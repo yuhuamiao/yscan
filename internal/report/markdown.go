@@ -68,6 +68,14 @@ func GenerateScanTaskRunReport(db *sql.DB, scanTaskID, runID int64, directory st
 		return "", fmt.Errorf("scan task run %d does not belong to scan task %d", runID, scanTaskID)
 	}
 
+	reportRun := run
+	if run.Status == model.ScanTaskRunStatusRunning && run.Stage == model.ScanTaskRunStageReporting {
+		reportRun.Status = model.ScanTaskRunStatusSuccess
+		reportRun.Stage = model.ScanTaskRunStageCompleted
+		reportRun.Progress = 100
+		reportRun.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+
 	snapshot := emptyRunSnapshot(run.ID)
 	loadedSnapshot, err := storage.GetScanTaskRunSnapshot(db, run.ID)
 	if err == nil {
@@ -77,8 +85,12 @@ func GenerateScanTaskRunReport(db *sql.DB, scanTaskID, runID int64, directory st
 	}
 
 	changes := emptyRunChanges(task.ID, run.ID)
-	if run.Status == model.ScanTaskRunStatusSuccess {
-		changes, err = diff.CompareRunWithPreviousSuccess(db, run.ID)
+	if reportRun.Status == model.ScanTaskRunStatusSuccess {
+		if run.Status == model.ScanTaskRunStatusSuccess {
+			changes, err = diff.CompareRunWithPreviousSuccess(db, run.ID)
+		} else {
+			changes, err = diff.CompareReportingRunWithPreviousSuccess(db, run.ID)
+		}
 		if err != nil {
 			return "", err
 		}
@@ -97,7 +109,7 @@ func GenerateScanTaskRunReport(db *sql.DB, scanTaskID, runID int64, directory st
 	}
 
 	transaction, err := prepareScanTaskRunReport(directory, ScanTaskRunReport{
-		Task: task, Run: run, Changes: changes, Snapshot: snapshot,
+		Task: task, Run: reportRun, Changes: changes, Snapshot: snapshot,
 		FingerprintImports: frozenImports, FingerprintMatches: fingerprintMatches,
 		FingerprintConclusions: fingerprintConclusions, GeneratedAt: time.Now().UTC(),
 	})

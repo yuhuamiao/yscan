@@ -131,6 +131,31 @@ func TestUpdateScanTaskRunReportErrorPreservesTerminalRun(t *testing.T) {
 	}
 }
 
+func TestReportingRunFinalizesAtomicallyAndCannotBeCanceled(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	task := createScheduledTaskForTest(t, db, "192.168.61.0/24")
+	run, err := CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-07-24T02:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE scan_task_runs SET status = ?, stage = ?, progress = 99, started_at = datetime('now') WHERE id = ?`, model.ScanTaskRunStatusRunning, model.ScanTaskRunStageReporting, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := CancelScanTaskRun(db, task.ID, run.ID); !errors.Is(err, ErrScanTaskRunNotCancelable) {
+		t.Fatalf("reporting cancellation error=%v", err)
+	}
+	if err := FinalizeSuccessfulScanTaskRun(db, run.ID, "report write failed"); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := GetScanTaskRun(db, run.ID)
+	if err != nil || completed.Status != model.ScanTaskRunStatusSuccess || completed.Stage != model.ScanTaskRunStageCompleted || completed.Progress != 100 || completed.FinishedAt == "" || completed.ReportError != "report write failed" {
+		t.Fatalf("completed=%#v err=%v", completed, err)
+	}
+}
+
 func TestClaimQueuedOneTimeRunFreezesActiveImportsOnlyWhenMissing(t *testing.T) {
 	db := openTestDB(t)
 	if err := initSQLiteSchema(db); err != nil {

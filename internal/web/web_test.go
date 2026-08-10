@@ -33,7 +33,7 @@ func TestScheduledTaskFormStaysScheduledOnly(t *testing.T) {
 	if strings.Contains(form, "name=\"mode\"") {
 		t.Fatal("scheduled task form must not expose an immediate execution mode")
 	}
-	for _, expected := range []string{"name=\"port_spec\"", "name=\"schedule_mode\"", "每日", "每周", "高级 Cron", "method:task ? 'PUT' : 'POST'"} {
+	for _, expected := range []string{"portPolicyControl(scanType", "name=\"schedule_mode\"", "每日", "每周", "高级 Cron", "method:task ? 'PUT' : 'POST'"} {
 		if !strings.Contains(form, expected) {
 			t.Fatalf("scheduled task form missing %q", expected)
 		}
@@ -54,19 +54,147 @@ func TestActiveRunDetailRefreshDoesNotReturnToTaskList(t *testing.T) {
 	refresh := pageSection(t, page, "let routeRefreshTimer = 0", "function renderScanTaskStats(rows)")
 	for _, expected := range []string{
 		"let selectedScanTaskID = ''",
-		"selectedScanTaskID ? showScanTaskDetail(selectedScanTaskID) : render()",
-		"String(selectedScanTaskID) === String(taskID)",
+		"let scanTaskDetailEpoch = 0",
+		"let runDetailLoadSerial = 0",
+		"let scanTaskDetailRefreshFailed = false",
+		"function refreshScanTaskDetail(taskID, runs, epoch)",
+		"epoch !== scanTaskDetailEpoch",
+		"runs.splice(0, runs.length, ...refreshedRuns)",
+		"updateRunState(document.getElementById('run-detail')",
+		"scanTaskDetailRefreshFailed = false; message('')",
+		"scanTaskDetailRefreshFailed = true; message(error.message, true); scheduleScanTaskDetailRefresh(taskID, runs, epoch)",
 	} {
 		if !strings.Contains(refresh, expected) {
 			t.Fatalf("detail refresh state machine missing %q", expected)
 		}
 	}
-	if strings.Contains(refresh, "if (!document.hidden) render()") {
-		t.Fatal("active-run timer still unconditionally replaces detail with the task list")
+	if strings.Contains(refresh, "showScanTaskDetail(taskID)") || strings.Contains(refresh, "showScanTaskDetail(selectedScanTaskID)") {
+		t.Fatal("active-run polling still rebuilds the selected task detail")
+	}
+	if strings.Contains(refresh, "renderScanTasks()") || strings.Contains(refresh, "renderImmediateExecutions()") {
+		t.Fatal("list polling still rebuilds the current route")
 	}
 	detail := pageSection(t, page, "async function showScanTaskDetail(id)", "function bindScanTaskActions(task)")
-	if !strings.Contains(detail, "selectedScanTaskID = String(id)") || !strings.Contains(detail, "scheduleScanTaskDetailRefresh(task.id, runs)") || !strings.Contains(detail, "data-testid=\"scan-task-detail\"") {
+	if !strings.Contains(detail, "selectedScanTaskID = String(id)") || !strings.Contains(detail, "scheduleScanTaskDetailRefresh(task.id, runs, epoch)") || !strings.Contains(detail, "data-testid=\"scan-task-detail\"") {
 		t.Fatal("task detail does not retain selection and schedule its own refresh")
+	}
+}
+
+func TestRunDiffRequestsIncludeBaselineAndSequenceIdentity(t *testing.T) {
+	page := string(indexHTML)
+	section := pageSection(t, page, "async function loadRunDetailAndChanges", "async function renderImmediateExecutions")
+	for _, expected := range []string{
+		"loadSerial = ++runDetailLoadSerial",
+		"function runDetailRequestCurrent(taskID, runID, baselineRunID, epoch, loadSerial)",
+		"loadSerial === runDetailLoadSerial",
+		"document.getElementById('baseline-select')?.value",
+		"loadRunChanges(taskID, run, baselineRunID, epoch, loadSerial)",
+	} {
+		if !strings.Contains(section, expected) {
+			t.Fatalf("run Diff request isolation missing %q", expected)
+		}
+	}
+	if !strings.Contains(page, "loadRunChanges(taskID, selectedRun, baselineRunID, epoch, ++runDetailLoadSerial)") {
+		t.Fatal("natural completion does not invalidate older Diff requests")
+	}
+}
+
+func TestListAndTerminalRefreshMutateExistingControls(t *testing.T) {
+	page := string(indexHTML)
+	for _, expected := range []string{
+		"function refreshScanTaskRows(routeMode, rows, epoch)",
+		"syncVisibleScanTaskRow(task, runs)",
+		"scheduleRouteRefresh('all', rows, epoch)",
+		"scheduleRouteRefresh('once', rows, epoch)",
+		"function syncRunSelectors(runs, selectedRunID)",
+		"activeRun(previousSelected) && !activeRun(selectedRun)",
+		"loadRunChanges(taskID, selectedRun",
+	} {
+		if !strings.Contains(page, expected) {
+			t.Fatalf("incremental list/terminal refresh missing %q", expected)
+		}
+	}
+}
+
+func TestPortPolicyPresetsAreSharedByScheduledAndImmediateForms(t *testing.T) {
+	page := string(indexHTML)
+	for _, expected := range []string{
+		"function portPolicyControl(scanType, portSpec = '')",
+		"function bindPortPolicy(form)",
+		"默认策略", "重要端口", "Web 常见端口", "基础服务端口", "数据库与中间件", "全端口", "自定义",
+		"name=\"port_preset\"", "name=\"port_spec\"", "1-65535", "baselinePortSpec",
+	} {
+		if !strings.Contains(page, expected) {
+			t.Fatalf("port policy presets missing %q", expected)
+		}
+	}
+	if strings.Count(page, "bindPortPolicy(") < 3 {
+		t.Fatal("scheduled and immediate forms do not share port policy binding")
+	}
+	if !strings.Contains(page, "function submittedPortSpec(values) { return values.get('port_preset') === 'default' ? ''") || strings.Count(page, "port_spec: submittedPortSpec(") != 2 {
+		t.Fatal("default port policy must display its range without persisting an explicit port_spec")
+	}
+}
+
+func TestMarkdownTablesHandleEscapedPipes(t *testing.T) {
+	page := string(indexHTML)
+	section := pageSection(t, page, "function markdownCells(line)", "function markdownTableSeparator(line)")
+	for _, expected := range []string{"trimmed[index] === '\\\\'", "trimmed[index + 1] === '|'", "cell += '|'"} {
+		if !strings.Contains(section, expected) {
+			t.Fatalf("Markdown table parser does not preserve escaped pipes: missing %q", expected)
+		}
+	}
+}
+
+func TestReportLoadingRejectsStaleSuccessAndFailure(t *testing.T) {
+	page := string(indexHTML)
+	section := pageSection(t, page, "const reportSelection =", "function route()")
+	for _, expected := range []string{
+		"loadSerial: 0",
+		"loadSerial = ++reportSelection.loadSerial",
+		"const isCurrent = () => loadSerial === reportSelection.loadSerial",
+		"catch (error) { if (isCurrent()) setMarkdownReport",
+		"catch (error) { if (isCurrent()) findings.innerHTML",
+	} {
+		if !strings.Contains(section, expected) {
+			t.Fatalf("report request isolation missing %q", expected)
+		}
+	}
+}
+
+func TestTerminalRunRefreshWaitsForReportOutcome(t *testing.T) {
+	page := string(indexHTML)
+	refresh := pageSection(t, page, "function activeRun(run)", "function scheduleRefresh(refresh)")
+	for _, expected := range []string{
+		"function runNeedsRefresh(run)",
+		"['failed', 'canceled'].includes(run.status)",
+		"!run.report_error",
+		"!run.report_path || !run.audit_report_path",
+	} {
+		if !strings.Contains(refresh, expected) {
+			t.Fatalf("terminal report refresh missing %q", expected)
+		}
+	}
+	if !strings.Contains(page, "rows.some(row => runNeedsRefresh") || !strings.Contains(page, "if (!runNeedsRefresh(runs[runs.length - 1])) return") {
+		t.Fatal("task list and detail do not use the terminal report refresh contract")
+	}
+}
+
+func TestActiveRunDetailRefreshSynchronizesVisibleTaskRow(t *testing.T) {
+	page := string(indexHTML)
+	for _, expected := range []string{
+		"let visibleScanTaskRows = []",
+		"function syncVisibleScanTaskRow(task, runs)",
+		"stats.innerHTML = renderScanTaskStats(visibleScanTaskRows)",
+		"syncVisibleRunDetail(taskID, runs, run)",
+		"data-testid=\"run-state\"",
+		"data-run-status",
+		"data-run-stage",
+		"data-run-progress",
+	} {
+		if !strings.Contains(page, expected) {
+			t.Fatalf("task list/detail synchronization missing %q", expected)
+		}
 	}
 }
 
@@ -114,7 +242,7 @@ func TestFingerprintPageLoadsCompleteManagementData(t *testing.T) {
 func TestReportsLoadStructuredFindingsAndSeparateAuditReport(t *testing.T) {
 	page := string(indexHTML)
 	section := pageSection(t, page, "async function renderReports()", "function route()")
-	for _, expected := range []string{"/findings?page=1&page_size=100", "/audit-report", "executed_endpoint_count", "candidate_endpoint_count", "未启用漏洞验证", "无可用端点或模板", "验证成功，未发现漏洞", "漏洞验证失败"} {
+	for _, expected := range []string{"/findings?page=1&page_size=100", "'audit-report'", "executed_endpoint_count", "candidate_endpoint_count", "未启用漏洞验证", "无可用端点或模板", "验证成功，未发现漏洞", "漏洞验证失败"} {
 		if !strings.Contains(section, expected) {
 			t.Fatalf("report page missing %q", expected)
 		}
@@ -124,6 +252,38 @@ func TestReportsLoadStructuredFindingsAndSeparateAuditReport(t *testing.T) {
 	}
 	if !strings.Contains(section, "item.description") || strings.Contains(section, "item.evidence") {
 		t.Fatal("report page must render parsed descriptions without raw nuclei evidence")
+	}
+}
+
+func TestReportsUseSafeMarkdownAndBoundedSearchPickers(t *testing.T) {
+	page := string(indexHTML)
+	for _, expected := range []string{
+		"function renderMarkdown(source)", "markdownTableSeparator", "markdownInline", "setMarkdownReport(content)",
+		"id=\"report-task-search\"", "id=\"report-run-search\"", "data-report-mode=\"user\"", "data-report-mode=\"audit\"",
+		"reportTaskMatches", "reportRunMatches", ".slice(0, 20)", "sort((left, right) => Number(right.sequence)",
+	} {
+		if !strings.Contains(page, expected) {
+			t.Fatalf("report interaction missing %q", expected)
+		}
+	}
+	if strings.Contains(page, "<pre class=\"markdown\"") || strings.Contains(page, "report.textContent = await request") {
+		t.Fatal("reports still expose Markdown source instead of the safe renderer")
+	}
+}
+
+func TestAssetPageUsesFixedSearchableNavigation(t *testing.T) {
+	page := string(indexHTML)
+	if !strings.Contains(page, ".asset-split { grid-template-columns: 380px minmax(0, 1fr); }") {
+		t.Fatal("asset navigation does not use the fixed desktop track")
+	}
+	section := pageSection(t, page, "async function renderAssets()", "let fingerprintRulePage")
+	for _, expected := range []string{"asset-nav", "id=\"asset-search\"", "asset-list", "data-asset-search", "最后发现"} {
+		if !strings.Contains(section, expected) {
+			t.Fatalf("asset navigation missing %q", expected)
+		}
+	}
+	if strings.Contains(section, "<th>首次发现</th>") {
+		t.Fatal("asset navigation still renders the wide five-column table")
 	}
 }
 

@@ -93,13 +93,15 @@ func TestT293RealLegacyUpgradeAndScan(t *testing.T) {
 	if err := executor.ExecuteRun(context.Background(), run.ID); err != nil {
 		t.Fatalf("execute real scan: %v", err)
 	}
-	assertSuccessfulRealRun(t, db, task, run.ID, httpPort, httpsPort, nginxPort, harborPort, seeyonPort, sshPort, mysqlPort)
-
 	reportDirectory := filepath.Join(t.TempDir(), "reports")
 	reportPath, err := report.GenerateScanTaskRunReport(db, task.ID, run.ID, reportDirectory)
 	if err != nil {
 		t.Fatalf("generate successful run report: %v", err)
 	}
+	if err := executor.FinalizeSuccessfulRun(run.ID, ""); err != nil {
+		t.Fatalf("finalize successful run: %v", err)
+	}
+	assertSuccessfulRealRun(t, db, task, run.ID, httpPort, httpsPort, nginxPort, harborPort, seeyonPort, sshPort, mysqlPort)
 	assertAuditReport(t, reportPath, false)
 	verifyCanceledPartialRun(t, db, reportDirectory)
 }
@@ -147,11 +149,14 @@ func TestT293RealProductServices(t *testing.T) {
 	if err := executor.ExecuteRun(context.Background(), run.ID); err != nil {
 		t.Fatalf("execute product scan: %v", err)
 	}
-	assertRealProductRun(t, db, task, run.ID)
 	reportPath, err := report.GenerateScanTaskRunReport(db, task.ID, run.ID, filepath.Join(t.TempDir(), "reports"))
 	if err != nil {
 		t.Fatalf("generate product report: %v", err)
 	}
+	if err := executor.FinalizeSuccessfulRun(run.ID, ""); err != nil {
+		t.Fatalf("finalize product run: %v", err)
+	}
+	assertRealProductRun(t, db, task, run.ID)
 	assertAuditReport(t, reportPath, false)
 }
 

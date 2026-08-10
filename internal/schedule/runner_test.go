@@ -98,6 +98,94 @@ func TestRunnerStartupFinalizesOrphanedRunningRunBeforeScheduling(t *testing.T) 
 	}
 }
 
+func TestRunnerStartupCompletesInterruptedAndLegacySuccessfulReportingRuns(t *testing.T) {
+	db := openRunnerTestDB(t)
+	firstTask := createRunnerTask(t, db, "192.168.13.0/24", "2026-07-24 00:00:00")
+	secondTask := createRunnerTask(t, db, "192.168.14.0/24", "2026-07-24 00:00:00")
+	interrupted, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: firstTask.ID, ScheduledFor: "2026-07-24T02:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: secondTask.ID, ScheduledFor: "2026-07-24T02:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE scan_task_runs SET status = ?, stage = ?, progress = 99, started_at = datetime('now') WHERE id = ?`, model.ScanTaskRunStatusRunning, model.ScanTaskRunStageReporting, interrupted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE scan_task_runs SET status = ?, stage = ?, progress = 99, started_at = datetime('now'), finished_at = datetime('now') WHERE id = ?`, model.ScanTaskRunStatusSuccess, model.ScanTaskRunStageReporting, legacy.ID); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(db, nil)
+	var recovered []model.ScanTaskRun
+	runner.OnRecovered = func(run model.ScanTaskRun) error {
+		recovered = append(recovered, run)
+		return nil
+	}
+	if err := runner.RecoverStartupState(); err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 2 {
+		t.Fatalf("recovered=%#v", recovered)
+	}
+	for _, runID := range []int64{interrupted.ID, legacy.ID} {
+		completed, err := storage.GetScanTaskRun(db, runID)
+		if err != nil || completed.Status != model.ScanTaskRunStatusSuccess || completed.Stage != model.ScanTaskRunStageCompleted || completed.Progress != 100 || completed.FinishedAt == "" {
+			t.Fatalf("completed run %d=%#v err=%v", runID, completed, err)
+		}
+	}
+}
+
+func TestRunnerStartupRepairsTerminalReportingStagesAndRecoversMissingReports(t *testing.T) {
+	db := openRunnerTestDB(t)
+	tests := []struct {
+		target string
+		status string
+		stage  string
+		want   string
+	}{
+		{target: "192.168.31.0/24", status: model.ScanTaskRunStatusFailed, stage: model.ScanTaskRunStageReporting, want: model.ScanTaskRunStageFailed},
+		{target: "192.168.32.0/24", status: model.ScanTaskRunStatusCanceled, stage: model.ScanTaskRunStageReporting, want: model.ScanTaskRunStageCanceled},
+		{target: "192.168.33.0/24", status: model.ScanTaskRunStatusFailed, stage: model.ScanTaskRunStageFailed, want: model.ScanTaskRunStageFailed},
+	}
+	created := make([]model.ScanTaskRun, 0, len(tests))
+	for index, item := range tests {
+		task := createRunnerTask(t, db, item.target, "2026-07-24 00:00:00")
+		run, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{
+			ScanTaskID: task.ID, ScheduledFor: time.Date(2026, time.July, 24, 2, index, 0, 0, time.UTC).Format(time.RFC3339),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE scan_task_runs SET status = ?, stage = ?, progress = 99, started_at = datetime('now'), finished_at = datetime('now') WHERE id = ?`, item.status, item.stage, run.ID); err != nil {
+			t.Fatal(err)
+		}
+		created = append(created, run)
+	}
+
+	runner := NewRunner(db, nil)
+	var recovered []model.ScanTaskRun
+	runner.OnRecovered = func(run model.ScanTaskRun) error {
+		recovered = append(recovered, run)
+		return nil
+	}
+	if err := runner.RecoverStartupState(); err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != len(tests) {
+		t.Fatalf("recovered=%#v", recovered)
+	}
+	for index, run := range created {
+		loaded, err := storage.GetScanTaskRun(db, run.ID)
+		if err != nil || loaded.Status != tests[index].status || loaded.Stage != tests[index].want {
+			t.Fatalf("repaired run %d=%#v err=%v", run.ID, loaded, err)
+		}
+		if tests[index].stage == model.ScanTaskRunStageReporting && loaded.Progress >= 99 {
+			t.Fatalf("reporting progress was not repaired: %#v", loaded)
+		}
+	}
+}
+
 func TestRunnerStartupFinalizesOrphanedScheduledQueuedRun(t *testing.T) {
 	db := openRunnerTestDB(t)
 	task := createRunnerTask(t, db, "192.168.12.0/24", "2026-07-24 00:00:00")

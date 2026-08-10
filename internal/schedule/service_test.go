@@ -149,6 +149,31 @@ func TestTaskServiceRejectsInvalidPortSpecOnCreateAndUpdate(t *testing.T) {
 	}
 }
 
+func TestTaskServiceKeepsFullPortRangeCompactInTaskAndRun(t *testing.T) {
+	db := openRunnerTestDB(t)
+	service := NewTaskService(db, ClockFunc(func() time.Time { return time.Date(2026, 7, 24, 2, 0, 0, 0, time.UTC) }))
+	task, run, err := service.Create(context.Background(), model.ScanTask{
+		Target: "192.168.30.10", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeOnce,
+		Config: model.ScanTaskConfig{PortSpec: "1-65535"},
+	})
+	if err != nil || run == nil {
+		t.Fatalf("create task=%#v run=%#v err=%v", task, run, err)
+	}
+	if task.Config.PortSpec != "1-65535" || run.Config.PortSpec != "1-65535" {
+		t.Fatalf("expanded port specs task=%q run=%q", task.Config.PortSpec, run.Config.PortSpec)
+	}
+	var taskConfigLength, runConfigLength int
+	if err := db.QueryRow(`SELECT length(config_json) FROM scan_tasks WHERE id = ?`, task.ID).Scan(&taskConfigLength); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT length(config_json) FROM scan_task_runs WHERE id = ?`, run.ID).Scan(&runConfigLength); err != nil {
+		t.Fatal(err)
+	}
+	if taskConfigLength > 512 || runConfigLength > 512 {
+		t.Fatalf("compact config lengths task=%d run=%d", taskConfigLength, runConfigLength)
+	}
+}
+
 func TestTaskServiceRunNowStartsInitialAndScheduledManualRuns(t *testing.T) {
 	db := openRunnerTestDB(t)
 	now := time.Date(2026, time.August, 9, 12, 0, 0, 123, time.UTC)

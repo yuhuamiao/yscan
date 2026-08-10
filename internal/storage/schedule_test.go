@@ -1,7 +1,10 @@
 package storage
 
 import (
+	"encoding/json"
 	"errors"
+	"strconv"
+	"strings"
 	"testing"
 
 	"golandproject/yscan/internal/model"
@@ -75,5 +78,62 @@ func TestScanTaskLifecycleAndSchedulingBoundary(t *testing.T) {
 	}
 	if _, err := UpdateScanTask(db, updated); !errors.Is(err, ErrScanTaskArchived) {
 		t.Fatalf("update archived task error = %v, want ErrScanTaskArchived", err)
+	}
+}
+
+func TestCompactPortSpecMigrationRepairsExistingTaskAndRunWithoutChangingHashes(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM schema_migrations WHERE name = ?`, t349CompactPortSpecMigration); err != nil {
+		t.Fatal(err)
+	}
+	values := make([]string, 65535)
+	for index := range values {
+		values[index] = strconv.Itoa(index + 1)
+	}
+	expanded := strings.Join(values, ",")
+	content, err := json.Marshal(model.ScanTaskConfig{PortSpec: expanded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Exec(`INSERT INTO scan_tasks (target, scan_type, mode, status, config_json, config_hash, created_at, updated_at) VALUES ('127.0.0.1', 'ip', 'once', 'enabled', ?, 'legacy-task-hash', datetime('now'), datetime('now'))`, string(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := result.LastInsertId()
+	if _, err := db.Exec(`INSERT INTO scan_task_runs (scan_task_id, sequence, scheduled_for, status, trigger, stage, progress, target, scan_type, config_json, config_hash, created_at, updated_at) VALUES (?, 1, datetime('now'), 'success', 'initial', 'completed', 100, '127.0.0.1', 'ip', ?, 'legacy-run-hash', datetime('now'), datetime('now'))`, taskID, string(content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateCompactScanTaskPortSpecs(db); err != nil {
+		t.Fatal(err)
+	}
+	var taskConfig, taskHash, runConfig, runHash string
+	if err := db.QueryRow(`SELECT config_json, config_hash FROM scan_tasks WHERE id = ?`, taskID).Scan(&taskConfig, &taskHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT config_json, config_hash FROM scan_task_runs WHERE scan_task_id = ?`, taskID).Scan(&runConfig, &runHash); err != nil {
+		t.Fatal(err)
+	}
+	if len(taskConfig) > 512 || len(runConfig) > 512 || !strings.Contains(taskConfig, `"port_spec":"1-65535"`) || !strings.Contains(runConfig, `"port_spec":"1-65535"`) {
+		t.Fatalf("configs were not compacted task_len=%d run_len=%d task=%s run=%s", len(taskConfig), len(runConfig), taskConfig, runConfig)
+	}
+	if taskHash != "legacy-task-hash" || runHash != "legacy-run-hash" {
+		t.Fatalf("historical hashes changed task=%q run=%q", taskHash, runHash)
+	}
+	migratedTask, err := GetScanTask(db, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unchanged, err := UpdateScanTask(db, migratedTask)
+	if err != nil {
+		t.Fatalf("save migrated task without changes: %v", err)
+	}
+	if unchanged.ConfigHash != "legacy-task-hash" {
+		t.Fatalf("no-op save changed migrated hash to %q", unchanged.ConfigHash)
+	}
+	if err := migrateCompactScanTaskPortSpecs(db); err != nil {
+		t.Fatalf("idempotent migration: %v", err)
 	}
 }

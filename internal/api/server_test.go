@@ -375,6 +375,136 @@ func TestHealthCheckAndRunStarterUseServiceContext(t *testing.T) {
 	}
 }
 
+func TestScanTaskCreateResponseKeepsFullPortRangeCompact(t *testing.T) {
+	db := openScanTaskAPIDB(t)
+	service := schedule.NewTaskService(db, nil)
+	handler, err := newHandlerWithScanTasks(db, func(string, string) (int64, error) { return 1, nil }, service, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/scan-tasks", bytes.NewBufferString(`{"target":"127.0.0.1","scan_type":"ip","mode":"once","config":{"port_spec":"1-65535"}}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create response=%d %s", response.Code, response.Body.String())
+	}
+	if response.Body.Len() > 4096 || !strings.Contains(response.Body.String(), `"port_spec":"1-65535"`) {
+		t.Fatalf("expanded create response length=%d body=%s", response.Body.Len(), response.Body.String())
+	}
+}
+
+func TestMigratedScanTaskNoOpAPIEditKeepsDiffComparable(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "migrated-no-op.db")
+	db, err := storage.InitDBAt(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := schedule.NewTaskService(db, schedule.ClockFunc(func() time.Time {
+		return time.Date(2026, time.July, 24, 2, 0, 0, 0, time.UTC)
+	}))
+	task, _, err := service.Create(context.Background(), model.ScanTask{
+		Target: "192.168.40.10", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeScheduled,
+		Cron: "0 2 * * *", Timezone: "UTC", Config: model.ScanTaskConfig{PortSpec: "65534-65535"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const legacyHash = "legacy-expanded-port-config-hash"
+	const legacyConfig = `{"port_spec":"65534,65535","vulnerability_on":false}`
+	if _, err := db.Exec(`UPDATE scan_tasks SET config_json = ?, config_hash = ? WHERE id = ?`, legacyConfig, legacyHash, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	first := createCompletedScanTaskRunForAPI(t, db, task.ID, "2026-07-24T02:00:00Z", model.ScanTaskRunSnapshot{})
+	if stored, err := storage.GetScanTaskRun(db, first.ID); err != nil || stored.ConfigHash != legacyHash {
+		t.Fatalf("baseline run hash=%q err=%v", stored.ConfigHash, err)
+	}
+	if _, err := db.Exec(`DELETE FROM schema_migrations WHERE name = 't349-compact-port-spec-v1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = storage.InitDBAt(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	migrated, err := storage.GetScanTask(db, task.ID)
+	if err != nil || migrated.Config.PortSpec != "65534-65535" || migrated.ConfigHash != legacyHash {
+		t.Fatalf("migrated task=%#v err=%v", migrated, err)
+	}
+	service = schedule.NewTaskService(db, schedule.ClockFunc(func() time.Time {
+		return time.Date(2026, time.July, 24, 2, 0, 0, 0, time.UTC)
+	}))
+
+	handler, err := newHandlerWithScanTasks(db, func(string, string) (int64, error) { return 1, nil }, service, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update := httptest.NewRecorder()
+	updatePath := "/api/scan-tasks/" + strconv.FormatInt(task.ID, 10)
+	updateBody := `{"target":"192.168.40.10","scan_type":"ip","mode":"scheduled","cron":"0 2 * * *","timezone":"UTC","config":{"port_spec":"65534-65535"}}`
+	handler.ServeHTTP(update, httptest.NewRequest(http.MethodPut, updatePath, bytes.NewBufferString(updateBody)))
+	if update.Code != http.StatusOK {
+		t.Fatalf("no-op update response=%d %s", update.Code, update.Body.String())
+	}
+	var updated model.ScanTask
+	if err := json.Unmarshal(update.Body.Bytes(), &updated); err != nil || updated.ConfigHash != legacyHash {
+		t.Fatalf("updated task=%#v err=%v", updated, err)
+	}
+	second := createCompletedScanTaskRunForAPI(t, db, task.ID, "2026-07-25T02:00:00Z", model.ScanTaskRunSnapshot{})
+
+	changes := httptest.NewRecorder()
+	changesPath := updatePath + "/runs/" + strconv.FormatInt(second.ID, 10) + "/changes"
+	handler.ServeHTTP(changes, httptest.NewRequest(http.MethodGet, changesPath, nil))
+	if changes.Code != http.StatusOK {
+		t.Fatalf("changes response=%d %s", changes.Code, changes.Body.String())
+	}
+	var result model.ScanTaskRunChanges
+	if err := json.Unmarshal(changes.Body.Bytes(), &result); err != nil || result.ConfigChanged {
+		t.Fatalf("changes=%#v err=%v", result, err)
+	}
+}
+
+func TestDefaultPortPolicyNoOpAPIEditKeepsDiffComparable(t *testing.T) {
+	db := openScanTaskAPIDB(t)
+	service := schedule.NewTaskService(db, schedule.ClockFunc(func() time.Time {
+		return time.Date(2026, time.July, 24, 2, 0, 0, 0, time.UTC)
+	}))
+	task, _, err := service.Create(context.Background(), model.ScanTask{
+		Target: "127.0.0.1", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeScheduled,
+		Cron: "0 2 * * *", Timezone: "UTC", Config: model.ScanTaskConfig{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := createCompletedScanTaskRunForAPI(t, db, task.ID, "2026-07-24T02:00:00Z", model.ScanTaskRunSnapshot{})
+	handler, err := newHandlerWithScanTasks(db, func(string, string) (int64, error) { return 1, nil }, service, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update := httptest.NewRecorder()
+	updatePath := "/api/scan-tasks/" + strconv.FormatInt(task.ID, 10)
+	updateBody := `{"target":"127.0.0.1","scan_type":"ip","mode":"scheduled","cron":"0 2 * * *","timezone":"UTC","config":{"port_spec":""}}`
+	handler.ServeHTTP(update, httptest.NewRequest(http.MethodPut, updatePath, bytes.NewBufferString(updateBody)))
+	if update.Code != http.StatusOK {
+		t.Fatalf("default no-op update response=%d %s", update.Code, update.Body.String())
+	}
+	var updated model.ScanTask
+	if err := json.Unmarshal(update.Body.Bytes(), &updated); err != nil || updated.ConfigHash != task.ConfigHash || updated.Config.PortSpec != "" {
+		t.Fatalf("default no-op task=%#v err=%v", updated, err)
+	}
+	second := createCompletedScanTaskRunForAPI(t, db, task.ID, "2026-07-25T02:00:00Z", model.ScanTaskRunSnapshot{})
+	changes := httptest.NewRecorder()
+	handler.ServeHTTP(changes, httptest.NewRequest(http.MethodGet, updatePath+"/runs/"+strconv.FormatInt(second.ID, 10)+"/changes?baseline_run_id="+strconv.FormatInt(first.ID, 10), nil))
+	var result model.ScanTaskRunChanges
+	if changes.Code != http.StatusOK {
+		t.Fatalf("default no-op changes response=%d %s", changes.Code, changes.Body.String())
+	}
+	if err := json.Unmarshal(changes.Body.Bytes(), &result); err != nil || result.ConfigChanged {
+		t.Fatalf("default no-op changes=%#v err=%v", result, err)
+	}
+}
+
 func TestScanTaskRunChangesAPIStaysWithinLogicalTask(t *testing.T) {
 	db := openScanTaskAPIDB(t)
 	service := schedule.NewTaskService(db, schedule.ClockFunc(func() time.Time {

@@ -169,7 +169,7 @@ func TestRunUserReportLeadsWithValidationAndKeepsAuditDetailsOut(t *testing.T) {
 			Validation:         model.ScanTaskRunValidation{Status: model.ScanTaskRunValidationSuccess, CandidateEndpointCount: 2, ExecutedEndpointCount: 2, TemplateCount: 3, FindingCount: 1},
 			Ports:              []model.ScanTaskRunPort{{IP: "192.168.75.1", Port: 23333, ServiceType: "http", Product: "nginx"}},
 			ProtocolEvidence:   []model.ScanTaskRunProtocolEvidence{{IP: "192.168.75.1", Port: 23333, Protocol: "http", Responded: true, StatusCode: 500, Server: "nginx", BodyCapturedLength: 2422}},
-			Vulnerabilities:    []model.ScanTaskRunVulnerability{{FindingKey: "test", TemplateID: "test-template", Name: "Test vulnerability", Severity: "high", Target: "http://192.168.75.1:23333", MatchedAt: "/admin", Description: "Readable vulnerability description", Evidence: `{"raw":"nuclei-json"}`}},
+			Vulnerabilities:    []model.ScanTaskRunVulnerability{{FindingKey: "test", TemplateID: "test-template", Name: "Test vulnerability", Severity: "high", Target: "http://192.168.75.1:23333", MatchedAt: "/admin", Description: "Readable a | b vulnerability description", Evidence: `{"raw":"nuclei-json"}`}},
 			TemplateCandidates: []model.ScanTaskRunTemplateCandidate{{TemplateID: "internal-only", Path: "private.yaml", Source: "fingerprint_mapping", Reason: "audit only"}},
 		},
 		FingerprintImports: []model.FingerprintImport{{ID: 11, ProjectionSHA256: "audit-sha"}},
@@ -187,7 +187,7 @@ func TestRunUserReportLeadsWithValidationAndKeepsAuditDetailsOut(t *testing.T) {
 	if validationIndex < 0 || serviceIndex < 0 || validationIndex > serviceIndex {
 		t.Fatalf("user report does not lead with validation:\n%s", content)
 	}
-	for _, expected := range []string{"success", "Test vulnerability", "Readable vulnerability description", "high", "HTTP 500 server=nginx response=2422 bytes", "Web server", "Runtime / language", "nginx", "php", "1.24", "cpe:2.3:a:nginx:nginx:1.24", "wappalyzer", "whatweb"} {
+	for _, expected := range []string{"success", "Test vulnerability", `Readable a \| b vulnerability description`, "high", "HTTP 500 server=nginx response=2422 bytes", "Web server", "Runtime / language", "nginx", "php", "1.24", "cpe:2.3:a:nginx:nginx:1.24", "wappalyzer", "whatweb"} {
 		if !strings.Contains(content, expected) {
 			t.Fatalf("user report missing %q:\n%s", expected, content)
 		}
@@ -298,6 +298,42 @@ func TestGenerateScanTaskRunReportRestoresExistingPairWhenDatabaseUpdateFails(t 
 	audit, auditErr := os.ReadFile(paths.Audit)
 	if userErr != nil || auditErr != nil || string(user) != string(oldUser) || string(audit) != string(oldAudit) {
 		t.Fatalf("database failure did not restore old pair user_err=%v audit_err=%v", userErr, auditErr)
+	}
+}
+
+func TestGenerateScanTaskRunReportProjectsReportingRunAsSuccessful(t *testing.T) {
+	db := openRunReportDB(t)
+	task, err := storage.CreateScanTask(db, model.ScanTask{Target: "192.168.21.0/24", ScanType: model.ScanTypeSubnet, Mode: model.ScanTaskModeScheduled, Cron: "0 2 * * *", Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-07-27T02:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE scan_task_runs SET status = ?, stage = ?, progress = 95 WHERE id = ?`, model.ScanTaskRunStatusRunning, model.ScanTaskRunStageSnapshot, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SaveScanTaskRunSnapshot(db, model.ScanTaskRunSnapshot{RunID: run.ID, Hosts: []model.ScanTaskRunHost{{IP: "192.168.21.10", IsActive: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.UpdateScanTaskRunProgress(db, run.ID, model.ScanTaskRunStageReporting, 99); err != nil {
+		t.Fatal(err)
+	}
+	path, err := GenerateScanTaskRunReport(db, task.ID, run.ID, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "| Run Status | success |") || !strings.Contains(string(content), "192.168.21.10") {
+		t.Fatalf("report did not project successful outcome and Diff:\n%s", content)
+	}
+	persisted, err := storage.GetScanTaskRun(db, run.ID)
+	if err != nil || persisted.Status != model.ScanTaskRunStatusRunning || persisted.Stage != model.ScanTaskRunStageReporting || persisted.Progress != 99 {
+		t.Fatalf("report generation published terminal status: %#v err=%v", persisted, err)
 	}
 }
 

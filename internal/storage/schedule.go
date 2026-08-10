@@ -99,6 +99,15 @@ func UpdateScanTask(db *sql.DB, task model.ScanTask) (model.ScanTask, error) {
 	if err != nil {
 		return model.ScanTask{}, err
 	}
+	currentPrepared, currentConfigJSON, err := prepareScanTask(current, current.Status)
+	if err != nil {
+		return model.ScanTask{}, fmt.Errorf("normalize current scan task: %w", err)
+	}
+	if sameScanTaskDefinition(prepared, currentPrepared, configJSON, currentConfigJSON) {
+		// Existing databases may retain the hash of a pre-normalized config.
+		// A no-op edit must not manufacture a configuration change between runs.
+		prepared.ConfigHash = current.ConfigHash
+	}
 	if prepared.Mode != current.Mode {
 		var runCount int
 		if err := db.QueryRow(`SELECT COUNT(1) FROM scan_task_runs WHERE scan_task_id = ?`, current.ID).Scan(&runCount); err != nil {
@@ -133,6 +142,15 @@ func UpdateScanTask(db *sql.DB, task model.ScanTask) (model.ScanTask, error) {
 		return model.ScanTask{}, errors.New("scan task changed concurrently")
 	}
 	return GetScanTask(db, prepared.ID)
+}
+
+func sameScanTaskDefinition(left, right model.ScanTask, leftConfigJSON, rightConfigJSON string) bool {
+	return left.Target == right.Target &&
+		left.ScanType == right.ScanType &&
+		left.Mode == right.Mode &&
+		left.Cron == right.Cron &&
+		left.Timezone == right.Timezone &&
+		leftConfigJSON == rightConfigJSON
 }
 
 func PauseScanTask(db *sql.DB, taskID int64) error {

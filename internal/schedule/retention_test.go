@@ -118,6 +118,9 @@ func TestExecutorRunsRetentionAfterTerminalState(t *testing.T) {
 	if err := executor.ExecuteRun(context.Background(), currentRun.ID); err != nil {
 		t.Fatalf("execute current run: %v", err)
 	}
+	if err := executor.FinalizeSuccessfulRun(currentRun.ID, ""); err != nil {
+		t.Fatalf("finalize current run: %v", err)
+	}
 	if _, err := storage.GetScanTaskRun(db, oldRun.ID); !errors.Is(err, storage.ErrScanTaskRunNotFound) {
 		t.Fatalf("expired run remains after executor cleanup, error = %v", err)
 	}
@@ -143,6 +146,9 @@ func TestExecutorRetentionFailureDoesNotRewriteTerminalState(t *testing.T) {
 	executor.Retention = &RetentionPolicy{DB: db, Clock: ClockFunc(time.Now), MaxAge: 0}
 	if err := executor.ExecuteRun(context.Background(), run.ID); err != nil {
 		t.Fatalf("retention failure must not fail the completed scan: %v", err)
+	}
+	if err := executor.FinalizeSuccessfulRun(run.ID, ""); err != nil {
+		t.Fatalf("retention failure must not fail terminal publication: %v", err)
 	}
 	completed, err := storage.GetScanTaskRun(db, run.ID)
 	if err != nil || completed.Status != model.ScanTaskRunStatusSuccess {

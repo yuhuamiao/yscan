@@ -141,6 +141,9 @@ http:
 	if _, err := report.GenerateScanTaskRunReport(db, task.ID, run.ID, report.DefaultDirectory); err != nil {
 		t.Fatalf("generate T322 report pair: %v", err)
 	}
+	if err := executor.FinalizeSuccessfulRun(run.ID, ""); err != nil {
+		t.Fatalf("finalize T322 run: %v", err)
+	}
 
 	handler, err := newHandlerWithScanTasks(db, func(string, string) (int64, error) { return 1, nil }, service, nil)
 	if err != nil {

@@ -251,6 +251,155 @@ func TestQuickScanCreatesOnlyV2TaskRunAndSnapshot(t *testing.T) {
 	}
 }
 
+func TestSuccessfulScanTaskRunIsNotPublishedBeforeReportFinishes(t *testing.T) {
+	db, err := storage.InitDBAt(filepath.Join(t.TempDir(), "report-finalization.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	service := schedule.NewTaskService(db, nil)
+	task, run, err := service.Create(context.Background(), model.ScanTask{
+		Target: "127.0.0.1", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeOnce,
+		Config: model.ScanTaskConfig{PortSpec: "80"},
+	})
+	if err != nil || run == nil {
+		t.Fatalf("create task=%#v run=%#v err=%v", task, run, err)
+	}
+	originalTargetRun, originalReport := runTargetTaskRun, generateScanTaskRunReport
+	t.Cleanup(func() { runTargetTaskRun, generateScanTaskRunReport = originalTargetRun, originalReport })
+	runTargetTaskRun = func(context.Context, workflow.TargetTaskRunOptions) (model.ScanTaskRunSnapshot, error) {
+		return model.ScanTaskRunSnapshot{Hosts: []model.ScanTaskRunHost{{IP: "127.0.0.1", IsActive: true}}}, nil
+	}
+	reportStarted := make(chan model.ScanTaskRun, 1)
+	releaseReport := make(chan struct{})
+	generateScanTaskRunReport = func(db *sql.DB, _, runID int64, _ string) (string, error) {
+		observed, lookupErr := storage.GetScanTaskRun(db, runID)
+		if lookupErr != nil {
+			return "", lookupErr
+		}
+		reportStarted <- observed
+		<-releaseReport
+		return "reports/ready.md", nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- executeLogicalScanTaskRun(context.Background(), db, model.Scanner{Network: "tcp"}, *run)
+	}()
+
+	observed := <-reportStarted
+	if observed.Status != model.ScanTaskRunStatusRunning || observed.Stage != model.ScanTaskRunStageReporting || observed.Progress != 99 || observed.FinishedAt != "" {
+		t.Fatalf("run exposed before report completion: %#v", observed)
+	}
+	persisted, err := storage.GetScanTaskRun(db, run.ID)
+	if err != nil || persisted.Status != model.ScanTaskRunStatusRunning || persisted.Stage != model.ScanTaskRunStageReporting || persisted.Progress != 99 {
+		t.Fatalf("persisted reporting run=%#v err=%v", persisted, err)
+	}
+	close(releaseReport)
+	if err := <-done; err != nil {
+		t.Fatalf("finish run: %v", err)
+	}
+	completed, err := storage.GetScanTaskRun(db, run.ID)
+	if err != nil || completed.Status != model.ScanTaskRunStatusSuccess || completed.Stage != model.ScanTaskRunStageCompleted || completed.Progress != 100 || completed.FinishedAt == "" || completed.ReportError != "" {
+		t.Fatalf("completed run=%#v err=%v", completed, err)
+	}
+}
+
+func TestSuccessfulScanTaskRunKeepsReportFailureDiagnosticAtFinalization(t *testing.T) {
+	db, err := storage.InitDBAt(filepath.Join(t.TempDir(), "report-error-finalization.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	service := schedule.NewTaskService(db, nil)
+	_, run, err := service.Create(context.Background(), model.ScanTask{Target: "127.0.0.1", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeOnce, Config: model.ScanTaskConfig{PortSpec: "80"}})
+	if err != nil || run == nil {
+		t.Fatalf("create run=%#v err=%v", run, err)
+	}
+	originalTargetRun, originalReport := runTargetTaskRun, generateScanTaskRunReport
+	t.Cleanup(func() { runTargetTaskRun, generateScanTaskRunReport = originalTargetRun, originalReport })
+	runTargetTaskRun = func(context.Context, workflow.TargetTaskRunOptions) (model.ScanTaskRunSnapshot, error) {
+		return model.ScanTaskRunSnapshot{}, nil
+	}
+	generateScanTaskRunReport = func(*sql.DB, int64, int64, string) (string, error) {
+		return "", errors.New("report directory is read-only")
+	}
+	if err := executeLogicalScanTaskRun(context.Background(), db, model.Scanner{Network: "tcp"}, *run); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := storage.GetScanTaskRun(db, run.ID)
+	if err != nil || completed.Status != model.ScanTaskRunStatusSuccess || completed.Stage != model.ScanTaskRunStageCompleted || completed.Progress != 100 || completed.ReportError != "report directory is read-only" {
+		t.Fatalf("completed run=%#v err=%v", completed, err)
+	}
+}
+
+func TestFailedAndCanceledScanTaskRunsKeepTerminalStageWhileReportGenerates(t *testing.T) {
+	tests := []struct {
+		name       string
+		cancelRun  bool
+		wantStatus string
+		wantStage  string
+	}{
+		{name: "failed", wantStatus: model.ScanTaskRunStatusFailed, wantStage: model.ScanTaskRunStageFailed},
+		{name: "canceled", cancelRun: true, wantStatus: model.ScanTaskRunStatusCanceled, wantStage: model.ScanTaskRunStageCanceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, err := storage.InitDBAt(filepath.Join(t.TempDir(), "terminal-report.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			service := schedule.NewTaskService(db, nil)
+			task, run, err := service.Create(context.Background(), model.ScanTask{
+				Target: "127.0.0.1", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeOnce,
+				Config: model.ScanTaskConfig{PortSpec: "80"},
+			})
+			if err != nil || run == nil {
+				t.Fatalf("create task=%#v run=%#v err=%v", task, run, err)
+			}
+			if tt.cancelRun {
+				if err := storage.CancelScanTaskRun(db, task.ID, run.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			originalTargetRun, originalReport := runTargetTaskRun, generateScanTaskRunReport
+			t.Cleanup(func() { runTargetTaskRun, generateScanTaskRunReport = originalTargetRun, originalReport })
+			runTargetTaskRun = func(context.Context, workflow.TargetTaskRunOptions) (model.ScanTaskRunSnapshot, error) {
+				return model.ScanTaskRunSnapshot{}, errors.New("scan failed")
+			}
+			reportStarted := make(chan model.ScanTaskRun, 1)
+			releaseReport := make(chan struct{})
+			generateScanTaskRunReport = func(db *sql.DB, _, runID int64, _ string) (string, error) {
+				observed, lookupErr := storage.GetScanTaskRun(db, runID)
+				if lookupErr != nil {
+					return "", lookupErr
+				}
+				reportStarted <- observed
+				<-releaseReport
+				return "reports/terminal.md", nil
+			}
+			done := make(chan error, 1)
+			go func() {
+				done <- executeLogicalScanTaskRun(context.Background(), db, model.Scanner{Network: "tcp"}, *run)
+			}()
+
+			observed := <-reportStarted
+			if observed.Status != tt.wantStatus || observed.Stage != tt.wantStage || observed.Progress == 99 {
+				t.Fatalf("run changed while report was pending: %#v", observed)
+			}
+			close(releaseReport)
+			if err := <-done; err != nil {
+				t.Fatalf("finish terminal report: %v", err)
+			}
+			completed, err := storage.GetScanTaskRun(db, run.ID)
+			if err != nil || completed.Status != tt.wantStatus || completed.Stage != tt.wantStage || completed.Progress == 99 {
+				t.Fatalf("terminal run=%#v err=%v", completed, err)
+			}
+		})
+	}
+}
+
 func TestProcessTaskExecutionGeneratesReportFromFinalSnapshot(t *testing.T) {
 	db := openTaskExecutionTestDB(t)
 	taskID, err := storage.CreateTask(db, model.TaskTypeScanIP, "192.168.1.10")

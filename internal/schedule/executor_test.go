@@ -29,12 +29,19 @@ func TestExecutorPersistsSnapshotAndSuccessfulRun(t *testing.T) {
 	if err := executor.ExecuteRun(context.Background(), run.ID); err != nil {
 		t.Fatalf("execute run: %v", err)
 	}
-	completed, err := storage.GetScanTaskRun(db, run.ID)
+	reporting, err := storage.GetScanTaskRun(db, run.ID)
 	if err != nil {
-		t.Fatalf("get completed run: %v", err)
+		t.Fatalf("get reporting run: %v", err)
 	}
-	if completed.Status != model.ScanTaskRunStatusSuccess || completed.StartedAt == "" || completed.FinishedAt == "" || completed.SnapshotWrittenAt == "" {
-		t.Fatalf("completed run = %#v", completed)
+	if reporting.Status != model.ScanTaskRunStatusRunning || reporting.Stage != model.ScanTaskRunStageReporting || reporting.Progress != 99 || reporting.StartedAt == "" || reporting.FinishedAt != "" || reporting.SnapshotWrittenAt == "" {
+		t.Fatalf("reporting run = %#v", reporting)
+	}
+	if err := executor.FinalizeSuccessfulRun(run.ID, ""); err != nil {
+		t.Fatalf("finalize run: %v", err)
+	}
+	completed, err := storage.GetScanTaskRun(db, run.ID)
+	if err != nil || completed.Status != model.ScanTaskRunStatusSuccess || completed.Stage != model.ScanTaskRunStageCompleted || completed.Progress != 100 || completed.FinishedAt == "" {
+		t.Fatalf("completed run = %#v, error = %v", completed, err)
 	}
 	snapshot, err := storage.GetScanTaskRunSnapshot(db, run.ID)
 	if err != nil || len(snapshot.Hosts) != 1 || snapshot.Hosts[0].IP != "192.168.10.10" {
@@ -90,6 +97,9 @@ func TestExecutorFailureDoesNotBlockLaterRun(t *testing.T) {
 	}
 	if err := executor.ExecuteRun(context.Background(), second.ID); err != nil {
 		t.Fatalf("later execution: %v", err)
+	}
+	if err := executor.FinalizeSuccessfulRun(second.ID, ""); err != nil {
+		t.Fatalf("finalize later run: %v", err)
 	}
 	completed, err := storage.GetScanTaskRun(db, second.ID)
 	if err != nil || completed.Status != model.ScanTaskRunStatusSuccess {

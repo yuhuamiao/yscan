@@ -192,8 +192,12 @@ func TestRunDiscoversNonBaselineTCPPort(t *testing.T) {
 
 func TestParsePortSpecCanonicalizesRangesAndRejectsInvalidInput(t *testing.T) {
 	ports, err := ParsePortSpec("443, 80, 8000-8002,443")
-	if err != nil || FormatPortSpec(ports) != "80,443,8000,8001,8002" {
+	if err != nil || FormatPortSpec(ports) != "80,443,8000-8002" {
 		t.Fatalf("ports=%v canonical=%q err=%v", ports, FormatPortSpec(ports), err)
+	}
+	fullRange, err := ParsePortSpec("1-65535")
+	if err != nil || len(fullRange) != 65535 || FormatPortSpec(fullRange) != "1-65535" {
+		t.Fatalf("full range count=%d canonical=%q err=%v", len(fullRange), FormatPortSpec(fullRange), err)
 	}
 	for _, invalid := range []string{"0", "65536", "443-80", "80,,443", "abc", "80-90-100"} {
 		if _, err := ParsePortSpec(invalid); err == nil {

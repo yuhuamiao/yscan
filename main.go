@@ -638,26 +638,23 @@ func executeLogicalScanTaskRun(ctx context.Context, db *sql.DB, baseTask model.S
 		}
 		return err
 	}
-	if !isTerminalScanTaskRunStatus(completed.Status) {
+	pendingSuccess := completed.Status == model.ScanTaskRunStatusRunning && completed.Stage == model.ScanTaskRunStageReporting
+	if !pendingSuccess && !isTerminalScanTaskRunStatus(completed.Status) {
 		return executionErr
 	}
-	if err := storage.UpdateScanTaskRunProgress(db, completed.ID, model.ScanTaskRunStageReporting, 99); err != nil {
-		return fmt.Errorf("update run reporting progress: %w", err)
-	}
+	reportError := ""
 	if _, err := generateScanTaskRunReport(db, completed.ScanTaskID, completed.ID, report.DefaultDirectory); err != nil {
+		reportError = err.Error()
 		log.Printf("scan task run %d report failed: %v", completed.ID, err)
-		if persistErr := storage.UpdateScanTaskRunReportError(db, completed.ID, err.Error()); persistErr != nil {
-			log.Printf("scan task run %d report diagnostic persistence failed: %v", completed.ID, persistErr)
+	}
+	if pendingSuccess {
+		if err := executor.FinalizeSuccessfulRun(completed.ID, reportError); err != nil {
+			return fmt.Errorf("finalize successful run: %w", err)
 		}
+		return executionErr
 	}
-	terminalStage, terminalProgress := model.ScanTaskRunStageCompleted, 100
-	if completed.Status == model.ScanTaskRunStatusFailed {
-		terminalStage, terminalProgress = model.ScanTaskRunStageFailed, completed.Progress
-	} else if completed.Status == model.ScanTaskRunStatusCanceled {
-		terminalStage, terminalProgress = model.ScanTaskRunStageCanceled, completed.Progress
-	}
-	if err := storage.UpdateScanTaskRunProgress(db, completed.ID, terminalStage, terminalProgress); err != nil {
-		return fmt.Errorf("finalize run progress: %w", err)
+	if err := storage.UpdateScanTaskRunReportError(db, completed.ID, reportError); err != nil {
+		return fmt.Errorf("persist report diagnostic: %w", err)
 	}
 	return executionErr
 }

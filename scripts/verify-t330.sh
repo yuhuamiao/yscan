@@ -225,11 +225,27 @@ for _ in $(seq 1 30); do
   sleep 0.1
 done
 jq -e '.status == "running"' active-run-status.json >/dev/null
+default_task_id=$(curl --fail --silent --request POST "$base_url/api/scan-tasks" \
+  --header 'Content-Type: application/json' \
+  --data '{"target":"127.0.2.1","scan_type":"ip","mode":"scheduled","cron":"0 0 1 1 *","timezone":"UTC","config":{"port_spec":""}}' | jq -r '.task.id')
+test -n "$default_task_id"
+immediate_task_id=$(curl --fail --silent --request POST "$base_url/api/scan-tasks" \
+  --header 'Content-Type: application/json' \
+  --data '{"target":"10.255.255.254","scan_type":"ip","mode":"once","config":{"port_spec":"1-65535"}}' | jq -r '.task.id')
+test -n "$immediate_task_id"
+for index in $(seq 1 24); do
+  curl --fail --silent --request POST "$base_url/api/scan-tasks" \
+    --header 'Content-Type: application/json' \
+    --data "{\"target\":\"127.0.1.$index\",\"scan_type\":\"ip\",\"mode\":\"scheduled\",\"cron\":\"0 0 1 1 *\",\"timezone\":\"UTC\",\"config\":{\"port_spec\":\"65535\"}}" \
+    > /dev/null
+done
 (cd "$repo_root" && go run ./internal/web/cmd/t330browser \
   --base-url "$base_url" \
-  --ip 127.0.0.1 \
-  --task-id "$task_id" \
-  --browser "$chromium_path" \
+	  --ip 127.0.0.1 \
+	  --task-id "$task_id" \
+	  --immediate-task-id "$immediate_task_id" \
+	  --default-task-id "$default_task_id" \
+	  --browser "$chromium_path" \
   --expected-ports 6 \
   --expected-validations 6 \
   --expected-findings 3)

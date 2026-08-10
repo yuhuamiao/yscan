@@ -26,7 +26,12 @@ var (
 // CancelScanTaskRun atomically records a cancellation request only while the
 // run can still be stopped. Terminal and skipped audit records are immutable.
 func CancelScanTaskRun(db *sql.DB, scanTaskID, runID int64) error {
-	result, err := db.Exec(`UPDATE scan_task_runs SET status = ?, updated_at = datetime('now') WHERE id = ? AND scan_task_id = ? AND status IN (?, ?)`, model.ScanTaskRunStatusCancelRequested, runID, scanTaskID, model.ScanTaskRunStatusQueued, model.ScanTaskRunStatusRunning)
+	result, err := db.Exec(`
+		UPDATE scan_task_runs SET status = ?, updated_at = datetime('now')
+		WHERE id = ? AND scan_task_id = ?
+			AND (status = ? OR (status = ? AND stage <> ?))`,
+		model.ScanTaskRunStatusCancelRequested, runID, scanTaskID,
+		model.ScanTaskRunStatusQueued, model.ScanTaskRunStatusRunning, model.ScanTaskRunStageReporting)
 	if err != nil {
 		return err
 	}
@@ -70,6 +75,33 @@ func UpdateScanTaskRunProgress(db *sql.DB, runID int64, stage string, progress i
 	return nil
 }
 
+// FinalizeSuccessfulScanTaskRun publishes the completed report state in one
+// update. Until this succeeds, readers continue to observe reporting at 99%.
+func FinalizeSuccessfulScanTaskRun(db *sql.DB, runID int64, reportError string) error {
+	if runID <= 0 {
+		return errors.New("scan task run ID is required")
+	}
+	reportError = strings.TrimSpace(reportError)
+	result, err := db.Exec(`
+		UPDATE scan_task_runs
+		SET status = ?, stage = ?, progress = 100,
+			report_error = NULLIF(?, ''), finished_at = datetime('now'), updated_at = datetime('now')
+		WHERE id = ? AND status = ? AND stage = ?`,
+		model.ScanTaskRunStatusSuccess, model.ScanTaskRunStageCompleted, reportError,
+		runID, model.ScanTaskRunStatusRunning, model.ScanTaskRunStageReporting)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return fmt.Errorf("scan task run %d is not awaiting successful report finalization", runID)
+	}
+	return nil
+}
+
 // FinalizeQueuedCancellation turns an accepted request for work that never
 // started into its terminal audit state.
 func FinalizeQueuedCancellation(db *sql.DB) error {
@@ -98,7 +130,24 @@ func FinalizeInterruptedScanTaskRunsWithResult(db *sql.DB) ([]model.ScanTaskRun,
 		SELECT id FROM scan_task_runs
 		WHERE status IN (?, ?)
 			OR (status = ? AND trigger = ? AND scan_task_id IN (SELECT id FROM scan_tasks WHERE mode = ?))
-		ORDER BY id`, model.ScanTaskRunStatusRunning, model.ScanTaskRunStatusCancelRequested, model.ScanTaskRunStatusQueued, model.ScanTaskRunTriggerScheduled, model.ScanTaskModeScheduled)
+			OR (status = ? AND (
+				stage <> ? OR progress <> 100
+				OR (COALESCE(report_error, '') = '' AND (COALESCE(report_path, '') = '' OR COALESCE(audit_report_path, '') = ''))
+			))
+			OR (status = ? AND (
+				stage <> ?
+				OR (COALESCE(report_error, '') = '' AND (COALESCE(report_path, '') = '' OR COALESCE(audit_report_path, '') = ''))
+			))
+			OR (status = ? AND (
+				stage <> ?
+				OR (COALESCE(report_error, '') = '' AND (COALESCE(report_path, '') = '' OR COALESCE(audit_report_path, '') = ''))
+			))
+		ORDER BY id`,
+		model.ScanTaskRunStatusRunning, model.ScanTaskRunStatusCancelRequested,
+		model.ScanTaskRunStatusQueued, model.ScanTaskRunTriggerScheduled, model.ScanTaskModeScheduled,
+		model.ScanTaskRunStatusSuccess, model.ScanTaskRunStageCompleted,
+		model.ScanTaskRunStatusFailed, model.ScanTaskRunStageFailed,
+		model.ScanTaskRunStatusCanceled, model.ScanTaskRunStageCanceled)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +169,39 @@ func FinalizeInterruptedScanTaskRunsWithResult(db *sql.DB) ([]model.ScanTaskRun,
 	if _, err := tx.Exec(`UPDATE scan_task_runs SET status = ?, stage = ?, error_message = ?, finished_at = datetime('now'), updated_at = datetime('now') WHERE status = ?`, model.ScanTaskRunStatusCanceled, model.ScanTaskRunStageCanceled, "canceled during service restart", model.ScanTaskRunStatusCancelRequested); err != nil {
 		return nil, err
 	}
+	if _, err := tx.Exec(`
+		UPDATE scan_task_runs
+		SET status = ?, stage = ?, progress = 100, finished_at = COALESCE(finished_at, datetime('now')), updated_at = datetime('now')
+		WHERE status = ? AND stage = ?`,
+		model.ScanTaskRunStatusSuccess, model.ScanTaskRunStageCompleted,
+		model.ScanTaskRunStatusRunning, model.ScanTaskRunStageReporting); err != nil {
+		return nil, err
+	}
 	if _, err := tx.Exec(`UPDATE scan_task_runs SET status = ?, stage = ?, error_message = ?, finished_at = datetime('now'), updated_at = datetime('now') WHERE status = ?`, model.ScanTaskRunStatusFailed, model.ScanTaskRunStageFailed, "interrupted by service restart", model.ScanTaskRunStatusRunning); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`
+		UPDATE scan_task_runs
+		SET stage = ?, progress = 100, finished_at = COALESCE(finished_at, datetime('now')), updated_at = datetime('now')
+		WHERE status = ? AND (stage <> ? OR progress <> 100)`,
+		model.ScanTaskRunStageCompleted, model.ScanTaskRunStatusSuccess,
+		model.ScanTaskRunStageCompleted); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`
+		UPDATE scan_task_runs
+		SET stage = ?, progress = CASE WHEN progress >= 99 THEN 95 ELSE progress END,
+			finished_at = COALESCE(finished_at, datetime('now')), updated_at = datetime('now')
+		WHERE status = ? AND stage <> ?`,
+		model.ScanTaskRunStageFailed, model.ScanTaskRunStatusFailed, model.ScanTaskRunStageFailed); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`
+		UPDATE scan_task_runs
+		SET stage = ?, progress = CASE WHEN progress >= 99 THEN 95 ELSE progress END,
+			finished_at = COALESCE(finished_at, datetime('now')), updated_at = datetime('now')
+		WHERE status = ? AND stage <> ?`,
+		model.ScanTaskRunStageCanceled, model.ScanTaskRunStatusCanceled, model.ScanTaskRunStageCanceled); err != nil {
 		return nil, err
 	}
 	if _, err := tx.Exec(`

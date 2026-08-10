@@ -17,11 +17,15 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"golandproject/yscan/internal/assist"
 	"golandproject/yscan/internal/model"
+	"golandproject/yscan/internal/scan"
 )
 
 const sqliteFile = "asm.db"
 
-const t320FrozenProductRolesMigration = "t320-frozen-product-roles-v2"
+const (
+	t320FrozenProductRolesMigration = "t320-frozen-product-roles-v2"
+	t349CompactPortSpecMigration    = "t349-compact-port-spec-v1"
+)
 
 func InitDB() (*sql.DB, error) {
 	return InitDBAt(sqliteFile)
@@ -586,7 +590,79 @@ func ensureSQLiteMigrations(db *sql.DB) error {
 	if err := backfillLegacyHostInventoryScopes(db); err != nil {
 		return err
 	}
+	if err := migrateCompactScanTaskPortSpecs(db); err != nil {
+		return err
+	}
 	return nil
+}
+
+func migrateCompactScanTaskPortSpecs(db *sql.DB) error {
+	var applied int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE name = ?`, t349CompactPortSpecMigration).Scan(&applied); err != nil {
+		return err
+	}
+	if applied > 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"scan_tasks", "scan_task_runs"} {
+		rows, err := tx.Query(`SELECT id, config_json FROM ` + table)
+		if err != nil {
+			return err
+		}
+		type update struct {
+			id         int64
+			configJSON string
+		}
+		updates := make([]update, 0)
+		for rows.Next() {
+			var id int64
+			var configJSON string
+			if err := rows.Scan(&id, &configJSON); err != nil {
+				rows.Close()
+				return err
+			}
+			var config model.ScanTaskConfig
+			if json.Unmarshal([]byte(configJSON), &config) != nil || strings.TrimSpace(config.PortSpec) == "" {
+				continue
+			}
+			ports, err := scan.ParsePortSpec(config.PortSpec)
+			if err != nil {
+				continue
+			}
+			compact := scan.FormatPortSpec(ports)
+			if compact == config.PortSpec {
+				continue
+			}
+			config.PortSpec = compact
+			content, err := json.Marshal(config)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			updates = append(updates, update{id: id, configJSON: string(content)})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, item := range updates {
+			if _, err := tx.Exec(`UPDATE `+table+` SET config_json = ? WHERE id = ?`, item.configJSON, item.id); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO schema_migrations (name) VALUES (?)`, t349CompactPortSpecMigration); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func backfillScanTaskRunLifecycle(db *sql.DB) error {

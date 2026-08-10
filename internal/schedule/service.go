@@ -158,7 +158,7 @@ func NormalizeInternalScanTarget(scanType, target string) (string, error) {
 	switch scanType {
 	case model.ScanTypeIP:
 		ip := net.ParseIP(target).To4()
-		if !isInternalIPv4(ip) {
+		if ip == nil || !isInternalIPv4(ip) {
 			return "", fmt.Errorf("scan target must be an internal IPv4 address: %s", target)
 		}
 		return ip.String(), nil

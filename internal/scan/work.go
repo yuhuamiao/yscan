@@ -85,10 +85,27 @@ func ParsePortSpec(value string) ([]int, error) {
 func FormatPortSpec(ports []int) string {
 	ports = normalizePorts(ports)
 	sort.Ints(ports)
-	values := make([]string, len(ports))
-	for index, port := range ports {
-		values[index] = strconv.Itoa(port)
+	if len(ports) == 0 {
+		return ""
 	}
+	values := make([]string, 0, len(ports))
+	start, end := ports[0], ports[0]
+	appendRange := func() {
+		if start == end {
+			values = append(values, strconv.Itoa(start))
+			return
+		}
+		values = append(values, strconv.Itoa(start)+"-"+strconv.Itoa(end))
+	}
+	for _, port := range ports[1:] {
+		if port == end+1 {
+			end = port
+			continue
+		}
+		appendRange()
+		start, end = port, port
+	}
+	appendRange()
 	return strings.Join(values, ",")
 }
 
