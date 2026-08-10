@@ -1,10 +1,10 @@
-# CAASM
+# yscan
 
-CAASM 是一个面向企业内网的资产发现和风险验证工具，命令行程序名为 `yscan`。
+`yscan` 是一个面向企业内网的 CAASM（Cyber Asset Attack Surface Management）工具，用于发现资产、识别服务并验证风险。
 
 给它一个内网 IP 或 CIDR，它会发现存活主机和开放端口，识别服务及 Web 技术栈，并把每次扫描保存到本地 SQLite 数据库。后续扫描可以直接看到新增资产、端口变化和漏洞变化。日常操作既可以使用命令行，也可以在浏览器控制台完成。
 
-CAASM 适合单机或小型服务器部署，不需要 Elasticsearch、Redis、消息队列或 Kubernetes。漏洞验证依赖本机安装的 Nuclei；如果没有 Nuclei，资产发现和服务识别仍可正常使用。
+`yscan` 适合单机或小型服务器部署，不需要 Elasticsearch、Redis、消息队列或 Kubernetes。漏洞验证依赖本机安装的 Nuclei；如果没有 Nuclei，资产发现和服务识别仍可正常使用。
 
 ## 主要功能
 
@@ -19,7 +19,7 @@ CAASM 适合单机或小型服务器部署，不需要 Elasticsearch、Redis、�
 
 ## 使用范围
 
-CAASM 只接受 RFC1918 私网地址和本机 Loopback IPv4。公网地址、Link-local、组播地址、未指定地址以及跨越内外网边界的 CIDR 会被拒绝。
+`yscan` 只接受 RFC1918 私网地址和本机 Loopback IPv4。公网地址、Link-local、组播地址、未指定地址以及跨越内外网边界的 CIDR 会被拒绝。
 
 请只扫描你拥有或已经获得明确授权的目标。
 
@@ -92,7 +92,7 @@ go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 
 模板目录也可以通过 `NUCLEI_TEMPLATES` 环境变量指定。未显式指定时，程序会检查用户目录和当前目录中的常见模板路径。
 
-CAASM 不会对每个端口执行整套模板。它会先根据服务、产品和 CPE 选择候选模板，再应用只读策略和审核清单。Nuclei 进程默认禁用交互和重定向，限制为每秒 25 个请求、5 个并发，并排除 `intrusive`、`dos`、`auth` 标签。
+`yscan` 不会对每个端口执行整套模板。它会先根据服务、产品和 CPE 选择候选模板，再应用只读策略和审核清单。Nuclei 进程默认禁用交互和重定向，限制为每秒 25 个请求、5 个并发，并排除 `intrusive`、`dos`、`auth` 标签。
 
 页面会明确区分以下结果：
 
@@ -251,7 +251,7 @@ curl -X POST http://127.0.0.1:8080/api/scan-tasks \
 
 ## 数据与报告
 
-CAASM 默认把数据写到启动目录：
+`yscan` 默认把数据写到启动目录：
 
 | 路径 | 内容 |
 | --- | --- |
@@ -274,15 +274,15 @@ sudo make install
 创建运行用户和数据目录，然后安装 systemd unit：
 
 ```bash
-sudo useradd --system --home /var/lib/caasm --shell /usr/sbin/nologin caasm
-sudo install -d -o caasm -g caasm -m 0750 /var/lib/caasm /etc/caasm
+sudo useradd --system --home /var/lib/yscan --shell /usr/sbin/nologin yscan
+sudo install -d -o yscan -g yscan -m 0750 /var/lib/yscan /etc/yscan
 sudo install -m 0644 deploy/yscan.service /etc/systemd/system/yscan.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now yscan
 curl --fail http://127.0.0.1:8080/api/healthz
 ```
 
-服务默认监听 `127.0.0.1:8080`，数据目录为 `/var/lib/caasm`。可以在 `/etc/caasm/yscan.env` 中设置运行环境变量。
+服务默认监听 `127.0.0.1:8080`，数据目录为 `/var/lib/yscan`。可以在 `/etc/yscan/yscan.env` 中设置运行环境变量。
 
 收到 `SIGINT` 或 `SIGTERM` 后，服务会停止接收新请求，取消本进程启动的扫描，等待运行退出后关闭。重新启动时会先处理上次未完成的运行并生成报告，然后才开始监听 API。
 
@@ -300,7 +300,7 @@ make release
 - 数据库和报告可能包含内部 IP、服务版本和漏洞信息，应限制文件访问权限并定期备份。
 - 非回环 API 监听必须使用 `--allow-cidr`，并同时配置主机防火墙或受控管理网络。
 - 启用漏洞验证前，应审查本地 Nuclei 模板及其许可证，并先在测试环境确认影响。
-- CAASM 不提供漏洞修复、工单、RBAC、多租户或互联网资产测绘功能。
+- `yscan` 不提供漏洞修复、工单、RBAC、多租户或互联网资产测绘功能。
 
 ## 开发与测试
 
