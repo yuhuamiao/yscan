@@ -763,7 +763,7 @@ func runMainArgs(rawArgs []string) error {
 		if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
 			listenAddress = strings.TrimSpace(args[1])
 		}
-		serverSession, err = appRuntime.AcquireServerSession(paths, listenAddress, runtimeConfig.MaxConcurrency)
+		serverSession, err = appRuntime.AcquireServerSessionForStartup(paths, listenAddress, runtimeConfig.MaxConcurrency, 2*time.Minute)
 		if err != nil {
 			return err
 		}
@@ -778,22 +778,18 @@ func runMainArgs(rawArgs []string) error {
 		}
 		runtimeConfig.MaxConcurrency = effective
 	}
-	database, err := paths.SelectDatabase()
+	managedDatabase, err := storage.OpenManagedDatabase(storage.ManagedDatabaseOptions{
+		Paths: paths, BusyTimeout: runtimeConfig.SQLiteBusyTimeout, ServerLockHeld: serverSession != nil,
+		InitializeContent: func(database *sql.DB) error {
+			_, err := fingerprint.InitializeEmbeddedSourcesIfEmpty(context.Background(), database)
+			return err
+		},
+	})
 	if err != nil {
 		return err
 	}
-	// T358 keeps the established root database layout until the locked T362
-	// initialization and T363 migration protocol can publish data/asm.db.
-	databasePath := database.Path
-	if database.Mode == appRuntime.DatabaseUninitialized {
-		databasePath = paths.LegacyDatabase
-	}
-
-	db, err := storage.InitDBAt(databasePath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
+	defer managedDatabase.Close()
+	db := managedDatabase.DB
 	if _, err := fingerprint.InitializeEmbeddedSourcesIfEmpty(context.Background(), db); err != nil {
 		return err
 	}

@@ -83,6 +83,28 @@ func AcquireServerSession(paths HomePaths, listenAddress string, maxConcurrency 
 	return session, nil
 }
 
+func AcquireServerSessionForStartup(paths HomePaths, listenAddress string, maxConcurrency int, timeout time.Duration) (*ServerSession, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		session, err := AcquireServerSession(paths, listenAddress, maxConcurrency)
+		if err == nil {
+			return session, nil
+		}
+		if !errors.Is(err, ErrLockHeld) {
+			return nil, err
+		}
+		if _, stateErr := os.Stat(paths.ServerState); stateErr == nil {
+			return nil, err
+		} else if !errors.Is(stateErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("inspect Server startup state: %w", stateErr)
+		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("wait for database initialization before Server startup: %w", err)
+		}
+		time.Sleep(databaseLockPollInterval)
+	}
+}
+
 func (session *ServerSession) MarkRunning() error {
 	return session.update(ServerRunning, "")
 }
