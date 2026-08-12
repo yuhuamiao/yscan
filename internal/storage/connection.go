@@ -23,60 +23,29 @@ var (
 )
 
 type ManagedDatabase struct {
-	DB        *sql.DB
-	Path      string
-	Mode      appRuntime.DatabaseMode
-	lifecycle *appRuntime.DatabaseLifecycle
+	DB   *sql.DB
+	Path string
+	Mode appRuntime.DatabaseMode
 }
 
 type ManagedDatabaseOptions struct {
 	Paths             appRuntime.HomePaths
 	BusyTimeout       time.Duration
-	ServerLockHeld    bool
-	LockTimeout       time.Duration
 	InitializeContent func(*sql.DB) error
 }
 
 func OpenManagedDatabase(options ManagedDatabaseOptions) (*ManagedDatabase, error) {
-	if options.LockTimeout <= 0 {
-		options.LockTimeout = 2 * time.Minute
-	}
 	if options.BusyTimeout <= 0 {
 		options.BusyTimeout = 5 * time.Second
 	}
-	for {
-		selection, err := options.Paths.SelectDatabase()
-		if err != nil {
-			return nil, err
-		}
-		if selection.Mode == appRuntime.DatabaseUninitialized {
-			managed, retry, err := initializeManagedDatabase(options)
-			if retry {
-				time.Sleep(25 * time.Millisecond)
-				continue
-			}
-			return managed, err
-		}
-		lifecycle, err := appRuntime.AcquireDatabaseShared(options.Paths, options.ServerLockHeld, options.LockTimeout)
-		if err != nil {
-			return nil, err
-		}
-		selectionAfterLock, err := options.Paths.SelectDatabase()
-		if err != nil {
-			_ = lifecycle.Close()
-			return nil, err
-		}
-		if selectionAfterLock != selection {
-			_ = lifecycle.Close()
-			continue
-		}
-		managed, err := openLockedDatabase(selection, lifecycle, options.BusyTimeout)
-		if err != nil {
-			_ = lifecycle.Close()
-			return nil, err
-		}
-		return managed, nil
+	selection, err := options.Paths.SelectDatabase()
+	if err != nil {
+		return nil, err
 	}
+	if selection.Mode == appRuntime.DatabaseUninitialized {
+		return initializeManagedDatabase(options)
+	}
+	return openManagedDatabase(selection, options.BusyTimeout)
 }
 
 func (managed *ManagedDatabase) Close() error {
@@ -88,53 +57,36 @@ func (managed *ManagedDatabase) Close() error {
 		result = managed.DB.Close()
 		managed.DB = nil
 	}
-	if managed.lifecycle != nil {
-		result = errors.Join(result, managed.lifecycle.Close())
-		managed.lifecycle = nil
-	}
 	return result
 }
 
-func initializeManagedDatabase(options ManagedDatabaseOptions) (*ManagedDatabase, bool, error) {
-	lifecycle, err := appRuntime.AcquireDatabaseExclusive(options.Paths, options.ServerLockHeld, options.LockTimeout)
-	if err != nil {
-		if errors.Is(err, appRuntime.ErrLockHeld) {
-			return nil, true, nil
-		}
-		return nil, false, err
-	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = lifecycle.Close()
-		}
-	}()
+func initializeManagedDatabase(options ManagedDatabaseOptions) (*ManagedDatabase, error) {
 	selection, err := options.Paths.SelectDatabase()
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if selection.Mode != appRuntime.DatabaseUninitialized {
-		return nil, true, nil
+		return openManagedDatabase(selection, options.BusyTimeout)
 	}
 	if err := os.MkdirAll(options.Paths.DataDir, 0750); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	temporary, err := os.CreateTemp(options.Paths.DataDir, ".asm.db.init-*")
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	temporaryPath := temporary.Name()
 	if err := temporary.Close(); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if err := os.Remove(temporaryPath); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	defer os.Remove(temporaryPath)
 
 	db, err := InitDBAt(temporaryPath)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	closeDB := true
 	defer func() {
@@ -143,46 +95,38 @@ func initializeManagedDatabase(options ManagedDatabaseOptions) (*ManagedDatabase
 		}
 	}()
 	if _, err := db.Exec(`PRAGMA journal_mode = DELETE`); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if err := writeSchemaVersion(db, CurrentSchemaVersion); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if options.InitializeContent != nil {
 		if err := options.InitializeContent(db); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 	}
 	var integrity string
 	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
-		return nil, false, fmt.Errorf("new database integrity check failed: %s: %w", integrity, err)
+		return nil, fmt.Errorf("new database integrity check failed: %s: %w", integrity, err)
 	}
 	if err := db.Close(); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	closeDB = false
 	if err := syncRegularFile(temporaryPath); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if err := os.Rename(temporaryPath, options.Paths.Database); err != nil {
-		return nil, false, fmt.Errorf("publish initialized database: %w", err)
+		return nil, fmt.Errorf("publish initialized database: %w", err)
 	}
 	if err := syncStorageDirectory(options.Paths.DataDir); err != nil {
-		return nil, false, err
-	}
-	if err := lifecycle.DowngradeToShared(); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	selection = appRuntime.DatabaseSelection{Mode: appRuntime.DatabaseCurrent, Path: options.Paths.Database}
-	managed, err := openLockedDatabase(selection, lifecycle, options.BusyTimeout)
-	if err != nil {
-		return nil, false, err
-	}
-	cleanup = false
-	return managed, false, nil
+	return openManagedDatabase(selection, options.BusyTimeout)
 }
 
-func openLockedDatabase(selection appRuntime.DatabaseSelection, lifecycle *appRuntime.DatabaseLifecycle, busyTimeout time.Duration) (*ManagedDatabase, error) {
+func openManagedDatabase(selection appRuntime.DatabaseSelection, busyTimeout time.Duration) (*ManagedDatabase, error) {
 	databaseURL := url.URL{Scheme: "file", Path: selection.Path}
 	query := databaseURL.Query()
 	query.Set("_busy_timeout", fmt.Sprintf("%d", busyTimeout.Milliseconds()))
@@ -217,7 +161,7 @@ func openLockedDatabase(selection appRuntime.DatabaseSelection, lifecycle *appRu
 		_ = db.Close()
 		return nil, fmt.Errorf("%w: database=%d binary=%d", ErrDatabaseUpgradeRequired, version, CurrentSchemaVersion)
 	}
-	return &ManagedDatabase{DB: db, Path: selection.Path, Mode: selection.Mode, lifecycle: lifecycle}, nil
+	return &ManagedDatabase{DB: db, Path: selection.Path, Mode: selection.Mode}, nil
 }
 
 func writeSchemaVersion(db *sql.DB, version int) error {
