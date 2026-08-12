@@ -31,7 +31,6 @@ type HomePaths struct {
 	RunLogsDir     string
 	RunDir         string
 	ServerState    string
-	MigrationState string
 }
 
 type DatabaseSelection struct {
@@ -72,7 +71,6 @@ func ResolveHome(executablePath, override string) (HomePaths, error) {
 		RunLogsDir:     filepath.Join(home, "logs", "runs"),
 		RunDir:         filepath.Join(home, "run"),
 		ServerState:    filepath.Join(home, "run", "server.state"),
-		MigrationState: filepath.Join(home, "run", "migration.state"),
 	}
 	return paths, nil
 }
