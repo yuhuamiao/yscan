@@ -6,7 +6,7 @@ templates_path=${YSCAN_T330_TEMPLATES:-/home/yuhua/nuclei-templates}
 api_addr=${YSCAN_T330_API_ADDR:-127.0.0.1:19091}
 port_spec=${YSCAN_T330_PORT_SPEC:-22222,6379,26379,28080,28081,28082}
 chromium_path=${YSCAN_T330_CHROMIUM:-/home/yuhua/.cache/ms-playwright/chromium-1200/chrome-linux64/chrome}
-validation_root=$(mktemp -d /tmp/caasm-t330-XXXXXX)
+validation_root=$(mktemp -d /tmp/yscan-t330-XXXXXX)
 runtime_dir="$validation_root/runtime"
 api_pid=""
 fixture_pid=""
@@ -84,14 +84,14 @@ for port in "${expected_ports[@]}"; do
 done
 
 mkdir "$runtime_dir"
-(cd "$repo_root" && go build -trimpath -o "$runtime_dir/caasm" .)
+(cd "$repo_root" && go build -trimpath -o "$runtime_dir/yscan" .)
 cd "$runtime_dir"
 
-./caasm fingerprint list > fingerprint-sources.txt
-test -s asm.db
+./yscan fingerprint list > fingerprint-sources.txt
+test -s data/asm.db
 test "$(tail -n +2 fingerprint-sources.txt | wc -l)" -eq 10
 
-create_output=$(./caasm --templates "$templates_path" schedule create \
+create_output=$(./yscan --templates "$templates_path" schedule create \
   --target 127.0.0.1 \
   --scan-type ip \
   --mode scheduled \
@@ -102,7 +102,7 @@ create_output=$(./caasm --templates "$templates_path" schedule create \
 task_id=$(sed -n 's/^ScanTask \([0-9][0-9]*\) created.*/\1/p' <<< "$create_output")
 test -n "$task_id"
 
-./caasm --templates "$templates_path" api "$api_addr" > api.log 2>&1 &
+./yscan --templates "$templates_path" server "$api_addr" > api.log 2>&1 &
 api_pid=$!
 base_url="http://$api_addr"
 for _ in $(seq 1 30); do
