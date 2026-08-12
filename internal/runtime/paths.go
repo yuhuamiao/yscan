@@ -30,10 +30,6 @@ type HomePaths struct {
 	LogsDir        string
 	RunLogsDir     string
 	RunDir         string
-	ServerLock     string
-	DatabaseLock   string
-	UpgradeLock    string
-	DispatchLock   string
 	ServerState    string
 	MigrationState string
 }
@@ -75,10 +71,6 @@ func ResolveHome(executablePath, override string) (HomePaths, error) {
 		LogsDir:        filepath.Join(home, "logs"),
 		RunLogsDir:     filepath.Join(home, "logs", "runs"),
 		RunDir:         filepath.Join(home, "run"),
-		ServerLock:     filepath.Join(home, "run", "server.lock"),
-		DatabaseLock:   filepath.Join(home, "run", "database.lock"),
-		UpgradeLock:    filepath.Join(home, "run", "upgrade.lock"),
-		DispatchLock:   filepath.Join(home, "run", "dispatch.lock"),
 		ServerState:    filepath.Join(home, "run", "server.state"),
 		MigrationState: filepath.Join(home, "run", "migration.state"),
 	}

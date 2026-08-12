@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-const ServerStateProtocolVersion = 1
-
 type ServerStatus string
 
 const (
@@ -23,16 +21,15 @@ const (
 	ServerDegraded ServerStatus = "degraded"
 )
 
+// ServerState is health metadata, not an inter-process lock.
 type ServerState struct {
-	ProtocolVersion int          `json:"protocol_version"`
-	InstanceID      string       `json:"instance_id"`
-	PID             int          `json:"pid"`
-	Status          ServerStatus `json:"status"`
-	ListenAddress   string       `json:"listen_address"`
-	MaxConcurrency  int          `json:"max_concurrency"`
-	StartedAt       time.Time    `json:"started_at"`
-	UpdatedAt       time.Time    `json:"updated_at"`
-	Diagnostic      string       `json:"diagnostic,omitempty"`
+	PID           int          `json:"pid"`
+	Status        ServerStatus `json:"status"`
+	ListenAddress string       `json:"listen_address"`
+	HealthToken   string       `json:"health_token"`
+	StartedAt     time.Time    `json:"started_at"`
+	UpdatedAt     time.Time    `json:"updated_at"`
+	Diagnostic    string       `json:"diagnostic,omitempty"`
 }
 
 type ServerInspection struct {
@@ -42,72 +39,33 @@ type ServerInspection struct {
 }
 
 type ServerSession struct {
-	paths HomePaths
-	lock  *FileLock
-	mu    sync.Mutex
-	state ServerState
+	paths  HomePaths
+	mu     sync.Mutex
+	state  ServerState
+	closed bool
 }
 
-func AcquireServerSession(paths HomePaths, listenAddress string, maxConcurrency int) (*ServerSession, error) {
-	lock, err := TryExclusiveLock(paths.ServerLock)
+func AcquireServerSession(paths HomePaths, listenAddress string) (*ServerSession, error) {
+	healthToken, err := randomHealthToken()
 	if err != nil {
-		if errors.Is(err, ErrLockHeld) {
-			return nil, fmt.Errorf("yscan Server is already running for home %s: %w", paths.Home, err)
-		}
-		return nil, err
-	}
-	instanceID, err := randomInstanceID()
-	if err != nil {
-		_ = lock.Close()
 		return nil, err
 	}
 	now := time.Now().UTC()
-	session := &ServerSession{
-		paths: paths,
-		lock:  lock,
-		state: ServerState{
-			ProtocolVersion: ServerStateProtocolVersion,
-			InstanceID:      instanceID,
-			PID:             os.Getpid(),
-			Status:          ServerStarting,
-			ListenAddress:   listenAddress,
-			MaxConcurrency:  maxConcurrency,
-			StartedAt:       now,
-			UpdatedAt:       now,
-		},
-	}
+	session := &ServerSession{paths: paths, state: ServerState{
+		PID: os.Getpid(), Status: ServerStarting, ListenAddress: listenAddress,
+		HealthToken: healthToken, StartedAt: now, UpdatedAt: now,
+	}}
 	if err := writeServerStateAtomic(paths.ServerState, session.state); err != nil {
-		_ = lock.Close()
 		return nil, err
 	}
 	return session, nil
 }
 
-func AcquireServerSessionForStartup(paths HomePaths, listenAddress string, maxConcurrency int, timeout time.Duration) (*ServerSession, error) {
-	deadline := time.Now().Add(timeout)
-	for {
-		session, err := AcquireServerSession(paths, listenAddress, maxConcurrency)
-		if err == nil {
-			return session, nil
-		}
-		if !errors.Is(err, ErrLockHeld) {
-			return nil, err
-		}
-		if _, stateErr := os.Stat(paths.ServerState); stateErr == nil {
-			return nil, err
-		} else if !errors.Is(stateErr, os.ErrNotExist) {
-			return nil, fmt.Errorf("inspect Server startup state: %w", stateErr)
-		}
-		if !time.Now().Before(deadline) {
-			return nil, fmt.Errorf("wait for database initialization before Server startup: %w", err)
-		}
-		time.Sleep(databaseLockPollInterval)
-	}
+func AcquireServerSessionForStartup(paths HomePaths, listenAddress string) (*ServerSession, error) {
+	return AcquireServerSession(paths, listenAddress)
 }
 
-func (session *ServerSession) MarkRunning() error {
-	return session.update(ServerRunning, "")
-}
+func (session *ServerSession) MarkRunning() error { return session.update(ServerRunning, "") }
 
 func (session *ServerSession) MarkDegraded(diagnostic string) error {
 	return session.update(ServerDegraded, diagnostic)
@@ -128,20 +86,24 @@ func (session *ServerSession) Close() error {
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	if session.lock == nil {
+	if session.closed {
 		return nil
 	}
-	removeErr := os.Remove(session.paths.ServerState)
-	if errors.Is(removeErr, os.ErrNotExist) {
-		removeErr = nil
+	session.closed = true
+	current, err := ReadServerState(session.paths.ServerState)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	lock := session.lock
-	session.lock = nil
-	lockErr := lock.Close()
-	if removeErr != nil {
-		return fmt.Errorf("remove server state: %w", removeErr)
+	if err != nil {
+		return err
 	}
-	return lockErr
+	if current.PID != session.state.PID || current.HealthToken != session.state.HealthToken {
+		return nil
+	}
+	if err := os.Remove(session.paths.ServerState); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove server state: %w", err)
+	}
+	return nil
 }
 
 func (session *ServerSession) update(status ServerStatus, diagnostic string) error {
@@ -150,7 +112,7 @@ func (session *ServerSession) update(status ServerStatus, diagnostic string) err
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	if session.lock == nil {
+	if session.closed {
 		return errors.New("server session is closed")
 	}
 	session.state.Status = status
@@ -160,20 +122,15 @@ func (session *ServerSession) update(status ServerStatus, diagnostic string) err
 }
 
 func InspectServer(paths HomePaths) ServerInspection {
-	probe, err := TryExclusiveLock(paths.ServerLock)
-	if err == nil {
-		_ = probe.Close()
+	state, err := ReadServerState(paths.ServerState)
+	if errors.Is(err, os.ErrNotExist) {
 		return ServerInspection{Status: ServerStopped}
 	}
-	if !errors.Is(err, ErrLockHeld) {
-		return ServerInspection{Status: ServerDegraded, Error: err.Error()}
-	}
-	state, err := ReadServerState(paths.ServerState)
 	if err != nil {
 		return ServerInspection{Status: ServerDegraded, Error: err.Error()}
 	}
-	if state.ProtocolVersion != ServerStateProtocolVersion {
-		return ServerInspection{Status: ServerDegraded, State: &state, Error: fmt.Sprintf("unsupported server state protocol %d", state.ProtocolVersion)}
+	if !processExists(state.PID) {
+		return ServerInspection{Status: ServerStopped, State: &state, Error: "stale server state"}
 	}
 	switch state.Status {
 	case ServerStarting, ServerRunning, ServerDegraded:
@@ -181,23 +138,6 @@ func InspectServer(paths HomePaths) ServerInspection {
 	default:
 		return ServerInspection{Status: ServerDegraded, State: &state, Error: fmt.Sprintf("invalid server status %q", state.Status)}
 	}
-}
-
-func ActiveServerConcurrency(paths HomePaths, configured int) (int, bool, error) {
-	inspection := InspectServer(paths)
-	if inspection.Status == ServerStopped {
-		return configured, false, nil
-	}
-	if inspection.State == nil || inspection.State.MaxConcurrency < 1 || inspection.State.MaxConcurrency > 8 {
-		if inspection.Error == "" {
-			inspection.Error = "active Server state does not contain a valid concurrency value"
-		}
-		return 0, false, errors.New(inspection.Error)
-	}
-	if inspection.State.ProtocolVersion != ServerStateProtocolVersion {
-		return 0, false, fmt.Errorf("active Server uses unsupported state protocol %d", inspection.State.ProtocolVersion)
-	}
-	return inspection.State.MaxConcurrency, inspection.State.MaxConcurrency != configured, nil
 }
 
 func ReadServerState(path string) (ServerState, error) {
@@ -209,7 +149,7 @@ func ReadServerState(path string) (ServerState, error) {
 	if err := json.Unmarshal(content, &state); err != nil {
 		return ServerState{}, fmt.Errorf("decode server state %s: %w", path, err)
 	}
-	if state.InstanceID == "" || state.PID <= 0 {
+	if state.PID <= 0 || state.HealthToken == "" || state.ListenAddress == "" || state.StartedAt.IsZero() {
 		return ServerState{}, fmt.Errorf("invalid server state %s", path)
 	}
 	return state, nil
@@ -248,10 +188,10 @@ func writeServerStateAtomic(path string, state ServerState) error {
 	return syncDirectory(filepath.Dir(path))
 }
 
-func randomInstanceID() (string, error) {
+func randomHealthToken() (string, error) {
 	buffer := make([]byte, 16)
 	if _, err := rand.Read(buffer); err != nil {
-		return "", fmt.Errorf("create Server instance ID: %w", err)
+		return "", fmt.Errorf("create Server health token: %w", err)
 	}
 	return hex.EncodeToString(buffer), nil
 }

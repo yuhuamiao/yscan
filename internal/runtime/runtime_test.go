@@ -3,76 +3,13 @@ package runtime
 import (
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestServerLockHelper(t *testing.T) {
-	if os.Getenv("YSCAN_SERVER_LOCK_HELPER") != "1" {
-		return
-	}
-	home := os.Getenv("YSCAN_SERVER_LOCK_HOME")
-	paths, err := ResolveHome(os.Args[0], home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(paths.RunDir, 0750); err != nil {
-		t.Fatal(err)
-	}
-	session, err := AcquireServerSession(paths, "127.0.0.1:8080", 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-	if err := os.WriteFile(filepath.Join(home, "ready"), []byte("ready"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(filepath.Join(home, "release")); err == nil {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("timed out waiting for release")
-}
-
-func TestServerSessionUsesOSLockAcrossProcesses(t *testing.T) {
-	home := t.TempDir()
-	command := exec.Command(os.Args[0], "-test.run=TestServerLockHelper")
-	command.Env = append(os.Environ(), "YSCAN_SERVER_LOCK_HELPER=1", "YSCAN_SERVER_LOCK_HOME="+home)
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = command.Process.Kill(); _ = command.Wait() })
-	waitForPath(t, filepath.Join(home, "ready"))
-	paths, err := ResolveHome(os.Args[0], home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inspection := InspectServer(paths)
-	if inspection.Status != ServerStarting || inspection.State == nil || inspection.State.MaxConcurrency != CurrentEffectiveConcurrency || inspection.State.ConfiguredMaxConcurrency != 3 {
-		t.Fatalf("inspection = %#v", inspection)
-	}
-	if _, err := AcquireServerSession(paths, "127.0.0.1:9090", 2); !errors.Is(err, ErrLockHeld) {
-		t.Fatalf("second Server error = %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(home, "release"), []byte("release"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := command.Wait(); err != nil {
-		t.Fatal(err)
-	}
-	inspection = InspectServer(paths)
-	if inspection.Status != ServerStopped {
-		t.Fatalf("stale lock file inspection = %#v", inspection)
-	}
-}
-
-func TestServerSessionStateAndActiveConcurrency(t *testing.T) {
+func TestServerSessionStateAndStaleRecovery(t *testing.T) {
 	home := t.TempDir()
 	paths, err := ResolveHome(os.Args[0], home)
 	if err != nil {
@@ -81,7 +18,7 @@ func TestServerSessionStateAndActiveConcurrency(t *testing.T) {
 	if err := os.MkdirAll(paths.RunDir, 0750); err != nil {
 		t.Fatal(err)
 	}
-	session, err := AcquireServerSession(paths, "127.0.0.1:8080", 4)
+	session, err := AcquireServerSession(paths, "127.0.0.1:8080")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,16 +27,8 @@ func TestServerSessionStateAndActiveConcurrency(t *testing.T) {
 		t.Fatal(err)
 	}
 	inspection := InspectServer(paths)
-	if inspection.Status != ServerRunning || inspection.State == nil || inspection.State.InstanceID == "" {
+	if inspection.Status != ServerRunning || inspection.State == nil || inspection.State.HealthToken == "" {
 		t.Fatalf("running inspection = %#v", inspection)
-	}
-	effective, changed, err := ActiveServerConcurrency(paths, 2)
-	if err != nil || effective != CurrentEffectiveConcurrency || !changed {
-		t.Fatalf("active concurrency = %d, %t, %v", effective, changed, err)
-	}
-	effective, changed, err = ActiveServerConcurrency(paths, 4)
-	if err != nil || effective != CurrentEffectiveConcurrency || changed {
-		t.Fatalf("matching configured concurrency = %d, %t, %v", effective, changed, err)
 	}
 	if err := session.MarkDegraded("scheduler stopped"); err != nil {
 		t.Fatal(err)
@@ -108,18 +37,21 @@ func TestServerSessionStateAndActiveConcurrency(t *testing.T) {
 	if inspection.Status != ServerDegraded || inspection.Error != "scheduler stopped" {
 		t.Fatalf("degraded inspection = %#v", inspection)
 	}
-}
-
-func waitForPath(t *testing.T, path string) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
 	}
-	t.Fatalf("timed out waiting for %s", path)
+	stale := ServerState{PID: 2147483647, Status: ServerRunning, ListenAddress: "127.0.0.1:8080", HealthToken: "stale", StartedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := writeServerStateAtomic(paths.ServerState, stale); err != nil {
+		t.Fatal(err)
+	}
+	if inspection := InspectServer(paths); inspection.Status != ServerStopped || inspection.State == nil {
+		t.Fatalf("stale inspection = %#v", inspection)
+	}
+	replacement, err := AcquireServerSessionForStartup(paths, "127.0.0.1:9090")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
 }
 
 func TestResolveHomeUsesExecutableInsteadOfWorkingDirectory(t *testing.T) {
