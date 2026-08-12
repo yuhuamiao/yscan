@@ -79,6 +79,10 @@ func StartServerWithScanTasksAndAccessPolicy(db *sql.DB, addr string, runTask Ta
 }
 
 func StartServerWithScanTasksAndAccessPolicyContext(ctx context.Context, db *sql.DB, addr string, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter, policy AccessPolicy) error {
+	return StartServerWithScanTasksAndAccessPolicyContextReady(ctx, db, addr, runTask, creator, startRun, policy, nil)
+}
+
+func StartServerWithScanTasksAndAccessPolicyContextReady(ctx context.Context, db *sql.DB, addr string, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter, policy AccessPolicy, ready func() error) error {
 	var activeRuns sync.WaitGroup
 	handler, err := newHandlerWithScanTasksContextAndGroup(ctx, db, runTask, creator, startRun, &activeRuns)
 	if err != nil {
@@ -88,9 +92,19 @@ func StartServerWithScanTasksAndAccessPolicyContext(ctx context.Context, db *sql
 		return err
 	}
 
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	if ready != nil {
+		if err := ready(); err != nil {
+			_ = listener.Close()
+			return err
+		}
+	}
 	server := &http.Server{Addr: addr, Handler: policy.Wrap(handler), ReadHeaderTimeout: 10 * time.Second}
 	listenResult := make(chan error, 1)
-	go func() { listenResult <- server.ListenAndServe() }()
+	go func() { listenResult <- server.Serve(listener) }()
 	log.Printf("API server listening on %s", addr)
 	select {
 	case err := <-listenResult:

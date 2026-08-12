@@ -756,6 +756,28 @@ func runMainArgs(rawArgs []string) error {
 	if err := paths.Prepare(); err != nil {
 		return err
 	}
+	isServerCommand := len(args) > 0 && strings.EqualFold(strings.TrimSpace(args[0]), "api")
+	var serverSession *appRuntime.ServerSession
+	if isServerCommand {
+		listenAddress := runtimeConfig.ListenAddress
+		if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
+			listenAddress = strings.TrimSpace(args[1])
+		}
+		serverSession, err = appRuntime.AcquireServerSession(paths, listenAddress, runtimeConfig.MaxConcurrency)
+		if err != nil {
+			return err
+		}
+		defer serverSession.Close()
+	} else {
+		effective, changed, err := appRuntime.ActiveServerConcurrency(paths, runtimeConfig.MaxConcurrency)
+		if err != nil {
+			return fmt.Errorf("read active Server configuration: %w", err)
+		}
+		if changed {
+			log.Printf("[INFO] using active Server concurrency %d; configuration changes require a Server restart", effective)
+		}
+		runtimeConfig.MaxConcurrency = effective
+	}
 	database, err := paths.SelectDatabase()
 	if err != nil {
 		return err
@@ -788,7 +810,7 @@ func runMainArgs(rawArgs []string) error {
 	task.NucleiTemplates = runtimeConfig.NucleiTemplates
 	task.DNSResolveMode = cfg.DNSResolveMode
 	task.DNSDenyCIDRs = cfg.DNSDenyCIDRs
-	return runByArgs(args, task, db)
+	return runByArgs(args, task, db, runtimeConfig, serverSession)
 }
 
 func isTopLevelVersion(args []string) bool {
@@ -879,7 +901,7 @@ func printCLIUsage() {
 	fmt.Println("       yscan version")
 }
 
-func runByArgs(args []string, task model.Scanner, db *sql.DB) error {
+func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appRuntime.Config, serverSession *appRuntime.ServerSession) error {
 	command := strings.ToLower(strings.TrimSpace(args[0]))
 	switch command {
 	case "help", "--help", "-h":
@@ -960,8 +982,8 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) error {
 		return nil
 
 	case "api":
-		addr := "127.0.0.1:8080"
-		policy := api.AccessPolicy{}
+		addr := runtimeConfig.ListenAddress
+		policy := api.AccessPolicy{TrustedCIDRs: append([]string(nil), runtimeConfig.AllowCIDRs...)}
 		if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
 			addr = strings.TrimSpace(args[1])
 		}
@@ -971,6 +993,9 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) error {
 			}
 			policy.TrustedCIDRs = append(policy.TrustedCIDRs, strings.TrimSpace(args[index+1]))
 			index++
+		}
+		if serverSession == nil {
+			return errors.New("Server lifecycle session is unavailable")
 		}
 		serviceContext, stopService := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stopService()
@@ -982,8 +1007,8 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) error {
 		}
 		runner.OnRecovered = func(run model.ScanTaskRun) error { return generateRecoveredScanTaskRunReport(db, run) }
 		service := schedule.NewTaskService(db, nil)
-		return recoverThenRunAPIAndScheduler(serviceContext, runner.RecoverStartupState, func(ctx context.Context) error {
-			return api.StartServerWithScanTasksAndAccessPolicyContext(ctx, db, addr, func(taskType, target string) (int64, error) {
+		serviceErr := recoverThenRunAPIAndScheduler(serviceContext, runner.RecoverStartupState, func(ctx context.Context) error {
+			return api.StartServerWithScanTasksAndAccessPolicyContextReady(ctx, db, addr, func(taskType, target string) (int64, error) {
 				return runTaskAsync(db, task, taskType, target)
 			}, service, func(ctx context.Context, run model.ScanTaskRun) {
 				if err := executeLogicalScanTaskRun(ctx, db, task, run); err != nil {
@@ -992,8 +1017,12 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB) error {
 					}
 					log.Printf("one-time ScanTask run %d failed: %v", run.ID, err)
 				}
-			}, policy)
+			}, policy, serverSession.MarkRunning)
 		}, runner.RunLoop)
+		if serviceErr != nil && serviceContext.Err() == nil {
+			_ = serverSession.MarkDegraded(serviceErr.Error())
+		}
+		return serviceErr
 
 	case "schedule":
 		return runScheduleCommand(args[1:], task, db)
