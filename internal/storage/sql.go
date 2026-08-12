@@ -2297,13 +2297,60 @@ func SyncOpenPorts(db *sql.DB, ip string, results []model.ScanResult, values ...
 	if err := ensureCurrentPortInventory(db); err != nil {
 		return err
 	}
+	ip, coverage, coveredPorts, recordsByPort, ports, err := preparePortInventorySync(db, ip, results, values)
+	if err != nil {
+		return err
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := syncCurrentPortInventoryTx(tx, ip, coverage, coveredPorts, recordsByPort, ports); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SyncOpenAndScopePorts atomically updates the global and scope inventories for
+// one host. Production workflows use this operation so a scope write failure
+// cannot leave the global inventory partially committed.
+func SyncOpenAndScopePorts(db *sql.DB, scope, ip string, results []model.ScanResult, values ...PortScanCoverage) error {
+	if err := ensureCurrentPortInventory(db); err != nil {
+		return err
+	}
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return errors.New("scan scope is required")
+	}
+	ip, coverage, coveredPorts, recordsByPort, ports, err := preparePortInventorySync(db, ip, results, values)
+	if err != nil {
+		return err
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := syncCurrentPortInventoryTx(tx, ip, coverage, coveredPorts, recordsByPort, ports); err != nil {
+		return err
+	}
+	if err := syncScopePortInventoryTx(tx, scope, ip, coverage, coveredPorts, recordsByPort, ports); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func preparePortInventorySync(db *sql.DB, ip string, results []model.ScanResult, values []PortScanCoverage) (string, PortScanCoverage, map[int]struct{}, map[int]scanResultRecord, []int, error) {
 	ip = strings.TrimSpace(ip)
 	if net.ParseIP(ip) == nil {
-		return fmt.Errorf("invalid host IP: %s", ip)
+		return "", PortScanCoverage{}, nil, nil, nil, fmt.Errorf("invalid host IP: %s", ip)
 	}
 	coverage, coveredPorts, err := normalizePortScanCoverage(values)
 	if err != nil {
-		return err
+		return "", PortScanCoverage{}, nil, nil, nil, err
 	}
 
 	recordsByPort := make(map[int]scanResultRecord)
@@ -2313,14 +2360,14 @@ func SyncOpenPorts(db *sql.DB, ip string, results []model.ScanResult, values ...
 		}
 		record, err := normalizeScanResult(db, result)
 		if err != nil {
-			return err
+			return "", PortScanCoverage{}, nil, nil, nil, err
 		}
 		if record.ip != ip {
-			return fmt.Errorf("scan result IP %s does not match host %s", record.ip, ip)
+			return "", PortScanCoverage{}, nil, nil, nil, fmt.Errorf("scan result IP %s does not match host %s", record.ip, ip)
 		}
 		if !coverage.Full {
 			if _, covered := coveredPorts[record.port]; !covered {
-				return fmt.Errorf("scan result port %d is outside the declared coverage", record.port)
+				return "", PortScanCoverage{}, nil, nil, nil, fmt.Errorf("scan result port %d is outside the declared coverage", record.port)
 			}
 		}
 		recordsByPort[record.port] = record
@@ -2331,30 +2378,31 @@ func SyncOpenPorts(db *sql.DB, ip string, results []model.ScanResult, values ...
 		ports = append(ports, port)
 	}
 	sort.Ints(ports)
+	return ip, coverage, coveredPorts, recordsByPort, ports, nil
+}
 
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-
+func syncCurrentPortInventoryTx(tx *sql.Tx, ip string, coverage PortScanCoverage, coveredPorts map[int]struct{}, recordsByPort map[int]scanResultRecord, ports []int) error {
 	for _, port := range ports {
-		if err = upsertCurrentPort(tx, recordsByPort[port]); err != nil {
+		if err := upsertCurrentPort(tx, recordsByPort[port]); err != nil {
 			return err
 		}
 	}
 
-	statement, args := coveredMissingPortsStatement(`DELETE FROM current_port_inventory WHERE ip = ?`, []interface{}{ip}, coverage, ports)
-	if _, err = tx.Exec(statement, args...); err != nil {
+	missingPorts, err := coveredMissingInventoryPorts(
+		tx,
+		`SELECT port FROM current_port_inventory WHERE ip = ?`,
+		[]interface{}{ip},
+		coverage,
+		coveredPorts,
+		recordsByPort,
+	)
+	if err != nil {
 		return err
 	}
-
-	if err = tx.Commit(); err != nil {
-		return err
+	for _, port := range missingPorts {
+		if _, err := tx.Exec(`DELETE FROM current_port_inventory WHERE ip = ? AND port = ?`, ip, port); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -2390,23 +2438,33 @@ func normalizePortScanCoverage(values []PortScanCoverage) (PortScanCoverage, map
 	return coverage, covered, nil
 }
 
-func coveredMissingPortsStatement(statement string, args []interface{}, coverage PortScanCoverage, openPorts []int) (string, []interface{}) {
-	if !coverage.Full {
-		if len(coverage.Ports) == 0 {
-			return statement + ` AND 1 = 0`, args
-		}
-		statement += ` AND port IN (` + sqlPlaceholders(len(coverage.Ports)) + `)`
-		for _, port := range coverage.Ports {
-			args = append(args, port)
-		}
+func coveredMissingInventoryPorts(tx *sql.Tx, query string, args []interface{}, coverage PortScanCoverage, coveredPorts map[int]struct{}, openPorts map[int]scanResultRecord) ([]int, error) {
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return nil, err
 	}
-	if len(openPorts) > 0 {
-		statement += ` AND port NOT IN (` + sqlPlaceholders(len(openPorts)) + `)`
-		for _, port := range openPorts {
-			args = append(args, port)
+	defer rows.Close()
+
+	missing := make([]int, 0)
+	for rows.Next() {
+		var port int
+		if err := rows.Scan(&port); err != nil {
+			return nil, err
 		}
+		if _, open := openPorts[port]; open {
+			continue
+		}
+		if !coverage.Full {
+			if _, covered := coveredPorts[port]; !covered {
+				continue
+			}
+		}
+		missing = append(missing, port)
 	}
-	return statement, args
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return missing, nil
 }
 
 func ensureCurrentPortInventory(db *sql.DB) error {
@@ -2427,48 +2485,26 @@ func ensureCurrentPortInventory(db *sql.DB) error {
 // scope-port inventory used for latest service profiling.
 func SyncScopeOpenPorts(db *sql.DB, scope, ip string, results []model.ScanResult, values ...PortScanCoverage) error {
 	scope = strings.TrimSpace(scope)
-	ip = strings.TrimSpace(ip)
 	if scope == "" {
 		return errors.New("scan scope is required")
 	}
-	if net.ParseIP(ip) == nil {
-		return fmt.Errorf("invalid host IP: %s", ip)
-	}
-	coverage, coveredPorts, err := normalizePortScanCoverage(values)
+	ip, coverage, coveredPorts, recordsByPort, ports, err := preparePortInventorySync(db, ip, results, values)
 	if err != nil {
 		return err
 	}
-
-	recordsByPort := make(map[int]scanResultRecord)
-	for _, result := range results {
-		if !result.Open {
-			continue
-		}
-		record, err := normalizeScanResult(db, result)
-		if err != nil {
-			return err
-		}
-		if record.ip != ip {
-			return fmt.Errorf("scan result IP %s does not match host %s", record.ip, ip)
-		}
-		if !coverage.Full {
-			if _, covered := coveredPorts[record.port]; !covered {
-				return fmt.Errorf("scan result port %d is outside the declared coverage", record.port)
-			}
-		}
-		recordsByPort[record.port] = record
-	}
-
-	ports := make([]int, 0, len(recordsByPort))
-	for port := range recordsByPort {
-		ports = append(ports, port)
-	}
-	sort.Ints(ports)
 
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+	if err := syncScopePortInventoryTx(tx, scope, ip, coverage, coveredPorts, recordsByPort, ports); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func syncScopePortInventoryTx(tx *sql.Tx, scope, ip string, coverage PortScanCoverage, coveredPorts map[int]struct{}, recordsByPort map[int]scanResultRecord, ports []int) error {
 	for _, port := range ports {
 		record := recordsByPort[port]
 		if _, err := tx.Exec(`
@@ -2485,22 +2521,28 @@ func SyncScopeOpenPorts(db *sql.DB, scope, ip string, results []model.ScanResult
 			record.port,
 			record.serviceType,
 		); err != nil {
-			_ = tx.Rollback()
 			return err
 		}
 	}
 
-	statement := `
-		UPDATE host_inventory_scope_ports
-		SET is_active = 0, last_checked = datetime('now')
-		WHERE scope = ? AND ip = ?`
-	statement, args := coveredMissingPortsStatement(statement, []interface{}{scope, ip}, coverage, ports)
-	if _, err := tx.Exec(statement, args...); err != nil {
-		_ = tx.Rollback()
+	missingPorts, err := coveredMissingInventoryPorts(
+		tx,
+		`SELECT port FROM host_inventory_scope_ports WHERE scope = ? AND ip = ?`,
+		[]interface{}{scope, ip},
+		coverage,
+		coveredPorts,
+		recordsByPort,
+	)
+	if err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return err
+	for _, port := range missingPorts {
+		if _, err := tx.Exec(`
+			UPDATE host_inventory_scope_ports
+			SET is_active = 0, last_checked = datetime('now')
+			WHERE scope = ? AND ip = ? AND port = ?`, scope, ip, port); err != nil {
+			return err
+		}
 	}
 	return nil
 }

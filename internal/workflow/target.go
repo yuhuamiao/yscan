@@ -157,10 +157,7 @@ func runTargetTaskRun(ctx context.Context, options TargetTaskRunOptions, depende
 	if len(configuredPorts) > 0 {
 		coverage = storage.SelectedPortScanCoverage(configuredPorts)
 	}
-	if err := storage.SyncOpenPorts(options.DB, target, openPorts, coverage); err != nil {
-		return snapshot, err
-	}
-	if err := storage.SyncScopeOpenPorts(options.DB, scope, target, openPorts, coverage); err != nil {
+	if err := storage.SyncOpenAndScopePorts(options.DB, scope, target, openPorts, coverage); err != nil {
 		return snapshot, err
 	}
 	if err := storage.DeactivateScopePortsForInactiveHosts(options.DB, scope); err != nil {

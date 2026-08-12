@@ -561,6 +561,118 @@ func TestPortInventoryRespectsSelectedScanCoverage(t *testing.T) {
 	}
 }
 
+func TestPortInventoryHandlesLargeCoverageWithoutSQLVariableOverflow(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatalf("initSQLiteSchema: %v", err)
+	}
+
+	const (
+		ip    = "192.168.10.22"
+		scope = "subnet:192.168.10.0/24"
+	)
+	seed := []model.ScanResult{
+		{Address: ip + ":80", Open: true, Service: "http"},
+		{Address: ip + ":443", Open: true, Service: "https"},
+		{Address: ip + ":55000", Open: true, Service: "unknown"},
+	}
+	if err := SyncOpenAndScopePorts(db, scope, ip, seed, FullPortScanCoverage()); err != nil {
+		t.Fatalf("seed port inventories: %v", err)
+	}
+
+	open443 := []model.ScanResult{{Address: ip + ":443", Open: true, Service: "https"}}
+	largeSelected := SelectedPortScanCoverage(portRangeForTest(50000))
+	if err := SyncOpenAndScopePorts(db, scope, ip, open443, largeSelected); err != nil {
+		t.Fatalf("sync inventories with 50000 selected ports: %v", err)
+	}
+	assertInventoryPortsForTest(t, db, scope, ip, []int{443, 55000})
+
+	explicitFullRange := SelectedPortScanCoverage(portRangeForTest(65535))
+	if err := SyncOpenAndScopePorts(db, scope, ip, open443, explicitFullRange); err != nil {
+		t.Fatalf("sync inventories with explicit full range: %v", err)
+	}
+	assertInventoryPortsForTest(t, db, scope, ip, []int{443})
+
+	open55000 := []model.ScanResult{{Address: ip + ":55000", Open: true, Service: "unknown"}}
+	if err := SyncOpenAndScopePorts(db, scope, ip, open55000, SelectedPortScanCoverage([]int{55000})); err != nil {
+		t.Fatalf("restore outside port: %v", err)
+	}
+	if err := SyncOpenAndScopePorts(db, scope, ip, open443, FullPortScanCoverage()); err != nil {
+		t.Fatalf("sync inventories with full coverage: %v", err)
+	}
+	assertInventoryPortsForTest(t, db, scope, ip, []int{443})
+}
+
+func TestPortInventoryCoverageSyncRollsBackAtomically(t *testing.T) {
+	db := openTestDB(t)
+	if err := initSQLiteSchema(db); err != nil {
+		t.Fatalf("initSQLiteSchema: %v", err)
+	}
+
+	const (
+		ip    = "192.168.10.23"
+		scope = "subnet:192.168.10.0/24"
+	)
+	seed := []model.ScanResult{
+		{Address: ip + ":80", Open: true, Product: "http"},
+		{Address: ip + ":8080", Open: true, Product: "http-alt"},
+	}
+	if err := SyncOpenAndScopePorts(db, scope, ip, seed, FullPortScanCoverage()); err != nil {
+		t.Fatalf("seed port inventories: %v", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TRIGGER reject_scope_port_deactivation
+		BEFORE UPDATE OF is_active ON host_inventory_scope_ports
+		WHEN OLD.scope = 'subnet:192.168.10.0/24' AND OLD.ip = '192.168.10.23' AND OLD.port = 8080 AND NEW.is_active = 0
+		BEGIN SELECT RAISE(ABORT, 'reject scope port deactivation'); END`); err != nil {
+		t.Fatalf("create scope inventory trigger: %v", err)
+	}
+	updated := []model.ScanResult{
+		{Address: ip + ":80", Open: true, Product: "https"},
+		{Address: ip + ":443", Open: true, Product: "https"},
+	}
+	if err := SyncOpenAndScopePorts(db, scope, ip, updated, FullPortScanCoverage()); err == nil {
+		t.Fatal("combined inventory sync unexpectedly succeeded")
+	}
+	assertInventoryPortsForTest(t, db, scope, ip, []int{80, 8080})
+	var currentService string
+	if err := db.QueryRow(`SELECT service_type FROM current_port_inventory WHERE ip = ? AND port = 80`, ip).Scan(&currentService); err != nil {
+		t.Fatalf("query current inventory service: %v", err)
+	}
+	if currentService != "http" {
+		t.Fatalf("current inventory service = %q, want rolled-back value http", currentService)
+	}
+	var scopeService string
+	if err := db.QueryRow(`SELECT service_type FROM host_inventory_scope_ports WHERE scope = ? AND ip = ? AND port = 80`, scope, ip).Scan(&scopeService); err != nil {
+		t.Fatalf("query scope inventory service: %v", err)
+	}
+	if scopeService != "http" {
+		t.Fatalf("scope inventory service = %q, want rolled-back value http", scopeService)
+	}
+}
+
+func portRangeForTest(maxPort int) []int {
+	ports := make([]int, maxPort)
+	for index := range ports {
+		ports[index] = index + 1
+	}
+	return ports
+}
+
+func assertInventoryPortsForTest(t *testing.T, db *sql.DB, scope, ip string, want []int) {
+	t.Helper()
+	if got := listCurrentPortsForTest(t, db, ip); !reflect.DeepEqual(got, want) {
+		t.Fatalf("current inventory ports = %v, want %v", got, want)
+	}
+	scopePorts, err := ListScopeActivePorts(db, scope)
+	if err != nil {
+		t.Fatalf("list scope ports: %v", err)
+	}
+	if wantByIP := map[string][]int{ip: want}; !reflect.DeepEqual(scopePorts, wantByIP) {
+		t.Fatalf("scope inventory ports = %#v, want %#v", scopePorts, wantByIP)
+	}
+}
+
 func TestPortInventoryRejectsResultsOutsideDeclaredCoverage(t *testing.T) {
 	db := openTestDB(t)
 	if err := initSQLiteSchema(db); err != nil {

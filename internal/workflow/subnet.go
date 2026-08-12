@@ -223,10 +223,7 @@ func runSubnetTaskRun(ctx context.Context, options SubnetTaskRunOptions, depende
 				return snapshot, err
 			}
 		}
-		if err := storage.SyncOpenPorts(options.DB, ip, openPorts, portCoverage); err != nil {
-			return snapshot, err
-		}
-		if err := storage.SyncScopeOpenPorts(options.DB, scope, ip, openPorts, portCoverage); err != nil {
+		if err := storage.SyncOpenAndScopePorts(options.DB, scope, ip, openPorts, portCoverage); err != nil {
 			return snapshot, err
 		}
 		if dependencies.collectFingerprints == nil {
@@ -1011,10 +1008,7 @@ func runSubnet(ctx context.Context, options SubnetRunOptions, dependencies subne
 		if err != nil {
 			return model.TaskChangeSummary{}, err
 		}
-		if err := storage.SyncOpenPorts(options.DB, ip, openPorts, portCoverage); err != nil {
-			return model.TaskChangeSummary{}, err
-		}
-		if err := storage.SyncScopeOpenPorts(options.DB, scope, ip, openPorts, portCoverage); err != nil {
+		if err := storage.SyncOpenAndScopePorts(options.DB, scope, ip, openPorts, portCoverage); err != nil {
 			return model.TaskChangeSummary{}, err
 		}
 

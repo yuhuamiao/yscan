@@ -229,10 +229,13 @@ default_task_id=$(curl --fail --silent --request POST "$base_url/api/scan-tasks"
   --header 'Content-Type: application/json' \
   --data '{"target":"127.0.2.1","scan_type":"ip","mode":"scheduled","cron":"0 0 1 1 *","timezone":"UTC","config":{"port_spec":""}}' | jq -r '.task.id')
 test -n "$default_task_id"
-immediate_task_id=$(curl --fail --silent --request POST "$base_url/api/scan-tasks" \
+immediate_task_response=$(curl --fail --silent --request POST "$base_url/api/scan-tasks" \
   --header 'Content-Type: application/json' \
-  --data '{"target":"10.255.255.254","scan_type":"ip","mode":"once","config":{"port_spec":"1-65535"}}' | jq -r '.task.id')
+  --data '{"target":"10.255.255.254","scan_type":"ip","mode":"once","config":{"port_spec":"1-65535"}}')
+immediate_task_id=$(jq -r '.task.id' <<< "$immediate_task_response")
+immediate_run_id=$(jq -r '.run.id' <<< "$immediate_task_response")
 test -n "$immediate_task_id"
+test -n "$immediate_run_id"
 for index in $(seq 1 24); do
   curl --fail --silent --request POST "$base_url/api/scan-tasks" \
     --header 'Content-Type: application/json' \
@@ -249,6 +252,61 @@ done
   --expected-ports 6 \
   --expected-validations 6 \
   --expected-findings 3)
+
+curl --fail --silent "$base_url/api/scan-tasks/$immediate_task_id/runs/$immediate_run_id" > immediate-run-status.json
+if jq -e '.status == "queued" or .status == "running" or .status == "cancel_requested"' immediate-run-status.json >/dev/null; then
+  curl --fail --silent --request POST "$base_url/api/scan-tasks/$immediate_task_id/runs/$immediate_run_id/cancel" > immediate-run-cancel.json
+fi
+for _ in $(seq 1 120); do
+  curl --fail --silent "$base_url/api/scan-tasks/$immediate_task_id/runs/$immediate_run_id" > immediate-run-status.json
+  if jq -e '.status != "queued" and .status != "running" and .status != "cancel_requested"' immediate-run-status.json >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+jq -e '.status != "queued" and .status != "running" and .status != "cancel_requested"' immediate-run-status.json >/dev/null
+
+full_task_response=$(curl --fail --silent --request POST "$base_url/api/scan-tasks" \
+  --header 'Content-Type: application/json' \
+  --data '{"target":"127.0.0.1","scan_type":"ip","mode":"scheduled","cron":"0 0 1 1 *","timezone":"UTC","config":{"port_spec":"1-65535"}}')
+full_task_id=$(jq -r '.task.id' <<< "$full_task_response")
+test -n "$full_task_id"
+curl --fail --silent "$base_url/api/scan-tasks/$full_task_id" > full-task.json
+jq -e '.config.port_spec == "1-65535"' full-task.json >/dev/null
+curl --fail --silent --request POST "$base_url/api/scan-tasks/$full_task_id/run-now" > full-run-start.json
+full_run_id=$(jq -r '.run.id' full-run-start.json)
+test -n "$full_run_id"
+for _ in $(seq 1 300); do
+  curl --fail --silent "$base_url/api/scan-tasks/$full_task_id/runs/$full_run_id" > full-run-status.json
+  if jq -e '.status == "success" and .stage == "completed" and .progress == 100' full-run-status.json >/dev/null; then
+    break
+  fi
+  if jq -e '.status == "failed" or .status == "canceled"' full-run-status.json >/dev/null; then
+    printf 'T357 full-port run reached an unexpected terminal state:\n' >&2
+    jq . full-run-status.json >&2
+    exit 1
+  fi
+  sleep 1
+done
+jq -e '.status == "success" and .stage == "completed" and .progress == 100 and .snapshot_written_at != ""' full-run-status.json >/dev/null
+
+full_run_path="$base_url/api/scan-tasks/$full_task_id/runs/$full_run_id"
+curl --fail --silent "$base_url/api/assets/127.0.0.1" > full-asset.json
+jq -e --argjson run_id "$full_run_id" 'any(.ports[]; .observation_run_id == $run_id)' full-asset.json >/dev/null
+curl --fail --silent "$full_run_path/findings?page=1&page_size=100" > full-findings.json
+jq -e '.validation.status == "disabled" and .total == 0' full-findings.json >/dev/null
+curl --fail --silent "$full_run_path/changes" > full-changes.json
+jq -e --argjson task_id "$full_task_id" --argjson run_id "$full_run_id" '
+  .scan_task_id == $task_id and
+  (.baseline_run_id // 0) == 0 and
+  .current_run_id == $run_id and
+  .config_changed == false
+' full-changes.json >/dev/null
+curl --fail --silent "$full_run_path/report" > full-user-report.md
+curl --fail --silent "$full_run_path/audit-report" > full-audit-report.md
+rg -q '^# yscan CAASM Scan Task Run Report$' full-user-report.md
+rg -q '^# yscan CAASM Scan Task Run Audit Report$' full-audit-report.md
+printf 'T357 explicit full-port run verified: task=%s run=%s status=success/completed/100%%\n' "$full_task_id" "$full_run_id"
 
 curl --fail --silent "$run_path/changes?baseline_run_id=$run1" > changes.json
 jq -e --argjson task_id "$task_id" --argjson run1 "$run1" --argjson run2 "$run2" '
