@@ -5,16 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	goruntime "runtime"
-	"syscall"
 )
 
 const (
-	filesystemNFS  = 0x6969
-	filesystemCIFS = 0xff534d42
-	filesystemSMB  = 0x517b
-	filesystem9P   = 0x01021997
-	filesystemFUSE = 0x65735546
 	defaultEnvFile = "# yscan configuration\nYSCAN_LISTEN_ADDR=127.0.0.1:8080\nYSCAN_MAX_CONCURRENCY=2\nYSCAN_SQLITE_BUSY_TIMEOUT=5s\nYSCAN_LOG_MAX_BYTES=10485760\nYSCAN_LOG_MAX_FILES=3\nYSCAN_NUCLEI_BINARY=nuclei\nYSCAN_NUCLEI_TEMPLATES=\nYSCAN_ALLOW_CIDRS=\n"
 )
 
@@ -37,7 +30,6 @@ type HomePaths struct {
 	LogsDir        string
 	RunLogsDir     string
 	RunDir         string
-	ExecutionsDir  string
 	ServerLock     string
 	DatabaseLock   string
 	UpgradeLock    string
@@ -83,7 +75,6 @@ func ResolveHome(executablePath, override string) (HomePaths, error) {
 		LogsDir:        filepath.Join(home, "logs"),
 		RunLogsDir:     filepath.Join(home, "logs", "runs"),
 		RunDir:         filepath.Join(home, "run"),
-		ExecutionsDir:  filepath.Join(home, "run", "executions"),
 		ServerLock:     filepath.Join(home, "run", "server.lock"),
 		DatabaseLock:   filepath.Join(home, "run", "database.lock"),
 		UpgradeLock:    filepath.Join(home, "run", "upgrade.lock"),
@@ -116,42 +107,12 @@ func (paths HomePaths) SelectDatabase() (DatabaseSelection, error) {
 }
 
 func (paths HomePaths) Prepare() error {
-	if err := ValidateLocalFilesystem(paths.Home); err != nil {
-		return err
-	}
-	for _, directory := range []string{paths.Home, paths.DataDir, paths.ReportsDir, paths.LogsDir, paths.RunLogsDir, paths.RunDir, paths.ExecutionsDir} {
+	for _, directory := range []string{paths.Home, paths.DataDir, paths.ReportsDir, paths.LogsDir, paths.RunLogsDir, paths.RunDir} {
 		if err := os.MkdirAll(directory, 0750); err != nil {
 			return fmt.Errorf("create yscan directory %s: %w", directory, err)
 		}
 	}
 	return createDefaultEnvAtomic(paths.EnvFile)
-}
-
-func ValidateLocalFilesystem(path string) error {
-	if goruntime.GOOS != "linux" {
-		return fmt.Errorf("yscan home requires Linux local filesystem, current OS is %s", goruntime.GOOS)
-	}
-	existing, err := nearestExistingPath(path)
-	if err != nil {
-		return err
-	}
-	var info syscall.Statfs_t
-	if err := syscall.Statfs(existing, &info); err != nil {
-		return fmt.Errorf("inspect filesystem for %s: %w", path, err)
-	}
-	if unsupportedFilesystem(info.Type) {
-		return fmt.Errorf("yscan home %s uses unsupported network or translated filesystem type 0x%x; use a Linux local filesystem such as ~/yscan", path, uint64(info.Type))
-	}
-	return nil
-}
-
-func unsupportedFilesystem(filesystemType int64) bool {
-	switch filesystemType {
-	case filesystemNFS, filesystemCIFS, filesystemSMB, filesystem9P, filesystemFUSE:
-		return true
-	default:
-		return false
-	}
 }
 
 func canonicalPath(path string) (string, error) {

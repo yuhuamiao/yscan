@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -70,7 +71,29 @@ func LoadConfig(paths HomePaths, overrides ConfigOverrides, lookupEnv func(strin
 		}
 		values[key] = strings.TrimSpace(value)
 	}
-	return parseConfigValues(values)
+	config, err := parseConfigValues(values)
+	if err != nil {
+		return Config{}, err
+	}
+	config.NucleiBinary = resolveNucleiBinary(paths.Home, config.NucleiBinary)
+	config.NucleiTemplates = resolveHomePath(paths.Home, config.NucleiTemplates)
+	return config, nil
+}
+
+func resolveNucleiBinary(home, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || filepath.IsAbs(value) || !strings.ContainsAny(value, `/\\`) {
+		return value
+	}
+	return filepath.Clean(filepath.Join(home, value))
+}
+
+func resolveHomePath(home, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || filepath.IsAbs(value) {
+		return value
+	}
+	return filepath.Clean(filepath.Join(home, value))
 }
 
 func readEnvFile(path string) (map[string]string, error) {

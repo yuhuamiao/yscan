@@ -54,7 +54,7 @@ func TestServerSessionUsesOSLockAcrossProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	inspection := InspectServer(paths)
-	if inspection.Status != ServerStarting || inspection.State == nil || inspection.State.MaxConcurrency != 3 {
+	if inspection.Status != ServerStarting || inspection.State == nil || inspection.State.MaxConcurrency != CurrentEffectiveConcurrency || inspection.State.ConfiguredMaxConcurrency != 3 {
 		t.Fatalf("inspection = %#v", inspection)
 	}
 	if _, err := AcquireServerSession(paths, "127.0.0.1:9090", 2); !errors.Is(err, ErrLockHeld) {
@@ -94,8 +94,12 @@ func TestServerSessionStateAndActiveConcurrency(t *testing.T) {
 		t.Fatalf("running inspection = %#v", inspection)
 	}
 	effective, changed, err := ActiveServerConcurrency(paths, 2)
-	if err != nil || effective != 4 || !changed {
+	if err != nil || effective != CurrentEffectiveConcurrency || !changed {
 		t.Fatalf("active concurrency = %d, %t, %v", effective, changed, err)
+	}
+	effective, changed, err = ActiveServerConcurrency(paths, 4)
+	if err != nil || effective != CurrentEffectiveConcurrency || changed {
+		t.Fatalf("matching configured concurrency = %d, %t, %v", effective, changed, err)
 	}
 	if err := session.MarkDegraded("scheduler stopped"); err != nil {
 		t.Fatal(err)
@@ -156,7 +160,7 @@ func TestPrepareAndDatabaseSelection(t *testing.T) {
 	if err := paths.Prepare(); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{paths.EnvFile, paths.DataDir, paths.ReportsDir, paths.RunLogsDir, paths.ExecutionsDir} {
+	for _, path := range []string{paths.EnvFile, paths.DataDir, paths.ReportsDir, paths.RunLogsDir, paths.RunDir} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("missing prepared path %s: %v", path, err)
 		}
@@ -259,13 +263,41 @@ func TestLoadConfigReportsUnknownAndDuplicateKeys(t *testing.T) {
 	}
 }
 
-func TestUnsupportedFilesystemTypes(t *testing.T) {
-	for _, filesystemType := range []int64{filesystemNFS, filesystemCIFS, filesystemSMB, filesystem9P, filesystemFUSE} {
-		if !unsupportedFilesystem(filesystemType) {
-			t.Fatalf("filesystem type 0x%x was accepted", filesystemType)
-		}
+func TestLoadConfigResolvesRelativeNucleiPathsFromHome(t *testing.T) {
+	home := t.TempDir()
+	other := t.TempDir()
+	paths, err := ResolveHome(filepath.Join(home, "yscan"), home)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if unsupportedFilesystem(0xef53) {
-		t.Fatal("local ext filesystem was rejected")
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(other); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+
+	config, err := LoadConfig(paths, ConfigOverrides{
+		ConfigNucleiBinary:    "tools/nuclei",
+		ConfigNucleiTemplates: "nuclei-templates",
+	}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.NucleiBinary != filepath.Join(home, "tools", "nuclei") {
+		t.Fatalf("binary = %q", config.NucleiBinary)
+	}
+	if config.NucleiTemplates != filepath.Join(home, "nuclei-templates") {
+		t.Fatalf("templates = %q", config.NucleiTemplates)
+	}
+
+	config, err = LoadConfig(paths, nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.NucleiBinary != "nuclei" {
+		t.Fatalf("PATH binary = %q", config.NucleiBinary)
 	}
 }
