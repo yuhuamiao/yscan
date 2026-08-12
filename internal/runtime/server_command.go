@@ -412,11 +412,11 @@ func writeLastLines(output io.Writer, path string, lines int) (int64, error) {
 }
 
 func UninstallSystemd(paths HomePaths, deleteHome bool) error {
-	if err := StopServer(paths, defaultStopTimeout, false); err != nil {
-		return err
-	}
 	if os.Geteuid() != 0 {
 		return errors.New("systemd uninstall requires root")
+	}
+	if err := StopServer(paths, defaultStopTimeout, false); err != nil {
+		return err
 	}
 	_ = exec.Command("systemctl", "disable", "--now", "yscan.service").Run()
 	if err := os.Remove("/etc/systemd/system/yscan.service"); err != nil && !errors.Is(err, os.ErrNotExist) {
