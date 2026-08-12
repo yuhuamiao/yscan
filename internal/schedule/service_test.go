@@ -31,6 +31,32 @@ func TestTaskServiceCreatesExactlyOneRunForOneTimeTask(t *testing.T) {
 	}
 }
 
+func TestTaskServiceAppliesServerNucleiTemplateDefault(t *testing.T) {
+	db := openRunnerTestDB(t)
+	service := NewTaskService(db, nil).WithDefaultNucleiTemplates("/opt/yscan/templates")
+	created, _, err := service.Create(context.Background(), model.ScanTask{
+		Target: "127.0.0.1", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeOnce,
+		Config: model.ScanTaskConfig{VulnerabilityOn: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Config.NucleiTemplates != "/opt/yscan/templates" {
+		t.Fatalf("templates = %q", created.Config.NucleiTemplates)
+	}
+
+	explicit, _, err := service.Create(context.Background(), model.ScanTask{
+		Target: "127.0.0.1", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeOnce,
+		Config: model.ScanTaskConfig{VulnerabilityOn: true, NucleiTemplates: "/custom/templates"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicit.Config.NucleiTemplates != "/custom/templates" {
+		t.Fatalf("explicit templates = %q", explicit.Config.NucleiTemplates)
+	}
+}
+
 func TestTaskServiceCreatesScheduledTaskWithoutInitialRun(t *testing.T) {
 	db := openRunnerTestDB(t)
 	service := NewTaskService(db, ClockFunc(func() time.Time { return time.Date(2026, time.July, 24, 2, 0, 0, 0, time.UTC) }))

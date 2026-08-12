@@ -18,8 +18,14 @@ import (
 // One-time tasks receive one queued run at creation; scheduled tasks wait for
 // Runner to materialize each cron occurrence.
 type TaskService struct {
-	DB    *sql.DB
-	Clock Clock
+	DB                     *sql.DB
+	Clock                  Clock
+	DefaultNucleiTemplates string
+}
+
+func (service *TaskService) WithDefaultNucleiTemplates(path string) *TaskService {
+	service.DefaultNucleiTemplates = strings.TrimSpace(path)
+	return service
 }
 
 func NewTaskService(db *sql.DB, clock Clock) *TaskService {
@@ -44,6 +50,7 @@ func (service *TaskService) Create(ctx context.Context, task model.ScanTask) (mo
 		return model.ScanTask{}, nil, err
 	}
 	task.Target = normalizedTarget
+	service.applyConfigDefaults(&task.Config)
 	ports, err := scan.ParsePortSpec(task.Config.PortSpec)
 	if err != nil {
 		return model.ScanTask{}, nil, fmt.Errorf("invalid port_spec: %w", err)
@@ -97,6 +104,7 @@ func (service *TaskService) Update(ctx context.Context, task model.ScanTask) (mo
 		return model.ScanTask{}, err
 	}
 	task.Target = normalizedTarget
+	service.applyConfigDefaults(&task.Config)
 	ports, err := scan.ParsePortSpec(task.Config.PortSpec)
 	if err != nil {
 		return model.ScanTask{}, fmt.Errorf("invalid port_spec: %w", err)
@@ -110,6 +118,12 @@ func (service *TaskService) Update(ctx context.Context, task model.ScanTask) (mo
 		}
 	}
 	return storage.UpdateScanTask(service.DB, task)
+}
+
+func (service *TaskService) applyConfigDefaults(config *model.ScanTaskConfig) {
+	if config != nil && config.VulnerabilityOn && strings.TrimSpace(config.NucleiTemplates) == "" {
+		config.NucleiTemplates = service.DefaultNucleiTemplates
+	}
 }
 
 // RunNow materializes an explicitly requested occurrence. The boolean tells

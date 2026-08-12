@@ -37,7 +37,13 @@ type ScanTaskRunOperator interface {
 
 type ScanTaskRunStarter func(context.Context, model.ScanTaskRun)
 
-type AccessPolicy struct{ TrustedCIDRs []string }
+type AccessPolicy struct {
+	TrustedCIDRs       []string
+	LocalHealthAddress string
+	LocalHealthToken   string
+}
+
+const LocalHealthTokenHeader = "X-Yscan-Local-Health-Token"
 
 type createScanTaskRequest struct {
 	Target   string               `json:"target"`
@@ -87,6 +93,23 @@ func StartServerWithScanTasksAndAccessPolicyContextReady(ctx context.Context, db
 }
 
 func StartServerWithScanTasksAndAccessPolicyLifecycle(ctx context.Context, db *sql.DB, addr string, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter, policy AccessPolicy, ready, requestsDrained func() error) error {
+	if err := policy.Validate(addr); err != nil {
+		return err
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return StartServerWithScanTasksAndAccessPolicyListener(ctx, db, listener, runTask, creator, startRun, policy, ready, requestsDrained)
+}
+
+// StartServerWithScanTasksAndAccessPolicyListener serves on a listener acquired
+// before database initialization. The caller owns startup ordering; this
+// function owns and closes the listener once called.
+func StartServerWithScanTasksAndAccessPolicyListener(ctx context.Context, db *sql.DB, listener net.Listener, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter, policy AccessPolicy, ready, requestsDrained func() error) error {
+	if listener == nil {
+		return errors.New("API listener is required")
+	}
 	var activeRuns sync.WaitGroup
 	workerContext, stopWorkers := context.WithCancel(context.Background())
 	defer stopWorkers()
@@ -94,13 +117,8 @@ func StartServerWithScanTasksAndAccessPolicyLifecycle(ctx context.Context, db *s
 	if err != nil {
 		return err
 	}
-	if err := policy.Validate(addr); err != nil {
-		return err
-	}
-
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
+	if host, _, splitErr := net.SplitHostPort(listener.Addr().String()); splitErr == nil {
+		policy.LocalHealthAddress = host
 	}
 	if ready != nil {
 		if err := ready(); err != nil {
@@ -108,40 +126,41 @@ func StartServerWithScanTasksAndAccessPolicyLifecycle(ctx context.Context, db *s
 			return err
 		}
 	}
-	server := &http.Server{Addr: addr, Handler: policy.Wrap(handler), ReadHeaderTimeout: 10 * time.Second}
+	server := &http.Server{Addr: listener.Addr().String(), Handler: policy.Wrap(handler), ReadHeaderTimeout: 10 * time.Second}
+	return serveServerWithLifecycle(ctx, server, listener, stopWorkers, &activeRuns, requestsDrained)
+}
+
+func serveServerWithLifecycle(ctx context.Context, server *http.Server, listener net.Listener, stopWorkers context.CancelFunc, activeRuns *sync.WaitGroup, requestsDrained func() error) error {
 	listenResult := make(chan error, 1)
 	go func() { listenResult <- server.Serve(listener) }()
-	log.Printf("API server listening on %s", addr)
+	log.Printf("API server listening on %s", listener.Addr())
+	var serveErr error
+	serveReturned := false
 	select {
-	case err := <-listenResult:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return err
+	case serveErr = <-listenResult:
+		serveReturned = true
 	case <-ctx.Done():
-		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownContext); err != nil {
-			return fmt.Errorf("graceful API shutdown: %w", err)
-		}
-		if requestsDrained != nil {
-			if err := requestsDrained(); err != nil {
-				return fmt.Errorf("after API request drain: %w", err)
-			}
-		}
-		stopWorkers()
-		runsStopped := make(chan struct{})
-		go func() { activeRuns.Wait(); close(runsStopped) }()
-		select {
-		case <-runsStopped:
-		case <-shutdownContext.Done():
-			return errors.New("graceful API shutdown timed out waiting for active scans")
-		}
-		if err := <-listenResult; err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
-		return nil
 	}
+	shutdownErr := server.Shutdown(context.Background())
+	if shutdownErr != nil {
+		serveErr = errors.Join(serveErr, fmt.Errorf("graceful API shutdown: %w", shutdownErr))
+	}
+	if !serveReturned {
+		serveErr = errors.Join(serveErr, <-listenResult)
+	}
+
+	var drainErr error
+	if requestsDrained != nil {
+		if err := requestsDrained(); err != nil {
+			drainErr = fmt.Errorf("after API request drain: %w", err)
+		}
+	}
+	stopWorkers()
+	activeRuns.Wait()
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		serveErr = nil
+	}
+	return errors.Join(serveErr, drainErr)
 }
 
 func (policy AccessPolicy) Validate(addr string) error {
@@ -179,6 +198,10 @@ func (policy AccessPolicy) Wrap(next http.Handler) http.Handler {
 		host, _, _ := net.SplitHostPort(r.RemoteAddr)
 		ip := net.ParseIP(host)
 		allowed := ip != nil && ip.IsLoopback()
+		if !allowed && r.Method == http.MethodGet && r.URL.Path == "/api/healthz" && policy.LocalHealthToken != "" && r.Header.Get(LocalHealthTokenHeader) == policy.LocalHealthToken {
+			healthIP := net.ParseIP(strings.TrimSpace(policy.LocalHealthAddress))
+			allowed = healthIP != nil && ip.Equal(healthIP)
+		}
 		for _, network := range networks {
 			if network.Contains(ip) {
 				allowed = true

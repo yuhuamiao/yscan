@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -49,6 +52,44 @@ func TestTopLevelVersionDoesNotInitializeHome(t *testing.T) {
 	}
 }
 
+func TestRejectUnmigratedWorkingDirectoryDatabase(t *testing.T) {
+	home := t.TempDir()
+	workingDirectory := t.TempDir()
+	paths, err := appRuntime.ResolveHome(os.Args[0], home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workingDirectory, "asm.db"), []byte("legacy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(workingDirectory); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+	err = rejectUnmigratedWorkingDirectoryDatabase(paths)
+	if err == nil || !strings.Contains(err.Error(), "upgrade --from-home") || !strings.Contains(err.Error(), workingDirectory) {
+		t.Fatalf("legacy cwd diagnostic = %v", err)
+	}
+}
+
+func TestParseUpgradeSourceHome(t *testing.T) {
+	if source, err := parseUpgradeSourceHome([]string{"--from-home", "/var/lib/yscan"}); err != nil || source != "/var/lib/yscan" {
+		t.Fatalf("source = %q, %v", source, err)
+	}
+	for _, args := range [][]string{{"--from-home"}, {"--from-home", ""}, {"--unknown", "x"}, {"--from-home", "a", "extra"}} {
+		if _, err := parseUpgradeSourceHome(args); err == nil {
+			t.Fatalf("invalid upgrade arguments accepted: %v", args)
+		}
+	}
+}
+
 func TestNormalizeServerCommandKeepsOneServiceEntry(t *testing.T) {
 	server, deprecated := normalizeServerCommand([]string{"server", "127.0.0.1:8080"})
 	if deprecated || strings.Join(server, " ") != "server 127.0.0.1:8080" {
@@ -60,11 +101,49 @@ func TestNormalizeServerCommandKeepsOneServiceEntry(t *testing.T) {
 	}
 }
 
+func TestPrepareServerStartupFailsBeforeDatabaseWork(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	config := appRuntime.Config{ListenAddress: listener.Addr().String()}
+	if _, err := prepareServerStartup([]string{"server"}, config); err == nil {
+		t.Fatal("occupied listener was accepted")
+	}
+}
+
+func TestOccupiedServerPortDoesNotInitializeDatabase(t *testing.T) {
+	home := t.TempDir()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	err = runMainArgs([]string{"--home", home, "--listen", listener.Addr().String(), "server"})
+	if err == nil {
+		t.Fatal("occupied listener was accepted")
+	}
+	paths, err := appRuntime.ResolveHome(os.Args[0], home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.Database); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("database changed before listen succeeded: %v", err)
+	}
+	if _, err := os.Stat(paths.ServerState); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("server state changed before listen succeeded: %v", err)
+	}
+}
+
 func TestParseCLIConfigCapturesRuntimeOverrides(t *testing.T) {
-	args, config := parseCLIConfig([]string{
+	args, config, err := parseCLIConfig([]string{
 		"--listen", "127.0.0.1:9090", "--trusted-cidrs=192.168.1.0/24", "--max-concurrency", "4",
 		"--sqlite-busy-timeout=7s", "--log-max-bytes", "2048", "--log-max-files=5", "--nuclei-binary", "/opt/nuclei", "server",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if strings.Join(args, " ") != "server" {
 		t.Fatalf("filtered arguments = %v", args)
 	}
@@ -77,6 +156,219 @@ func TestParseCLIConfigCapturesRuntimeOverrides(t *testing.T) {
 		if config.Runtime[key] != value {
 			t.Fatalf("runtime override %s = %q, want %q", key, config.Runtime[key], value)
 		}
+	}
+}
+
+func TestParseCLIConfigRejectsMissingValues(t *testing.T) {
+	flags := []string{"--templates", "--dns-mode", "--dns-deny-cidr", "--home", "--listen", "--trusted-cidrs", "--max-concurrency", "--sqlite-busy-timeout", "--log-max-bytes", "--log-max-files", "--nuclei-binary"}
+	for _, flag := range flags {
+		t.Run(flag, func(t *testing.T) {
+			if _, _, err := parseCLIConfig([]string{flag}); err == nil || !strings.Contains(err.Error(), "requires a value") {
+				t.Fatalf("missing %s value error = %v", flag, err)
+			}
+			if _, _, err := parseCLIConfig([]string{flag + "="}); err == nil || !strings.Contains(err.Error(), "requires a value") {
+				t.Fatalf("empty %s value error = %v", flag, err)
+			}
+		})
+	}
+}
+
+func TestEffectiveBackgroundArgumentsPreserveResolvedConfiguration(t *testing.T) {
+	config := appRuntime.Config{ListenAddress: "127.0.0.1:39091", AllowCIDRs: []string{"10.0.0.0/8"}, MaxConcurrency: 4, SQLiteBusyTimeout: 7 * time.Second, LogMaxBytes: 2048, LogMaxFiles: 5, NucleiBinary: "/opt/nuclei", NucleiTemplates: "/opt/templates"}
+	arguments := effectiveBackgroundArguments(config, cliConfig{DNSResolveMode: "internal", DNSDenyCIDRs: []string{"192.168.0.0/16"}})
+	_, parsed, err := parseCLIConfig(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Templates != "" {
+		parsed.Runtime[appRuntime.ConfigNucleiTemplates] = parsed.Templates
+	}
+	resolved, err := appRuntime.LoadConfig(appRuntime.HomePaths{EnvFile: filepath.Join(t.TempDir(), "missing.env")}, parsed.Runtime, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ListenAddress != config.ListenAddress || resolved.MaxConcurrency != config.MaxConcurrency || resolved.SQLiteBusyTimeout != config.SQLiteBusyTimeout || resolved.NucleiBinary != config.NucleiBinary || resolved.NucleiTemplates != config.NucleiTemplates || strings.Join(resolved.AllowCIDRs, ",") != strings.Join(config.AllowCIDRs, ",") {
+		t.Fatalf("background configuration = %#v, want %#v", resolved, config)
+	}
+}
+
+func TestBackgroundServerPreservesEffectiveConfigurationAndDynamicStatus(t *testing.T) {
+	home := t.TempDir()
+	binary := filepath.Join(home, "yscan")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build test binary: %v\n%s", err, output)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	_ = listener.Close()
+	templates := filepath.Join(home, "templates")
+	if err := os.MkdirAll(templates, 0750); err != nil {
+		t.Fatal(err)
+	}
+	start := exec.Command(binary,
+		"--home", home, "--listen", address, "--max-concurrency", "4",
+		"--sqlite-busy-timeout", "7s", "--log-max-bytes", "2048", "--log-max-files", "2",
+		"--nuclei-binary", "/bin/false", "--templates", templates, "server", "start")
+	start.Dir = home
+	if output, err := start.CombinedOutput(); err != nil {
+		t.Fatalf("start background Server: %v\n%s", err, output)
+	}
+	paths, err := appRuntime.ResolveHome(binary, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		stop := exec.Command(binary, "--home", home, "server", "stop", "--force")
+		stop.Dir = home
+		_ = stop.Run()
+	})
+	inspection := appRuntime.InspectServerHealth(paths)
+	if inspection.Status != appRuntime.ServerRunning || inspection.State == nil || inspection.State.ListenAddress != address {
+		t.Fatalf("background inspection = %#v", inspection)
+	}
+	commandLine, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", inspection.State.PID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.ReplaceAll(strings.TrimRight(string(commandLine), "\x00"), "\x00", " ")
+	for _, expected := range []string{"--listen " + address, "--max-concurrency 4", "--sqlite-busy-timeout 7s", "--log-max-bytes 2048", "--log-max-files 2", "--nuclei-binary /bin/false", "--templates " + templates} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("child command line %q does not contain %q", joined, expected)
+		}
+	}
+	status := exec.Command(binary, "--home", home, "server", "status")
+	status.Dir = home
+	output, err := status.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "Server: running") || !strings.Contains(string(output), "Listen: "+address) {
+		t.Fatalf("dynamic status: %v\n%s", err, output)
+	}
+	stop := exec.Command(binary, "--home", home, "server", "stop")
+	stop.Dir = home
+	if output, err := stop.CombinedOutput(); err != nil {
+		t.Fatalf("stop Server: %v\n%s", err, output)
+	}
+	status = exec.Command(binary, "--home", home, "server", "status")
+	status.Dir = home
+	if err := status.Run(); err == nil {
+		t.Fatal("stopped Server status returned success")
+	}
+	listener, err = net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	envAddress := listener.Addr().String()
+	_ = listener.Close()
+	envContent := fmt.Sprintf("YSCAN_LISTEN_ADDR=%s\nYSCAN_MAX_CONCURRENCY=3\nYSCAN_SQLITE_BUSY_TIMEOUT=5s\nYSCAN_LOG_MAX_BYTES=4096\nYSCAN_LOG_MAX_FILES=2\nYSCAN_NUCLEI_BINARY=/bin/false\nYSCAN_NUCLEI_TEMPLATES=\nYSCAN_ALLOW_CIDRS=\n", envAddress)
+	if err := os.WriteFile(paths.EnvFile, []byte(envContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+	start = exec.Command(binary, "--home", home, "server", "start")
+	start.Dir = home
+	if output, err := start.CombinedOutput(); err != nil {
+		t.Fatalf("start from .env: %v\n%s", err, output)
+	}
+	inspection = appRuntime.InspectServerHealth(paths)
+	if inspection.Status != appRuntime.ServerRunning || inspection.State == nil || inspection.State.ListenAddress != envAddress {
+		t.Fatalf(".env background inspection = %#v", inspection)
+	}
+	if err := os.WriteFile(paths.EnvFile, []byte("YSCAN_UNKNOWN_SETTING=broken\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	restart := exec.Command(binary, "--home", home, "server", "restart")
+	restart.Dir = home
+	if output, err := restart.CombinedOutput(); err == nil || !strings.Contains(string(output), "unknown configuration key") {
+		t.Fatalf("restart with invalid configuration: %v\n%s", err, output)
+	}
+	if inspection = appRuntime.InspectServerHealth(paths); inspection.Status != appRuntime.ServerRunning {
+		t.Fatalf("invalid restart stopped the existing Server: %#v", inspection)
+	}
+	status = exec.Command(binary, "--home", home, "server", "status")
+	status.Dir = home
+	if output, err := status.CombinedOutput(); err != nil || !strings.Contains(string(output), "Server: running") {
+		t.Fatalf("status with invalid .env: %v\n%s", err, output)
+	}
+	logs := exec.Command(binary, "--home", home, "server", "logs", "--lines", "1", "--no-follow")
+	logs.Dir = home
+	if output, err := logs.CombinedOutput(); err != nil {
+		t.Fatalf("logs with invalid .env: %v\n%s", err, output)
+	}
+	stop = exec.Command(binary, "--home", home, "server", "stop")
+	stop.Dir = home
+	if output, err := stop.CombinedOutput(); err != nil {
+		t.Fatalf("stop .env Server: %v\n%s", err, output)
+	}
+	if nonLoopbackIP := testNonLoopbackIPv4(t); nonLoopbackIP != "" {
+		listener, err = net.Listen("tcp", net.JoinHostPort(nonLoopbackIP, "0"))
+		if err != nil {
+			t.Fatalf("reserve non-loopback listener: %v", err)
+		}
+		nonLoopbackAddress := listener.Addr().String()
+		_ = listener.Close()
+		if err := os.WriteFile(paths.EnvFile, []byte(""), 0600); err != nil {
+			t.Fatal(err)
+		}
+		start = exec.Command(binary, "--home", home, "--listen", nonLoopbackAddress, "--trusted-cidrs", "192.0.2.0/24", "server", "start")
+		start.Dir = home
+		if output, err := start.CombinedOutput(); err != nil {
+			t.Fatalf("start non-loopback Server: %v\n%s", err, output)
+		}
+		inspection = appRuntime.InspectServerHealth(paths)
+		if inspection.Status != appRuntime.ServerRunning || inspection.State == nil || inspection.State.ListenAddress != nonLoopbackAddress {
+			t.Fatalf("non-loopback health inspection = %#v", inspection)
+		}
+		client := &http.Client{Timeout: time.Second, Transport: &http.Transport{Proxy: nil}}
+		response, err := client.Get("http://" + nonLoopbackAddress + "/api/healthz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusForbidden {
+			t.Fatalf("untrusted non-loopback health response = %d", response.StatusCode)
+		}
+		stop = exec.Command(binary, "--home", home, "server", "stop")
+		stop.Dir = home
+		if output, err := stop.CombinedOutput(); err != nil {
+			t.Fatalf("stop non-loopback Server: %v\n%s", err, output)
+		}
+	}
+	unit, err := os.ReadFile("deploy/yscan.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(unit), "127.0.0.1:8080") || strings.Contains(string(unit), "curl") || !strings.Contains(string(unit), "server status") {
+		t.Fatalf("systemd health command is not dynamic:\n%s", unit)
+	}
+}
+
+func testNonLoopbackIPv4(t *testing.T) string {
+	t.Helper()
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, address := range addresses {
+		ip, _, err := net.ParseCIDR(address.String())
+		if err == nil && ip.To4() != nil && !ip.IsLoopback() && !ip.IsUnspecified() {
+			return ip.String()
+		}
+	}
+	t.Log("no non-loopback IPv4 address is available; process-level health test skipped")
+	return ""
+}
+
+func TestServerUninstallRejectsDeleteHomeOption(t *testing.T) {
+	paths, err := appRuntime.ResolveHome(os.Args[0], t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handled, err := handleServerControlCommand(paths, []string{"uninstall", "--delete-home"})
+	if !handled || err == nil || !strings.Contains(err.Error(), "usage: yscan server uninstall") {
+		t.Fatalf("delete-home result handled=%t error=%v", handled, err)
 	}
 }
 
@@ -117,6 +409,43 @@ func TestServerServiceLogRotationAndTail(t *testing.T) {
 	}
 	if output.String() != "two\nthree\n" {
 		t.Fatalf("tail = %q", output.String())
+	}
+}
+
+func TestServerLogFollowDrainsRotatedInodeBeforeSwitching(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "yscan.log")
+	if err := os.WriteFile(path, []byte("initial\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var output strings.Builder
+	result := make(chan error, 1)
+	go func() { result <- appRuntime.PrintServerLogs(ctx, &output, path, 0, true) }()
+	time.Sleep(300 * time.Millisecond)
+	old, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.WriteString("old-inode-tail\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("new-inode-head\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(750 * time.Millisecond)
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "old-inode-tail") || !strings.Contains(output.String(), "new-inode-head") {
+		t.Fatalf("follow output lost rotated content: %q", output.String())
 	}
 }
 

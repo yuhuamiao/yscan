@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -133,7 +132,7 @@ func (writer *RotatingLogWriter) rotate() error {
 	return writer.open()
 }
 
-func StartBackgroundServer(paths HomePaths, serverArguments []string, timeout time.Duration) error {
+func StartBackgroundServer(paths HomePaths, effectiveArguments, serverArguments []string, timeout time.Duration) error {
 	if inspection := InspectServer(paths); inspection.Status != ServerStopped {
 		return fmt.Errorf("yscan Server is %s", inspection.Status)
 	}
@@ -158,7 +157,8 @@ func StartBackgroundServer(paths HomePaths, serverArguments []string, timeout ti
 	}
 	defer nullInput.Close()
 
-	arguments := []string{"--home", paths.Home, "server", "--background-child"}
+	arguments := append([]string(nil), effectiveArguments...)
+	arguments = append(arguments, "--home", paths.Home, "server", "--background-child")
 	arguments = append(arguments, serverArguments...)
 	command := exec.Command(paths.Executable, arguments...)
 	command.Stdin = nullInput
@@ -166,7 +166,7 @@ func StartBackgroundServer(paths HomePaths, serverArguments []string, timeout ti
 	command.Stderr = logFile
 	command.ExtraFiles = []*os.File{writer}
 	command.Env = append(os.Environ(), backgroundReadyFDEnvironment+"=3")
-	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	configureDetachedProcess(command)
 	if err := command.Start(); err != nil {
 		_ = writer.Close()
 		return err
@@ -198,7 +198,7 @@ func StartBackgroundServer(paths HomePaths, serverArguments []string, timeout ti
 		}
 		return fmt.Errorf("background Server failed before readiness: %w", err)
 	case <-time.After(timeout):
-		_ = command.Process.Signal(syscall.SIGTERM)
+		_ = signalGraceful(command.Process)
 		return errors.New("background Server readiness timed out")
 	}
 }
@@ -234,7 +234,7 @@ func StopServer(paths HomePaths, timeout time.Duration, force bool) error {
 		return fmt.Errorf("cannot stop Server in %s state: %s", inspection.Status, inspection.Error)
 	}
 	confirmed := InspectServer(paths)
-	if confirmed.State == nil || confirmed.State.InstanceID != inspection.State.InstanceID || confirmed.State.PID != inspection.State.PID {
+	if confirmed.State == nil || confirmed.State.HealthToken != inspection.State.HealthToken || confirmed.State.PID != inspection.State.PID {
 		return errors.New("Server identity changed while preparing to stop; retry the command")
 	}
 	if err := verifyControlledServerProcess(paths, inspection.State.PID); err != nil {
@@ -244,7 +244,7 @@ func StopServer(paths HomePaths, timeout time.Duration, force bool) error {
 	if err != nil {
 		return err
 	}
-	if err := process.Signal(syscall.SIGTERM); err != nil {
+	if err := signalGraceful(process); err != nil {
 		return fmt.Errorf("signal Server process %d: %w", inspection.State.PID, err)
 	}
 	if timeout <= 0 {
@@ -260,7 +260,7 @@ func StopServer(paths HomePaths, timeout time.Duration, force bool) error {
 	if !force {
 		return errors.New("Server did not stop within the graceful timeout; use --force to terminate it")
 	}
-	if err := process.Signal(syscall.SIGKILL); err != nil {
+	if err := signalForce(process); err != nil {
 		return fmt.Errorf("force Server stop: %w", err)
 	}
 	return nil
@@ -280,8 +280,18 @@ func InspectServerHealth(paths HomePaths) ServerInspection {
 	if host == "" || net.ParseIP(host).IsUnspecified() {
 		host = "127.0.0.1"
 	}
-	client := &http.Client{Timeout: time.Second}
-	response, err := client.Get("http://" + net.JoinHostPort(host, port) + "/api/healthz")
+	client := &http.Client{
+		Timeout:   time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	request, err := http.NewRequest(http.MethodGet, "http://"+net.JoinHostPort(host, port)+"/api/healthz", nil)
+	if err != nil {
+		inspection.Status = ServerDegraded
+		inspection.Error = err.Error()
+		return inspection
+	}
+	request.Header.Set("X-Yscan-Local-Health-Token", inspection.State.HealthToken)
+	response, err := client.Do(request)
 	if err != nil {
 		inspection.Status = ServerDegraded
 		inspection.Error = err.Error()
@@ -295,39 +305,6 @@ func InspectServerHealth(paths HomePaths) ServerInspection {
 	return inspection
 }
 
-func verifyControlledServerProcess(paths HomePaths, pid int) error {
-	commandLine, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-	if err != nil {
-		return fmt.Errorf("verify Server process %d: %w", pid, err)
-	}
-	arguments := strings.Split(strings.TrimRight(string(commandLine), "\x00"), "\x00")
-	if len(arguments) == 0 {
-		return fmt.Errorf("Server process %d has no command line", pid)
-	}
-	executableInfo, err := os.Stat(paths.Executable)
-	if err != nil {
-		return fmt.Errorf("inspect yscan executable: %w", err)
-	}
-	processExecutableInfo, err := os.Stat(fmt.Sprintf("/proc/%d/exe", pid))
-	if err != nil {
-		return fmt.Errorf("inspect Server executable: %w", err)
-	}
-	if !os.SameFile(executableInfo, processExecutableInfo) {
-		return fmt.Errorf("refusing to signal PID %d because it is not this yscan executable", pid)
-	}
-	serverArgument := false
-	for _, argument := range arguments[1:] {
-		if argument == "server" {
-			serverArgument = true
-			break
-		}
-	}
-	if !serverArgument {
-		return fmt.Errorf("refusing to signal PID %d because it is not a yscan Server command", pid)
-	}
-	return nil
-}
-
 func PrintServerLogs(ctx context.Context, output io.Writer, path string, lines int, follow bool) error {
 	if lines < 0 {
 		return errors.New("log line count cannot be negative")
@@ -339,6 +316,18 @@ func PrintServerLogs(ctx context.Context, output io.Writer, path string, lines i
 	if !follow {
 		return nil
 	}
+	current, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = current.Close() }()
+	if _, err := current.Seek(position, io.SeekStart); err != nil {
+		return err
+	}
+	currentInfo, err := current.Stat()
+	if err != nil {
+		return err
+	}
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -346,6 +335,9 @@ func PrintServerLogs(ctx context.Context, output io.Writer, path string, lines i
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			if _, err := io.Copy(output, current); err != nil {
+				return err
+			}
 			info, err := os.Stat(path)
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -353,23 +345,23 @@ func PrintServerLogs(ctx context.Context, output io.Writer, path string, lines i
 			if err != nil {
 				return err
 			}
-			if info.Size() < position {
-				position = 0
-			}
-			if info.Size() == position {
+			if os.SameFile(currentInfo, info) {
 				continue
+			}
+			if _, err := io.Copy(output, current); err != nil {
+				return err
 			}
 			file, err := os.Open(path)
 			if err != nil {
 				continue
 			}
-			_, _ = file.Seek(position, io.SeekStart)
-			written, copyErr := io.Copy(output, file)
-			_ = file.Close()
-			if copyErr != nil {
-				return copyErr
+			newInfo, err := file.Stat()
+			if err != nil {
+				_ = file.Close()
+				return err
 			}
-			position += written
+			_ = current.Close()
+			current, currentInfo = file, newInfo
 		}
 	}
 }
@@ -411,22 +403,38 @@ func writeLastLines(output io.Writer, path string, lines int) (int64, error) {
 	return info.Size(), nil
 }
 
-func UninstallSystemd(paths HomePaths, deleteHome bool) error {
-	if os.Geteuid() != 0 {
-		return errors.New("systemd uninstall requires root")
-	}
+func UninstallSystemd(paths HomePaths) error {
 	if err := StopServer(paths, defaultStopTimeout, false); err != nil {
 		return err
 	}
-	_ = exec.Command("systemctl", "disable", "--now", "yscan.service").Run()
-	if err := os.Remove("/etc/systemd/system/yscan.service"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	return uninstallSystemdUnit()
+}
+
+// CaptureProcessOutput routes Go-level stdout and stderr through the same
+// rotating writer as log.Printf. It is used only by the detached Server child.
+func CaptureProcessOutput(output io.Writer) (func() error, error) {
+	if output == nil {
+		return nil, errors.New("process log output is required")
 	}
-	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
-		return err
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return nil, err
 	}
-	if deleteHome {
-		return os.RemoveAll(paths.Home)
-	}
-	return nil
+	previousStdout, previousStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = writer, writer
+	result := make(chan error, 1)
+	go func() {
+		_, copyErr := io.Copy(output, reader)
+		result <- copyErr
+	}()
+	var once sync.Once
+	var closeErr error
+	return func() error {
+		once.Do(func() {
+			os.Stdout, os.Stderr = previousStdout, previousStderr
+			closeErr = writer.Close()
+			closeErr = errors.Join(closeErr, <-result, reader.Close())
+		})
+		return closeErr
+	}, nil
 }

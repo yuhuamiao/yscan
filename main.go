@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"golandproject/yscan/internal/api"
@@ -445,10 +444,10 @@ func hasFlag(args []string, flag string) bool {
 	return false
 }
 
-func parseCLIConfig(args []string) ([]string, cliConfig) {
+func parseCLIConfig(args []string) ([]string, cliConfig, error) {
 	cfg := cliConfig{DNSResolveMode: domain.DNSModeHybrid, Runtime: appRuntime.ConfigOverrides{}}
 	if len(args) == 0 {
-		return args, cfg
+		return args, cfg, nil
 	}
 
 	filtered := make([]string, 0, len(args))
@@ -456,75 +455,155 @@ func parseCLIConfig(args []string) ([]string, cliConfig) {
 		current := strings.TrimSpace(args[i])
 		switch {
 		case current == "--templates":
-			if i+1 < len(args) {
-				cfg.Templates = strings.TrimSpace(args[i+1])
-				i++
+			value, next, err := requiredFlagValue(args, i, current)
+			if err != nil {
+				return nil, cfg, err
 			}
+			cfg.Templates, i = value, next
 		case strings.HasPrefix(current, "--templates="):
 			cfg.Templates = strings.TrimSpace(strings.TrimPrefix(current, "--templates="))
-		case current == "--dns-mode":
-			if i+1 < len(args) {
-				cfg.DNSResolveMode = strings.TrimSpace(strings.ToLower(args[i+1]))
-				i++
+			if cfg.Templates == "" {
+				return nil, cfg, errors.New("--templates requires a value")
 			}
+		case current == "--dns-mode":
+			value, next, err := requiredFlagValue(args, i, current)
+			if err != nil {
+				return nil, cfg, err
+			}
+			cfg.DNSResolveMode, i = strings.ToLower(value), next
 		case strings.HasPrefix(current, "--dns-mode="):
 			cfg.DNSResolveMode = strings.TrimSpace(strings.ToLower(strings.TrimPrefix(current, "--dns-mode=")))
+			if cfg.DNSResolveMode == "" {
+				return nil, cfg, errors.New("--dns-mode requires a value")
+			}
 		case current == "--dns-deny-cidr":
-			if i+1 < len(args) {
-				cfg.DNSDenyCIDRs = append(cfg.DNSDenyCIDRs, strings.TrimSpace(args[i+1]))
-				i++
+			value, next, err := requiredFlagValue(args, i, current)
+			if err != nil {
+				return nil, cfg, err
 			}
+			cfg.DNSDenyCIDRs, i = append(cfg.DNSDenyCIDRs, value), next
 		case strings.HasPrefix(current, "--dns-deny-cidr="):
-			cfg.DNSDenyCIDRs = append(cfg.DNSDenyCIDRs, strings.TrimSpace(strings.TrimPrefix(current, "--dns-deny-cidr=")))
-		case current == "--home":
-			if i+1 < len(args) {
-				cfg.Home = strings.TrimSpace(args[i+1])
-				i++
+			value := strings.TrimSpace(strings.TrimPrefix(current, "--dns-deny-cidr="))
+			if value == "" {
+				return nil, cfg, errors.New("--dns-deny-cidr requires a value")
 			}
+			cfg.DNSDenyCIDRs = append(cfg.DNSDenyCIDRs, value)
+		case current == "--home":
+			value, next, err := requiredFlagValue(args, i, current)
+			if err != nil {
+				return nil, cfg, err
+			}
+			cfg.Home, i = value, next
 		case strings.HasPrefix(current, "--home="):
 			cfg.Home = strings.TrimSpace(strings.TrimPrefix(current, "--home="))
+			if cfg.Home == "" {
+				return nil, cfg, errors.New("--home requires a value")
+			}
 		case current == "--listen":
-			i = captureRuntimeFlag(args, i, appRuntime.ConfigListenAddress, cfg.Runtime)
+			var err error
+			i, err = captureRuntimeFlag(args, i, current, appRuntime.ConfigListenAddress, cfg.Runtime)
+			if err != nil {
+				return nil, cfg, err
+			}
 		case strings.HasPrefix(current, "--listen="):
-			cfg.Runtime[appRuntime.ConfigListenAddress] = strings.TrimSpace(strings.TrimPrefix(current, "--listen="))
+			if err := captureRuntimeFlagEquals(current, "--listen=", appRuntime.ConfigListenAddress, cfg.Runtime); err != nil {
+				return nil, cfg, err
+			}
 		case current == "--trusted-cidrs":
-			i = captureRuntimeFlag(args, i, appRuntime.ConfigAllowCIDRs, cfg.Runtime)
+			var err error
+			i, err = captureRuntimeFlag(args, i, current, appRuntime.ConfigAllowCIDRs, cfg.Runtime)
+			if err != nil {
+				return nil, cfg, err
+			}
 		case strings.HasPrefix(current, "--trusted-cidrs="):
-			cfg.Runtime[appRuntime.ConfigAllowCIDRs] = strings.TrimSpace(strings.TrimPrefix(current, "--trusted-cidrs="))
+			if err := captureRuntimeFlagEquals(current, "--trusted-cidrs=", appRuntime.ConfigAllowCIDRs, cfg.Runtime); err != nil {
+				return nil, cfg, err
+			}
 		case current == "--max-concurrency":
-			i = captureRuntimeFlag(args, i, appRuntime.ConfigMaxConcurrency, cfg.Runtime)
+			var err error
+			i, err = captureRuntimeFlag(args, i, current, appRuntime.ConfigMaxConcurrency, cfg.Runtime)
+			if err != nil {
+				return nil, cfg, err
+			}
 		case strings.HasPrefix(current, "--max-concurrency="):
-			cfg.Runtime[appRuntime.ConfigMaxConcurrency] = strings.TrimSpace(strings.TrimPrefix(current, "--max-concurrency="))
+			if err := captureRuntimeFlagEquals(current, "--max-concurrency=", appRuntime.ConfigMaxConcurrency, cfg.Runtime); err != nil {
+				return nil, cfg, err
+			}
 		case current == "--sqlite-busy-timeout":
-			i = captureRuntimeFlag(args, i, appRuntime.ConfigSQLiteBusyTimeout, cfg.Runtime)
+			var err error
+			i, err = captureRuntimeFlag(args, i, current, appRuntime.ConfigSQLiteBusyTimeout, cfg.Runtime)
+			if err != nil {
+				return nil, cfg, err
+			}
 		case strings.HasPrefix(current, "--sqlite-busy-timeout="):
-			cfg.Runtime[appRuntime.ConfigSQLiteBusyTimeout] = strings.TrimSpace(strings.TrimPrefix(current, "--sqlite-busy-timeout="))
+			if err := captureRuntimeFlagEquals(current, "--sqlite-busy-timeout=", appRuntime.ConfigSQLiteBusyTimeout, cfg.Runtime); err != nil {
+				return nil, cfg, err
+			}
 		case current == "--log-max-bytes":
-			i = captureRuntimeFlag(args, i, appRuntime.ConfigLogMaxBytes, cfg.Runtime)
+			var err error
+			i, err = captureRuntimeFlag(args, i, current, appRuntime.ConfigLogMaxBytes, cfg.Runtime)
+			if err != nil {
+				return nil, cfg, err
+			}
 		case strings.HasPrefix(current, "--log-max-bytes="):
-			cfg.Runtime[appRuntime.ConfigLogMaxBytes] = strings.TrimSpace(strings.TrimPrefix(current, "--log-max-bytes="))
+			if err := captureRuntimeFlagEquals(current, "--log-max-bytes=", appRuntime.ConfigLogMaxBytes, cfg.Runtime); err != nil {
+				return nil, cfg, err
+			}
 		case current == "--log-max-files":
-			i = captureRuntimeFlag(args, i, appRuntime.ConfigLogMaxFiles, cfg.Runtime)
+			var err error
+			i, err = captureRuntimeFlag(args, i, current, appRuntime.ConfigLogMaxFiles, cfg.Runtime)
+			if err != nil {
+				return nil, cfg, err
+			}
 		case strings.HasPrefix(current, "--log-max-files="):
-			cfg.Runtime[appRuntime.ConfigLogMaxFiles] = strings.TrimSpace(strings.TrimPrefix(current, "--log-max-files="))
+			if err := captureRuntimeFlagEquals(current, "--log-max-files=", appRuntime.ConfigLogMaxFiles, cfg.Runtime); err != nil {
+				return nil, cfg, err
+			}
 		case current == "--nuclei-binary":
-			i = captureRuntimeFlag(args, i, appRuntime.ConfigNucleiBinary, cfg.Runtime)
+			var err error
+			i, err = captureRuntimeFlag(args, i, current, appRuntime.ConfigNucleiBinary, cfg.Runtime)
+			if err != nil {
+				return nil, cfg, err
+			}
 		case strings.HasPrefix(current, "--nuclei-binary="):
-			cfg.Runtime[appRuntime.ConfigNucleiBinary] = strings.TrimSpace(strings.TrimPrefix(current, "--nuclei-binary="))
+			if err := captureRuntimeFlagEquals(current, "--nuclei-binary=", appRuntime.ConfigNucleiBinary, cfg.Runtime); err != nil {
+				return nil, cfg, err
+			}
 		default:
 			filtered = append(filtered, args[i])
 		}
 	}
 
-	return filtered, cfg
+	return filtered, cfg, nil
 }
 
-func captureRuntimeFlag(args []string, index int, key string, overrides appRuntime.ConfigOverrides) int {
-	if index+1 < len(args) {
-		overrides[key] = strings.TrimSpace(args[index+1])
-		return index + 1
+func requiredFlagValue(args []string, index int, flag string) (string, int, error) {
+	if index+1 >= len(args) || strings.HasPrefix(strings.TrimSpace(args[index+1]), "-") {
+		return "", index, fmt.Errorf("%s requires a value", flag)
 	}
-	return index
+	value := strings.TrimSpace(args[index+1])
+	if value == "" {
+		return "", index, fmt.Errorf("%s requires a value", flag)
+	}
+	return value, index + 1, nil
+}
+
+func captureRuntimeFlag(args []string, index int, flag, key string, overrides appRuntime.ConfigOverrides) (int, error) {
+	value, next, err := requiredFlagValue(args, index, flag)
+	if err != nil {
+		return index, err
+	}
+	overrides[key] = value
+	return next, nil
+}
+
+func captureRuntimeFlagEquals(argument, prefix, key string, overrides appRuntime.ConfigOverrides) error {
+	value := strings.TrimSpace(strings.TrimPrefix(argument, prefix))
+	if value == "" {
+		return fmt.Errorf("%s requires a value", strings.TrimSuffix(prefix, "="))
+	}
+	overrides[key] = value
+	return nil
 }
 
 func resolveVulnTargetPorts(db *sql.DB, target string) (string, []int, error) {
@@ -813,7 +892,10 @@ func runMain() error {
 }
 
 func runMainArgs(rawArgs []string) (returnErr error) {
-	args, cfg := parseCLIConfig(rawArgs)
+	args, cfg, err := parseCLIConfig(rawArgs)
+	if err != nil {
+		return err
+	}
 	if len(args) == 0 || isTopLevelHelp(args) {
 		printCLIUsage()
 		return nil
@@ -831,6 +913,12 @@ func runMainArgs(rawArgs []string) (returnErr error) {
 	paths, err := appRuntime.ResolveHome("", homeOverride)
 	if err != nil {
 		return err
+	}
+	if len(args) > 1 && strings.EqualFold(args[0], "server") {
+		handled, err := handleServerControlCommand(paths, args[1:])
+		if err != nil || handled {
+			return err
+		}
 	}
 	overrides := cfg.Runtime
 	if cfg.Templates != "" {
@@ -859,20 +947,35 @@ func runMainArgs(rawArgs []string) (returnErr error) {
 		}()
 	}
 	if len(args) > 0 && strings.EqualFold(args[0], "server") {
-		handled, err := handleServerManagementCommand(paths, args[1:])
+		handled, err := handleServerManagementCommand(paths, args[1:], runtimeConfig, cfg)
 		if err != nil || handled {
 			return err
 		}
 	}
+	command := strings.ToLower(strings.TrimSpace(args[0]))
+	upgradeSourceHome := ""
+	if command == "upgrade" {
+		upgradeSourceHome, err = parseUpgradeSourceHome(args[1:])
+		if err != nil {
+			return err
+		}
+		if upgradeSourceHome == "" {
+			if err := rejectUnmigratedWorkingDirectoryDatabase(paths); err != nil {
+				return err
+			}
+		}
+	}
 	isServerCommand := len(args) > 0 && strings.EqualFold(strings.TrimSpace(args[0]), "server")
+	var preparedServer *preparedServerStartup
 	var serverSession *appRuntime.ServerSession
 	var serviceLog *appRuntime.RotatingLogWriter
 	if isServerCommand {
-		listenAddress := runtimeConfig.ListenAddress
-		if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
-			listenAddress = strings.TrimSpace(args[1])
+		preparedServer, err = prepareServerStartup(args, runtimeConfig)
+		if err != nil {
+			return err
 		}
-		serverSession, err = appRuntime.AcquireServerSessionForStartup(paths, listenAddress, runtimeConfig.MaxConcurrency, 2*time.Minute)
+		defer preparedServer.listener.Close()
+		serverSession, err = appRuntime.AcquireServerSessionForStartup(paths, preparedServer.listener.Addr().String())
 		if err != nil {
 			return err
 		}
@@ -883,29 +986,24 @@ func runMainArgs(rawArgs []string) (returnErr error) {
 		}
 		defer serviceLog.Close()
 		if backgroundChild {
+			restoreOutput, captureErr := appRuntime.CaptureProcessOutput(serviceLog)
+			if captureErr != nil {
+				return captureErr
+			}
+			defer restoreOutput()
 			log.SetOutput(serviceLog)
 		} else {
 			log.SetOutput(io.MultiWriter(os.Stderr, serviceLog))
 		}
 		defer log.SetOutput(os.Stderr)
-	} else {
-		effective, changed, err := appRuntime.ActiveServerConcurrency(paths, runtimeConfig.MaxConcurrency)
-		if err != nil {
-			return fmt.Errorf("read active Server configuration: %w", err)
-		}
-		if changed {
-			log.Printf("[INFO] using active Server concurrency %d; configuration changes require a Server restart", effective)
-		}
-		runtimeConfig.MaxConcurrency = effective
 	}
-	command := strings.ToLower(strings.TrimSpace(args[0]))
 	migrationPending, err := storage.HomeMigrationPending(paths)
 	if err != nil {
 		return err
 	}
-	if command == "upgrade" || migrationPending || serverSession != nil {
+	if command == "upgrade" {
 		migrated, err := storage.UpgradeLegacyHome(storage.HomeUpgradeOptions{
-			Paths: paths, ServerLockHeld: serverSession != nil,
+			Paths: paths, SourceHome: upgradeSourceHome,
 			InitializeContent: func(database *sql.DB) error {
 				_, err := fingerprint.InitializeEmbeddedSourcesIfEmpty(context.Background(), database)
 				return err
@@ -914,17 +1012,28 @@ func runMainArgs(rawArgs []string) (returnErr error) {
 		if err != nil {
 			return err
 		}
-		if command == "upgrade" {
-			if migrated {
-				fmt.Printf("yscan database upgraded to %s\n", paths.Database)
-			} else {
-				fmt.Println("yscan database is already current")
-			}
-			return nil
+		if migrated {
+			fmt.Printf("yscan database upgraded to %s\n", paths.Database)
+		} else {
+			fmt.Println("yscan database is already current")
 		}
+		return nil
+	}
+	if migrationPending {
+		return fmt.Errorf("interrupted offline upgrade detected under %s; run 'yscan --home %q upgrade' for recovery guidance", paths.DataDir, paths.Home)
+	}
+	selection, err := paths.SelectDatabase()
+	if err != nil {
+		return err
+	}
+	if selection.Mode == appRuntime.DatabaseLegacy {
+		return fmt.Errorf("legacy database found at %s; stop all yscan processes and run: yscan --home %q upgrade", selection.Path, paths.Home)
+	}
+	if err := rejectUnmigratedWorkingDirectoryDatabase(paths); err != nil {
+		return err
 	}
 	managedDatabase, err := storage.OpenManagedDatabase(storage.ManagedDatabaseOptions{
-		Paths: paths, BusyTimeout: runtimeConfig.SQLiteBusyTimeout, ServerLockHeld: serverSession != nil,
+		Paths: paths, BusyTimeout: runtimeConfig.SQLiteBusyTimeout,
 		InitializeContent: func(database *sql.DB) error {
 			_, err := fingerprint.InitializeEmbeddedSourcesIfEmpty(context.Background(), database)
 			return err
@@ -954,7 +1063,7 @@ func runMainArgs(rawArgs []string) (returnErr error) {
 	task.NucleiTemplates = runtimeConfig.NucleiTemplates
 	task.DNSResolveMode = cfg.DNSResolveMode
 	task.DNSDenyCIDRs = cfg.DNSDenyCIDRs
-	return runByArgs(args, task, db, runtimeConfig, serverSession, func() error {
+	return runByArgs(args, task, db, runtimeConfig, serverSession, preparedServer, func() error {
 		if err := serverSession.MarkRunning(); err != nil {
 			return err
 		}
@@ -966,35 +1075,89 @@ func runMainArgs(rawArgs []string) (returnErr error) {
 	})
 }
 
-func handleServerManagementCommand(paths appRuntime.HomePaths, args []string) (bool, error) {
+func parseUpgradeSourceHome(args []string) (string, error) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	if len(args) != 2 || args[0] != "--from-home" {
+		return "", errors.New("usage: yscan upgrade [--from-home <legacy_home>]")
+	}
+	value := strings.TrimSpace(args[1])
+	if value == "" || strings.HasPrefix(value, "-") {
+		return "", errors.New("--from-home requires a value")
+	}
+	return value, nil
+}
+
+func rejectUnmigratedWorkingDirectoryDatabase(paths appRuntime.HomePaths) error {
+	selection, err := paths.SelectDatabase()
+	if err != nil || selection.Mode != appRuntime.DatabaseUninitialized {
+		return err
+	}
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	workingDirectory, err = filepath.Abs(workingDirectory)
+	if err != nil {
+		return err
+	}
+	if filepath.Clean(workingDirectory) == filepath.Clean(paths.Home) {
+		return nil
+	}
+	legacyPath := filepath.Join(workingDirectory, "asm.db")
+	info, err := os.Lstat(legacyPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect legacy working-directory database: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("legacy working-directory database is not a regular file: %s", legacyPath)
+	}
+	return fmt.Errorf("legacy database found at %s; migrate it explicitly with: yscan --home %q upgrade --from-home %q", legacyPath, paths.Home, workingDirectory)
+}
+
+func handleServerManagementCommand(paths appRuntime.HomePaths, args []string, config appRuntime.Config, cli cliConfig) (bool, error) {
 	if len(args) == 0 {
 		return false, nil
 	}
 	switch strings.ToLower(strings.TrimSpace(args[0])) {
 	case "--background", "start":
-		return true, appRuntime.StartBackgroundServer(paths, args[1:], 2*time.Minute)
+		return true, appRuntime.StartBackgroundServer(paths, effectiveBackgroundArguments(config, cli), args[1:], 2*time.Minute)
+	case "restart":
+		if err := appRuntime.StopServer(paths, 30*time.Second, false); err != nil {
+			return true, err
+		}
+		return true, appRuntime.StartBackgroundServer(paths, effectiveBackgroundArguments(config, cli), args[1:], 2*time.Minute)
+	default:
+		return false, nil
+	}
+}
+
+func handleServerControlCommand(paths appRuntime.HomePaths, args []string) (bool, error) {
+	if len(args) == 0 {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(args[0])) {
 	case "stop":
 		force := len(args) == 2 && args[1] == "--force"
 		if len(args) > 1 && !force {
 			return true, errors.New("usage: yscan server stop [--force]")
 		}
 		return true, appRuntime.StopServer(paths, 30*time.Second, force)
-	case "restart":
-		if err := appRuntime.StopServer(paths, 30*time.Second, false); err != nil {
-			return true, err
-		}
-		return true, appRuntime.StartBackgroundServer(paths, args[1:], 2*time.Minute)
 	case "status":
 		inspection := appRuntime.InspectServerHealth(paths)
 		fmt.Printf("Server: %s\n", inspection.Status)
 		if inspection.State != nil {
-			fmt.Printf("PID: %d\nInstance: %s\nListen: %s\nConcurrency: %d\n", inspection.State.PID, inspection.State.InstanceID, inspection.State.ListenAddress, inspection.State.MaxConcurrency)
+			fmt.Printf("PID: %d\nListen: %s\nStarted: %s\n", inspection.State.PID, inspection.State.ListenAddress, inspection.State.StartedAt.Format(time.RFC3339))
 		}
 		if inspection.Error != "" {
 			fmt.Printf("Diagnostic: %s\n", inspection.Error)
 		}
-		if inspection.Status == appRuntime.ServerDegraded {
-			return true, errors.New("Server is degraded")
+		if inspection.Status != appRuntime.ServerRunning {
+			return true, fmt.Errorf("Server is %s", inspection.Status)
 		}
 		return true, nil
 	case "logs":
@@ -1016,18 +1179,43 @@ func handleServerManagementCommand(paths appRuntime.HomePaths, args []string) (b
 				return true, fmt.Errorf("unknown server logs option: %s", args[index])
 			}
 		}
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		ctx, stop := signal.NotifyContext(context.Background(), appRuntime.ShutdownSignals()...)
 		defer stop()
 		return true, appRuntime.PrintServerLogs(ctx, os.Stdout, filepath.Join(paths.LogsDir, "yscan.log"), lines, follow)
 	case "uninstall":
-		deleteHome := len(args) == 2 && args[1] == "--delete-home"
-		if len(args) > 1 && !deleteHome {
-			return true, errors.New("usage: yscan server uninstall [--delete-home]")
+		if len(args) > 1 {
+			return true, errors.New("usage: yscan server uninstall")
 		}
-		return true, appRuntime.UninstallSystemd(paths, deleteHome)
+		if err := appRuntime.UninstallSystemd(paths); err != nil {
+			return true, err
+		}
+		fmt.Printf("systemd unit removed; yscan home retained at %s\n", paths.Home)
+		return true, nil
 	default:
 		return false, nil
 	}
+}
+
+func effectiveBackgroundArguments(config appRuntime.Config, cli cliConfig) []string {
+	arguments := []string{
+		"--listen", config.ListenAddress,
+		"--max-concurrency", strconv.Itoa(config.MaxConcurrency),
+		"--sqlite-busy-timeout", config.SQLiteBusyTimeout.String(),
+		"--log-max-bytes", strconv.FormatInt(config.LogMaxBytes, 10),
+		"--log-max-files", strconv.Itoa(config.LogMaxFiles),
+		"--nuclei-binary", config.NucleiBinary,
+		"--dns-mode", cli.DNSResolveMode,
+	}
+	if len(config.AllowCIDRs) > 0 {
+		arguments = append(arguments, "--trusted-cidrs", strings.Join(config.AllowCIDRs, ","))
+	}
+	if config.NucleiTemplates != "" {
+		arguments = append(arguments, "--templates", config.NucleiTemplates)
+	}
+	for _, cidr := range cli.DNSDenyCIDRs {
+		arguments = append(arguments, "--dns-deny-cidr", cidr)
+	}
+	return arguments
 }
 
 func normalizeServerCommand(args []string) ([]string, bool) {
@@ -1126,10 +1314,38 @@ func printCLIUsage() {
 	fmt.Println("       yscan server start|stop|restart|status|logs|uninstall")
 	fmt.Println("       yscan legacy-list|legacy-status|legacy-findings ...")
 	fmt.Println("       yscan version")
-	fmt.Println("       yscan upgrade")
+	fmt.Println("       yscan upgrade [--from-home <legacy_home>]")
 }
 
-func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appRuntime.Config, serverSession *appRuntime.ServerSession, serverReady func() error) error {
+type preparedServerStartup struct {
+	listener net.Listener
+	policy   api.AccessPolicy
+}
+
+func prepareServerStartup(args []string, runtimeConfig appRuntime.Config) (*preparedServerStartup, error) {
+	addr := runtimeConfig.ListenAddress
+	policy := api.AccessPolicy{TrustedCIDRs: append([]string(nil), runtimeConfig.AllowCIDRs...)}
+	if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
+		addr = strings.TrimSpace(args[1])
+	}
+	for index := 2; index < len(args); index++ {
+		if args[index] != "--allow-cidr" || index+1 >= len(args) {
+			return nil, errors.New("usage: yscan server [listen_addr] [--allow-cidr <cidr>]...")
+		}
+		policy.TrustedCIDRs = append(policy.TrustedCIDRs, strings.TrimSpace(args[index+1]))
+		index++
+	}
+	if err := policy.Validate(addr); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return &preparedServerStartup{listener: listener, policy: policy}, nil
+}
+
+func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appRuntime.Config, serverSession *appRuntime.ServerSession, preparedServer *preparedServerStartup, serverReady func() error) error {
 	command := strings.ToLower(strings.TrimSpace(args[0]))
 	switch command {
 	case "help", "--help", "-h":
@@ -1210,22 +1426,14 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appR
 		return nil
 
 	case "server":
-		addr := runtimeConfig.ListenAddress
-		policy := api.AccessPolicy{TrustedCIDRs: append([]string(nil), runtimeConfig.AllowCIDRs...)}
-		if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
-			addr = strings.TrimSpace(args[1])
-		}
-		for index := 2; index < len(args); index++ {
-			if args[index] != "--allow-cidr" || index+1 >= len(args) {
-				return errors.New("usage: yscan server [listen_addr] [--allow-cidr <cidr>]...")
-			}
-			policy.TrustedCIDRs = append(policy.TrustedCIDRs, strings.TrimSpace(args[index+1]))
-			index++
-		}
-		if serverSession == nil {
+		if serverSession == nil || preparedServer == nil || preparedServer.listener == nil {
 			return errors.New("Server lifecycle session is unavailable")
 		}
-		serviceContext, stopService := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		policy := preparedServer.policy
+		listenHost, _, _ := net.SplitHostPort(preparedServer.listener.Addr().String())
+		policy.LocalHealthAddress = listenHost
+		policy.LocalHealthToken = serverSession.State().HealthToken
+		serviceContext, stopService := signal.NotifyContext(context.Background(), appRuntime.ShutdownSignals()...)
 		defer stopService()
 		var ownedRuns serverRunRegistry
 		runner := schedule.NewRunner(db, nil)
@@ -1235,12 +1443,12 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appR
 			}
 		}
 		runner.OnRecovered = func(run model.ScanTaskRun) error { return generateRecoveredScanTaskRunReport(db, run) }
-		service := schedule.NewTaskService(db, nil)
+		service := schedule.NewTaskService(db, nil).WithDefaultNucleiTemplates(runtimeConfig.NucleiTemplates)
 		if err := runner.RecoverStartupState(); err != nil {
 			return fmt.Errorf("schedule startup recovery: %w", err)
 		}
 		serviceErr := runAPIAndSchedulerWithDrain(serviceContext, func(ctx context.Context, drained func() error) error {
-			return api.StartServerWithScanTasksAndAccessPolicyLifecycle(ctx, db, addr, func(taskType, target string) (int64, error) {
+			return api.StartServerWithScanTasksAndAccessPolicyListener(ctx, db, preparedServer.listener, func(taskType, target string) (int64, error) {
 				return runTaskAsync(db, task, taskType, target)
 			}, service, func(ctx context.Context, run model.ScanTaskRun) {
 				ownedRuns.track(run.ID)
@@ -1296,18 +1504,14 @@ func runAPIAndSchedulerWithDrain(parent context.Context, runAPI func(context.Con
 	} else {
 		stopScheduler()
 	}
-	select {
-	case second := <-results:
-		if parent.Err() != nil {
-			for _, result := range []serviceComponentResult{first, second} {
-				if result.err != nil && !errors.Is(result.err, context.Canceled) {
-					return fmt.Errorf("%s stopped: %w", result.name, result.err)
-				}
+	second := <-results
+	if parent.Err() != nil {
+		for _, result := range []serviceComponentResult{first, second} {
+			if result.err != nil && !errors.Is(result.err, context.Canceled) {
+				return fmt.Errorf("%s stopped: %w", result.name, result.err)
 			}
-			return nil
 		}
-	case <-time.After(30 * time.Second):
-		return fmt.Errorf("%s stopped, but shutdown did not drain within 30 seconds", first.name)
+		return nil
 	}
 	if first.err != nil {
 		return fmt.Errorf("%s stopped: %w", first.name, first.err)
