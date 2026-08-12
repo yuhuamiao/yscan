@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,6 +42,51 @@ var (
 	runSubnetTaskRun            = workflow.RunSubnetTaskRun
 	generateScanTaskRunReport   = report.GenerateScanTaskRunReport
 )
+
+type serverRunRegistry struct {
+	mu  sync.Mutex
+	ids map[int64]struct{}
+}
+
+func (registry *serverRunRegistry) track(runID int64) {
+	if runID <= 0 {
+		return
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.ids == nil {
+		registry.ids = make(map[int64]struct{})
+	}
+	registry.ids[runID] = struct{}{}
+}
+
+func (registry *serverRunRegistry) cancelQueued(db *sql.DB) error {
+	registry.mu.Lock()
+	ids := make([]int64, 0, len(registry.ids))
+	for id := range registry.ids {
+		ids = append(ids, id)
+	}
+	registry.mu.Unlock()
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if _, err := tx.Exec(`
+			UPDATE scan_task_runs
+			SET status = ?, stage = ?, error_message = ?, finished_at = datetime('now'), updated_at = datetime('now')
+			WHERE id = ? AND status = ?`,
+			model.ScanTaskRunStatusCanceled, model.ScanTaskRunStageCanceled,
+			"canceled during normal Server shutdown", id, model.ScanTaskRunStatusQueued); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
 
 type cliConfig struct {
 	Templates      string
@@ -1181,6 +1227,7 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appR
 		}
 		serviceContext, stopService := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stopService()
+		var ownedRuns serverRunRegistry
 		runner := schedule.NewRunner(db, nil)
 		runner.OnClaim = func(ctx context.Context, run model.ScanTaskRun) {
 			if err := executeLogicalScanTaskRun(ctx, db, task, run); err != nil {
@@ -1196,6 +1243,7 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appR
 			return api.StartServerWithScanTasksAndAccessPolicyLifecycle(ctx, db, addr, func(taskType, target string) (int64, error) {
 				return runTaskAsync(db, task, taskType, target)
 			}, service, func(ctx context.Context, run model.ScanTaskRun) {
+				ownedRuns.track(run.ID)
 				if err := executeLogicalScanTaskRun(ctx, db, task, run); err != nil {
 					if errors.Is(err, schedule.ErrGlobalConcurrencyUnavailable) {
 						return
@@ -1204,6 +1252,12 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appR
 				}
 			}, policy, serverReady, drained)
 		}, runner.RunLoop)
+		if shutdownErr := ownedRuns.cancelQueued(db); shutdownErr != nil {
+			if serviceErr != nil {
+				return fmt.Errorf("%v; cancel remaining Server queued runs: %w", serviceErr, shutdownErr)
+			}
+			return fmt.Errorf("cancel remaining Server queued runs: %w", shutdownErr)
+		}
 		if serviceErr != nil && serviceContext.Err() == nil {
 			_ = serverSession.MarkDegraded(serviceErr.Error())
 		}

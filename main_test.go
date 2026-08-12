@@ -214,6 +214,44 @@ func TestServerShutdownDrainsAPIRequestsBeforeSchedulerStops(t *testing.T) {
 	}
 }
 
+func TestServerRunRegistryCancelsOnlyOwnedQueuedRuns(t *testing.T) {
+	db := openLogicalScanTaskRunTestDB(t)
+	task, err := storage.CreateScanTask(db, model.ScanTask{Target: "127.0.0.1", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeScheduled, Cron: "0 0 * * *", Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-08-12T10:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unowned, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-08-12T10:01:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-08-12T10:02:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE scan_task_runs SET status = ?, stage = ? WHERE id = ?`, model.ScanTaskRunStatusRunning, model.ScanTaskRunStageStarting, running.ID); err != nil {
+		t.Fatal(err)
+	}
+	registry := serverRunRegistry{}
+	registry.track(owned.ID)
+	registry.track(running.ID)
+	if err := registry.cancelQueued(db); err != nil {
+		t.Fatal(err)
+	}
+	for _, check := range []struct {
+		id     int64
+		status string
+	}{{owned.ID, model.ScanTaskRunStatusCanceled}, {unowned.ID, model.ScanTaskRunStatusQueued}, {running.ID, model.ScanTaskRunStatusRunning}} {
+		run, err := storage.GetScanTaskRun(db, check.id)
+		if err != nil || run.Status != check.status {
+			t.Fatalf("run %d status=%q error=%v, want %q", check.id, run.Status, err, check.status)
+		}
+	}
+}
+
 func TestRecoveredServicePreservesRunCreatedAfterAPIStarts(t *testing.T) {
 	db := openLogicalScanTaskRunTestDB(t)
 	oldTask, err := storage.CreateScanTask(db, model.ScanTask{
