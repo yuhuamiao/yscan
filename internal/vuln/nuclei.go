@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golandproject/yscan/internal/model"
@@ -31,6 +32,17 @@ var (
 	ErrTemplateDirectoryMissing = errors.New("nuclei template directory missing")
 	ErrTemplateMissing          = errors.New("nuclei template missing")
 )
+
+var configuredNucleiBinary struct {
+	sync.RWMutex
+	path string
+}
+
+func ConfigureNucleiBinary(path string) {
+	configuredNucleiBinary.Lock()
+	configuredNucleiBinary.path = strings.TrimSpace(path)
+	configuredNucleiBinary.Unlock()
+}
 
 // NucleiExecutionResult separates process startup and actual template
 // execution from findings and errors. Callers must not infer coverage from an
@@ -327,6 +339,26 @@ func normalizeTagList(tags []string) []string {
 }
 
 func DetectNucleiBinary() (string, error) {
+	configuredNucleiBinary.RLock()
+	configured := configuredNucleiBinary.path
+	configuredNucleiBinary.RUnlock()
+	if configured != "" && configured != "nuclei" {
+		if strings.ContainsRune(configured, filepath.Separator) || filepath.IsAbs(configured) {
+			info, err := os.Stat(configured)
+			if err != nil || info.IsDir() || info.Mode()&0111 == 0 {
+				return "", fmt.Errorf("%w: configured path is not executable: %s", ErrNucleiMissing, configured)
+			}
+			absolute, err := filepath.Abs(configured)
+			if err != nil {
+				return "", err
+			}
+			return absolute, nil
+		}
+		if path, err := exec.LookPath(configured); err == nil {
+			return path, nil
+		}
+		return "", fmt.Errorf("%w: configured executable %q was not found", ErrNucleiMissing, configured)
+	}
 	for _, name := range nucleiBinaryNames() {
 		if p, err := exec.LookPath(name); err == nil {
 			return p, nil

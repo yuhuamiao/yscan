@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -44,6 +45,19 @@ func TestBuildNucleiArgsAlwaysIncludesSafetyExclusions(t *testing.T) {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("missing process safety flag %q in %v", expected, args)
 		}
+	}
+}
+
+func TestDetectNucleiBinaryUsesConfiguredExecutable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reviewed-nuclei")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	ConfigureNucleiBinary(path)
+	t.Cleanup(func() { ConfigureNucleiBinary("") })
+	resolved, err := DetectNucleiBinary()
+	if err != nil || resolved != path {
+		t.Fatalf("configured nuclei = %q, %v", resolved, err)
 	}
 }
 

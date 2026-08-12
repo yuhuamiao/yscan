@@ -47,6 +47,7 @@ type cliConfig struct {
 	DNSResolveMode string
 	DNSDenyCIDRs   []string
 	Home           string
+	Runtime        appRuntime.ConfigOverrides
 }
 
 func runTask(db *sql.DB, baseTask model.Scanner, taskType, target string) {
@@ -399,7 +400,7 @@ func hasFlag(args []string, flag string) bool {
 }
 
 func parseCLIConfig(args []string) ([]string, cliConfig) {
-	cfg := cliConfig{DNSResolveMode: domain.DNSModeHybrid}
+	cfg := cliConfig{DNSResolveMode: domain.DNSModeHybrid, Runtime: appRuntime.ConfigOverrides{}}
 	if len(args) == 0 {
 		return args, cfg
 	}
@@ -436,12 +437,48 @@ func parseCLIConfig(args []string) ([]string, cliConfig) {
 			}
 		case strings.HasPrefix(current, "--home="):
 			cfg.Home = strings.TrimSpace(strings.TrimPrefix(current, "--home="))
+		case current == "--listen":
+			i = captureRuntimeFlag(args, i, appRuntime.ConfigListenAddress, cfg.Runtime)
+		case strings.HasPrefix(current, "--listen="):
+			cfg.Runtime[appRuntime.ConfigListenAddress] = strings.TrimSpace(strings.TrimPrefix(current, "--listen="))
+		case current == "--trusted-cidrs":
+			i = captureRuntimeFlag(args, i, appRuntime.ConfigAllowCIDRs, cfg.Runtime)
+		case strings.HasPrefix(current, "--trusted-cidrs="):
+			cfg.Runtime[appRuntime.ConfigAllowCIDRs] = strings.TrimSpace(strings.TrimPrefix(current, "--trusted-cidrs="))
+		case current == "--max-concurrency":
+			i = captureRuntimeFlag(args, i, appRuntime.ConfigMaxConcurrency, cfg.Runtime)
+		case strings.HasPrefix(current, "--max-concurrency="):
+			cfg.Runtime[appRuntime.ConfigMaxConcurrency] = strings.TrimSpace(strings.TrimPrefix(current, "--max-concurrency="))
+		case current == "--sqlite-busy-timeout":
+			i = captureRuntimeFlag(args, i, appRuntime.ConfigSQLiteBusyTimeout, cfg.Runtime)
+		case strings.HasPrefix(current, "--sqlite-busy-timeout="):
+			cfg.Runtime[appRuntime.ConfigSQLiteBusyTimeout] = strings.TrimSpace(strings.TrimPrefix(current, "--sqlite-busy-timeout="))
+		case current == "--log-max-bytes":
+			i = captureRuntimeFlag(args, i, appRuntime.ConfigLogMaxBytes, cfg.Runtime)
+		case strings.HasPrefix(current, "--log-max-bytes="):
+			cfg.Runtime[appRuntime.ConfigLogMaxBytes] = strings.TrimSpace(strings.TrimPrefix(current, "--log-max-bytes="))
+		case current == "--log-max-files":
+			i = captureRuntimeFlag(args, i, appRuntime.ConfigLogMaxFiles, cfg.Runtime)
+		case strings.HasPrefix(current, "--log-max-files="):
+			cfg.Runtime[appRuntime.ConfigLogMaxFiles] = strings.TrimSpace(strings.TrimPrefix(current, "--log-max-files="))
+		case current == "--nuclei-binary":
+			i = captureRuntimeFlag(args, i, appRuntime.ConfigNucleiBinary, cfg.Runtime)
+		case strings.HasPrefix(current, "--nuclei-binary="):
+			cfg.Runtime[appRuntime.ConfigNucleiBinary] = strings.TrimSpace(strings.TrimPrefix(current, "--nuclei-binary="))
 		default:
 			filtered = append(filtered, args[i])
 		}
 	}
 
 	return filtered, cfg
+}
+
+func captureRuntimeFlag(args []string, index int, key string, overrides appRuntime.ConfigOverrides) int {
+	if index+1 < len(args) {
+		overrides[key] = strings.TrimSpace(args[index+1])
+		return index + 1
+	}
+	return index
 }
 
 func resolveVulnTargetPorts(db *sql.DB, target string) (string, []int, error) {
@@ -749,7 +786,7 @@ func runMainArgs(rawArgs []string) (returnErr error) {
 	if err != nil {
 		return err
 	}
-	overrides := appRuntime.ConfigOverrides{}
+	overrides := cfg.Runtime
 	if cfg.Templates != "" {
 		overrides[appRuntime.ConfigNucleiTemplates] = cfg.Templates
 	}
@@ -757,6 +794,7 @@ func runMainArgs(rawArgs []string) (returnErr error) {
 	if err != nil {
 		return err
 	}
+	vuln.ConfigureNucleiBinary(runtimeConfig.NucleiBinary)
 	if err := paths.Prepare(); err != nil {
 		return err
 	}

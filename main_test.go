@@ -60,6 +60,26 @@ func TestNormalizeServerCommandKeepsOneServiceEntry(t *testing.T) {
 	}
 }
 
+func TestParseCLIConfigCapturesRuntimeOverrides(t *testing.T) {
+	args, config := parseCLIConfig([]string{
+		"--listen", "127.0.0.1:9090", "--trusted-cidrs=192.168.1.0/24", "--max-concurrency", "4",
+		"--sqlite-busy-timeout=7s", "--log-max-bytes", "2048", "--log-max-files=5", "--nuclei-binary", "/opt/nuclei", "server",
+	})
+	if strings.Join(args, " ") != "server" {
+		t.Fatalf("filtered arguments = %v", args)
+	}
+	want := map[string]string{
+		appRuntime.ConfigListenAddress: "127.0.0.1:9090", appRuntime.ConfigAllowCIDRs: "192.168.1.0/24",
+		appRuntime.ConfigMaxConcurrency: "4", appRuntime.ConfigSQLiteBusyTimeout: "7s", appRuntime.ConfigLogMaxBytes: "2048",
+		appRuntime.ConfigLogMaxFiles: "5", appRuntime.ConfigNucleiBinary: "/opt/nuclei",
+	}
+	for key, value := range want {
+		if config.Runtime[key] != value {
+			t.Fatalf("runtime override %s = %q, want %q", key, config.Runtime[key], value)
+		}
+	}
+}
+
 func TestServerServiceLogRotationAndTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "yscan.log")
 	writer, err := appRuntime.OpenRotatingLogWriter(path, 1024, 2)
