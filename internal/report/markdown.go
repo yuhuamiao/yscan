@@ -9,12 +9,56 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golandproject/yscan/internal/diff"
 	"golandproject/yscan/internal/model"
 	"golandproject/yscan/internal/storage"
 )
+
+var runtimeReportDirectory struct {
+	sync.RWMutex
+	path string
+}
+
+func ConfigureHomeDirectory(directory string) {
+	runtimeReportDirectory.Lock()
+	if strings.TrimSpace(directory) == "" {
+		runtimeReportDirectory.path = ""
+	} else {
+		runtimeReportDirectory.path = filepath.Clean(directory)
+	}
+	runtimeReportDirectory.Unlock()
+}
+
+func effectiveReportDirectory(directory string) string {
+	if strings.TrimSpace(directory) != "" && filepath.Clean(directory) != DefaultDirectory {
+		return directory
+	}
+	runtimeReportDirectory.RLock()
+	configured := runtimeReportDirectory.path
+	runtimeReportDirectory.RUnlock()
+	if configured != "" {
+		return configured
+	}
+	return DefaultDirectory
+}
+
+func storedReportPath(path string) string {
+	runtimeReportDirectory.RLock()
+	directory := runtimeReportDirectory.path
+	runtimeReportDirectory.RUnlock()
+	if directory == "" || !filepath.IsAbs(path) {
+		return filepath.ToSlash(path)
+	}
+	home := filepath.Dir(directory)
+	relative, err := filepath.Rel(home, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return filepath.ToSlash(path)
+	}
+	return filepath.ToSlash(relative)
+}
 
 func GenerateTaskReport(db *sql.DB, taskID int64, directory string) (string, error) {
 	task, err := storage.GetTaskByID(db, taskID)
@@ -117,12 +161,13 @@ func GenerateScanTaskRunReport(db *sql.DB, scanTaskID, runID int64, directory st
 		return "", err
 	}
 	paths := transaction.paths
-	if err := updateScanTaskRunReportPaths(db, run.ID, paths.User, paths.Audit); err != nil {
+	storedUser, storedAudit := storedReportPath(paths.User), storedReportPath(paths.Audit)
+	if err := updateScanTaskRunReportPaths(db, run.ID, storedUser, storedAudit); err != nil {
 		_ = transaction.rollback()
 		return "", err
 	}
 	transaction.commit()
-	return paths.User, nil
+	return storedUser, nil
 }
 
 func isMissingFingerprintReportTable(err error) bool {
@@ -134,9 +179,7 @@ func WriteTaskReport(directory string, report TaskReport) (string, error) {
 	if report.Task.ID <= 0 {
 		return "", fmt.Errorf("invalid task ID: %d", report.Task.ID)
 	}
-	if strings.TrimSpace(directory) == "" {
-		directory = DefaultDirectory
-	}
+	directory = effectiveReportDirectory(directory)
 	if err := os.MkdirAll(directory, 0750); err != nil {
 		return "", err
 	}
@@ -200,9 +243,7 @@ func prepareScanTaskRunReport(directory string, report ScanTaskRunReport) (*scan
 	if report.Task.ID <= 0 || report.Run.ID <= 0 || report.Run.ScanTaskID != report.Task.ID {
 		return nil, errors.New("valid scan task and matching run are required")
 	}
-	if strings.TrimSpace(directory) == "" {
-		directory = DefaultDirectory
-	}
+	directory = effectiveReportDirectory(directory)
 	if err := os.MkdirAll(directory, 0750); err != nil {
 		return nil, err
 	}
@@ -373,9 +414,7 @@ func ReadTaskReport(directory string, taskID int64) ([]byte, error) {
 	if taskID <= 0 {
 		return nil, fmt.Errorf("invalid task ID: %d", taskID)
 	}
-	if strings.TrimSpace(directory) == "" {
-		directory = DefaultDirectory
-	}
+	directory = effectiveReportDirectory(directory)
 	return os.ReadFile(TaskReportPath(directory, taskID))
 }
 
@@ -386,9 +425,7 @@ func ReadScanTaskRunReport(directory string, scanTaskID, runID int64) ([]byte, e
 	if scanTaskID <= 0 || runID <= 0 {
 		return nil, fmt.Errorf("invalid scan task or run ID")
 	}
-	if strings.TrimSpace(directory) == "" {
-		directory = DefaultDirectory
-	}
+	directory = effectiveReportDirectory(directory)
 	if err := recoverScanTaskRunReportPair(scanTaskRunReportJournalPath(directory, scanTaskID, runID)); err != nil {
 		return nil, err
 	}
@@ -399,9 +436,7 @@ func ReadScanTaskRunAuditReport(directory string, scanTaskID, runID int64) ([]by
 	if scanTaskID <= 0 || runID <= 0 {
 		return nil, fmt.Errorf("invalid scan task or run ID")
 	}
-	if strings.TrimSpace(directory) == "" {
-		directory = DefaultDirectory
-	}
+	directory = effectiveReportDirectory(directory)
 	if err := recoverScanTaskRunReportPair(scanTaskRunReportJournalPath(directory, scanTaskID, runID)); err != nil {
 		return nil, err
 	}

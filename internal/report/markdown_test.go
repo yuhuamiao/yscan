@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -334,6 +335,40 @@ func TestGenerateScanTaskRunReportProjectsReportingRunAsSuccessful(t *testing.T)
 	persisted, err := storage.GetScanTaskRun(db, run.ID)
 	if err != nil || persisted.Status != model.ScanTaskRunStatusRunning || persisted.Stage != model.ScanTaskRunStageReporting || persisted.Progress != 99 {
 		t.Fatalf("report generation published terminal status: %#v err=%v", persisted, err)
+	}
+}
+
+func TestConfiguredHomeReportDirectoryIgnoresWorkingDirectory(t *testing.T) {
+	home := t.TempDir()
+	directory := filepath.Join(home, "reports")
+	ConfigureHomeDirectory(directory)
+	t.Cleanup(func() { ConfigureHomeDirectory("") })
+	workingDirectory := t.TempDir()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(workingDirectory); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+
+	paths, err := WriteScanTaskRunReport(DefaultDirectory, ScanTaskRunReport{
+		Task: model.ScanTask{ID: 4, Target: "127.0.0.1", ScanType: model.ScanTypeIP},
+		Run:  model.ScanTaskRun{ID: 8, ScanTaskID: 4, Target: "127.0.0.1", Status: model.ScanTaskRunStatusSuccess},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths.User != filepath.Join(directory, "scan-task-4-run-8.md") {
+		t.Fatalf("user report path = %q", paths.User)
+	}
+	content, err := ReadScanTaskRunReport(DefaultDirectory, 4, 8)
+	if err != nil || !strings.Contains(string(content), "127.0.0.1") {
+		t.Fatalf("read configured report: %v, %q", err, content)
+	}
+	if _, err := os.Stat(filepath.Join(workingDirectory, DefaultDirectory)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("working directory report folder exists: %v", err)
 	}
 }
 

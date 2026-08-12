@@ -756,6 +756,7 @@ func runMainArgs(rawArgs []string) error {
 	if err := paths.Prepare(); err != nil {
 		return err
 	}
+	report.ConfigureHomeDirectory(paths.ReportsDir)
 	isServerCommand := len(args) > 0 && strings.EqualFold(strings.TrimSpace(args[0]), "api")
 	var serverSession *appRuntime.ServerSession
 	if isServerCommand {
@@ -777,6 +778,31 @@ func runMainArgs(rawArgs []string) error {
 			log.Printf("[INFO] using active Server concurrency %d; configuration changes require a Server restart", effective)
 		}
 		runtimeConfig.MaxConcurrency = effective
+	}
+	command := strings.ToLower(strings.TrimSpace(args[0]))
+	migrationPending, err := storage.HomeMigrationPending(paths)
+	if err != nil {
+		return err
+	}
+	if command == "upgrade" || migrationPending || serverSession != nil {
+		migrated, err := storage.UpgradeLegacyHome(storage.HomeUpgradeOptions{
+			Paths: paths, ServerLockHeld: serverSession != nil,
+			InitializeContent: func(database *sql.DB) error {
+				_, err := fingerprint.InitializeEmbeddedSourcesIfEmpty(context.Background(), database)
+				return err
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if command == "upgrade" {
+			if migrated {
+				fmt.Printf("yscan database upgraded to %s\n", paths.Database)
+			} else {
+				fmt.Println("yscan database is already current")
+			}
+			return nil
+		}
 	}
 	managedDatabase, err := storage.OpenManagedDatabase(storage.ManagedDatabaseOptions{
 		Paths: paths, BusyTimeout: runtimeConfig.SQLiteBusyTimeout, ServerLockHeld: serverSession != nil,
@@ -895,6 +921,7 @@ func printCLIUsage() {
 	fmt.Println("       yscan api [listen_addr] [--allow-cidr <cidr>]...")
 	fmt.Println("       yscan legacy-list|legacy-status|legacy-findings ...")
 	fmt.Println("       yscan version")
+	fmt.Println("       yscan upgrade")
 }
 
 func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appRuntime.Config, serverSession *appRuntime.ServerSession) error {
