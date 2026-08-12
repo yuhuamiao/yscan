@@ -57,7 +57,7 @@ func AcquireDatabaseExclusive(paths HomePaths, serverAlreadyHeld bool, timeout t
 	deadline := time.Now().Add(timeout)
 	lifecycle := &DatabaseLifecycle{paths: paths, exclusive: true}
 	if !serverAlreadyHeld {
-		server, err := acquireFileLock(paths.ServerLock, syscall.LOCK_EX, deadline)
+		server, err := tryFileLock(paths.ServerLock, syscall.LOCK_EX)
 		if err != nil {
 			return nil, fmt.Errorf("acquire Server lock for database initialization: %w", err)
 		}

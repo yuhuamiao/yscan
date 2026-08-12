@@ -52,6 +52,7 @@ func OpenManagedDatabase(options ManagedDatabaseOptions) (*ManagedDatabase, erro
 		if selection.Mode == appRuntime.DatabaseUninitialized {
 			managed, retry, err := initializeManagedDatabase(options)
 			if retry {
+				time.Sleep(25 * time.Millisecond)
 				continue
 			}
 			return managed, err

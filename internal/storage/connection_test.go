@@ -33,10 +33,22 @@ func TestManagedDatabaseHelper(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer session.Close()
+		if readyPath := os.Getenv("YSCAN_DATABASE_SERVER_READY"); readyPath != "" {
+			if err := os.WriteFile(readyPath, []byte("ready"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	managed, err := OpenManagedDatabase(ManagedDatabaseOptions{
 		Paths: paths, BusyTimeout: time.Second, ServerLockHeld: serverMode, LockTimeout: 20 * time.Second,
 		InitializeContent: func(db *sql.DB) error {
+			if delay := os.Getenv("YSCAN_DATABASE_INIT_DELAY"); delay != "" {
+				duration, err := time.ParseDuration(delay)
+				if err != nil {
+					return err
+				}
+				time.Sleep(duration)
+			}
 			_, err := db.Exec(`CREATE TABLE initialization_marker (owner TEXT NOT NULL)`)
 			if err == nil {
 				_, err = db.Exec(`INSERT INTO initialization_marker (owner) VALUES (?)`, os.Getenv("YSCAN_DATABASE_OWNER"))
@@ -52,6 +64,72 @@ func TestManagedDatabaseHelper(t *testing.T) {
 	if err := managed.DB.QueryRow(`SELECT COUNT(*) FROM initialization_marker`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("marker count=%d error=%v", count, err)
 	}
+	if publishedPath := os.Getenv("YSCAN_DATABASE_PUBLISHED"); publishedPath != "" {
+		if err := os.WriteFile(publishedPath, []byte("published"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		releasePath := os.Getenv("YSCAN_DATABASE_RELEASE")
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(releasePath); err == nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("timed out waiting for database helper release")
+	}
+}
+
+func TestCLIJoinsDatabasePublishedByStartingServer(t *testing.T) {
+	home := t.TempDir()
+	ready := filepath.Join(home, "server-ready")
+	published := filepath.Join(home, "database-published")
+	release := filepath.Join(home, "server-release")
+	server := exec.Command(os.Args[0], "-test.run=TestManagedDatabaseHelper")
+	server.Env = append(os.Environ(),
+		"YSCAN_DATABASE_HELPER=1", "YSCAN_DATABASE_HOME="+home, "YSCAN_DATABASE_OWNER=server",
+		"YSCAN_DATABASE_SERVER=1", "YSCAN_DATABASE_SERVER_READY="+ready, "YSCAN_DATABASE_INIT_DELAY=500ms",
+		"YSCAN_DATABASE_PUBLISHED="+published, "YSCAN_DATABASE_RELEASE="+release)
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitForStoragePath(t, ready)
+	waitForStoragePath(t, published)
+	cli := exec.Command(os.Args[0], "-test.run=TestManagedDatabaseHelper")
+	cli.Env = append(os.Environ(), "YSCAN_DATABASE_HELPER=1", "YSCAN_DATABASE_HOME="+home, "YSCAN_DATABASE_OWNER=cli")
+	if output, err := cli.CombinedOutput(); err != nil {
+		t.Fatalf("CLI open failed: %v\n%s", err, output)
+	}
+	if inspection := appRuntime.InspectServer(mustStoragePaths(t, home)); inspection.Status == appRuntime.ServerStopped {
+		t.Fatal("Server exited before CLI joined its published database")
+	}
+	if err := os.WriteFile(release, []byte("release"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Wait(); err != nil {
+		t.Fatalf("Server initialization failed: %v", err)
+	}
+}
+
+func mustStoragePaths(t *testing.T, home string) appRuntime.HomePaths {
+	t.Helper()
+	paths, err := appRuntime.ResolveHome(os.Args[0], home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return paths
+}
+
+func waitForStoragePath(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
 }
 
 func TestConcurrentFirstInitializationPublishesOneDatabase(t *testing.T) {
