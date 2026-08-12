@@ -45,7 +45,7 @@ func TestRetentionPrunesExpiredTerminalRunsAndKeepsBaseline(t *testing.T) {
 
 	policy := NewRetentionPolicy(db, ClockFunc(func() time.Time {
 		return time.Date(2026, time.July, 24, 0, 0, 0, 0, time.UTC)
-	}))
+	}), directory)
 	result, err := policy.Prune(context.Background())
 	if err != nil {
 		t.Fatalf("prune retention: %v", err)
@@ -98,7 +98,7 @@ func TestRetentionPrunesExpiredTerminalRunsAndKeepsBaseline(t *testing.T) {
 	}
 }
 
-func TestExecutorRunsRetentionAfterTerminalState(t *testing.T) {
+func TestExecutorKeepsExpiredHistoryAfterTerminalState(t *testing.T) {
 	db := openExecutorTestDB(t)
 	task := createRunnerTask(t, db, "192.168.50.0/24", "2025-12-01 00:00:00")
 	directory := t.TempDir()
@@ -112,20 +112,17 @@ func TestExecutorRunsRetentionAfterTerminalState(t *testing.T) {
 	executor := NewExecutor(db, ScanTaskRunExecutorFunc(func(context.Context, model.ScanTaskRun) (model.ScanTaskRunSnapshot, error) {
 		return model.ScanTaskRunSnapshot{}, nil
 	}))
-	executor.Retention = NewRetentionPolicy(db, ClockFunc(func() time.Time {
-		return time.Date(2026, time.July, 24, 3, 0, 0, 0, time.UTC)
-	}))
 	if err := executor.ExecuteRun(context.Background(), currentRun.ID); err != nil {
 		t.Fatalf("execute current run: %v", err)
 	}
 	if err := executor.FinalizeSuccessfulRun(currentRun.ID, ""); err != nil {
 		t.Fatalf("finalize current run: %v", err)
 	}
-	if _, err := storage.GetScanTaskRun(db, oldRun.ID); !errors.Is(err, storage.ErrScanTaskRunNotFound) {
-		t.Fatalf("expired run remains after executor cleanup, error = %v", err)
+	if _, err := storage.GetScanTaskRun(db, oldRun.ID); err != nil {
+		t.Fatalf("expired run was removed after a new run completed: %v", err)
 	}
-	if _, err := os.Stat(oldReport); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expired report remains after executor cleanup, error = %v", err)
+	if _, err := os.Stat(oldReport); err != nil {
+		t.Fatalf("expired report was removed after a new run completed: %v", err)
 	}
 	completed, err := storage.GetScanTaskRun(db, currentRun.ID)
 	if err != nil || completed.Status != model.ScanTaskRunStatusSuccess {
@@ -133,26 +130,39 @@ func TestExecutorRunsRetentionAfterTerminalState(t *testing.T) {
 	}
 }
 
-func TestExecutorRetentionFailureDoesNotRewriteTerminalState(t *testing.T) {
+func TestRetentionResolvesStoredPathsAgainstHomeFromOtherWorkingDirectory(t *testing.T) {
 	db := openExecutorTestDB(t)
-	task := createRunnerTask(t, db, "192.168.60.0/24", "2026-07-24 00:00:00")
-	run, err := storage.CreateScanTaskRun(db, model.ScanTaskRun{ScanTaskID: task.ID, ScheduledFor: "2026-07-24T02:00:00Z"})
+	task := createRunnerTask(t, db, "192.168.70.0/24", "2025-12-01 00:00:00")
+	home := t.TempDir()
+	reports := filepath.Join(home, "reports")
+	if err := os.MkdirAll(reports, 0750); err != nil {
+		t.Fatal(err)
+	}
+	reportPath := writeRetentionReport(t, reports, "relative.md")
+	run := createRetentionRun(t, db, task.ID, "2026-01-01T02:00:00Z", model.ScanTaskRunStatusFailed, reportPath, false)
+	if _, err := db.Exec(`UPDATE scan_task_runs SET report_path = ?, audit_report_path = ? WHERE id = ?`, "reports/relative.md", "reports/relative.md.audit", run.ID); err != nil {
+		t.Fatal(err)
+	}
+	other := t.TempDir()
+	previous, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("create run: %v", err)
+		t.Fatal(err)
 	}
-	executor := NewExecutor(db, ScanTaskRunExecutorFunc(func(context.Context, model.ScanTaskRun) (model.ScanTaskRunSnapshot, error) {
-		return model.ScanTaskRunSnapshot{}, nil
-	}))
-	executor.Retention = &RetentionPolicy{DB: db, Clock: ClockFunc(time.Now), MaxAge: 0}
-	if err := executor.ExecuteRun(context.Background(), run.ID); err != nil {
-		t.Fatalf("retention failure must not fail the completed scan: %v", err)
+	if err := os.Chdir(other); err != nil {
+		t.Fatal(err)
 	}
-	if err := executor.FinalizeSuccessfulRun(run.ID, ""); err != nil {
-		t.Fatalf("retention failure must not fail terminal publication: %v", err)
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+	policy := NewRetentionPolicy(db, ClockFunc(func() time.Time { return time.Date(2026, time.July, 24, 0, 0, 0, 0, time.UTC) }), reports)
+	if _, err := policy.Prune(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	completed, err := storage.GetScanTaskRun(db, run.ID)
-	if err != nil || completed.Status != model.ScanTaskRunStatusSuccess {
-		t.Fatalf("completed run = %#v, error = %v", completed, err)
+	for _, path := range []string{reportPath, reportPath + ".audit"} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("retained report %s was not removed: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(other, "reports")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retention touched current working directory: %v", err)
 	}
 }
 

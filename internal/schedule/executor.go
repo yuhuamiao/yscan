@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	"golandproject/yscan/internal/model"
@@ -26,9 +25,8 @@ func (fn ScanTaskRunExecutorFunc) Execute(ctx context.Context, run model.ScanTas
 }
 
 type Executor struct {
-	DB        *sql.DB
-	Run       ScanTaskRunExecutor
-	Retention *RetentionPolicy
+	DB  *sql.DB
+	Run ScanTaskRunExecutor
 }
 
 var (
@@ -39,7 +37,7 @@ var (
 )
 
 func NewExecutor(db *sql.DB, run ScanTaskRunExecutor) *Executor {
-	return &Executor{DB: db, Run: run, Retention: NewRetentionPolicy(db, nil)}
+	return &Executor{DB: db, Run: run}
 }
 
 // ExecuteRun owns the queued -> running scan transition. Scan errors are
@@ -246,35 +244,14 @@ func (executor *Executor) markTerminal(runID int64, status, message string) erro
 	return nil
 }
 
-// completeRun commits the scan outcome before retention. A cleanup error never
-// rewrites the already-final run status, so reporting and later schedules can
-// still use the completed result.
 func (executor *Executor) completeRun(runID int64, status, message string) error {
-	if err := executor.markTerminal(runID, status, message); err != nil {
-		return err
-	}
-	if executor.Retention == nil {
-		return nil
-	}
-	if _, err := executor.Retention.Prune(context.Background()); err != nil {
-		log.Printf("scan task run retention cleanup failed: %v", err)
-	}
-	return nil
+	return executor.markTerminal(runID, status, message)
 }
 
-// FinalizeSuccessfulRun publishes success only after the caller has completed
-// report preparation. Retention runs after the terminal state is durable.
+// FinalizeSuccessfulRun publishes success only after report preparation. Run
+// history is retained until a future explicit cleanup command requests pruning.
 func (executor *Executor) FinalizeSuccessfulRun(runID int64, reportError string) error {
-	if err := storage.FinalizeSuccessfulScanTaskRun(executor.DB, runID, reportError); err != nil {
-		return err
-	}
-	if executor.Retention == nil {
-		return nil
-	}
-	if _, err := executor.Retention.Prune(context.Background()); err != nil {
-		log.Printf("scan task run retention cleanup failed: %v", err)
-	}
-	return nil
+	return storage.FinalizeSuccessfulScanTaskRun(executor.DB, runID, reportError)
 }
 
 func (executor *Executor) isCancelRequested(runID int64) (bool, error) {

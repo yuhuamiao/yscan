@@ -276,6 +276,7 @@ func TestBackgroundServerPreservesEffectiveConfigurationAndDynamicStatus(t *test
 	if inspection.Status != appRuntime.ServerRunning || inspection.State == nil || inspection.State.ListenAddress != envAddress {
 		t.Fatalf(".env background inspection = %#v", inspection)
 	}
+	stablePID, stableHealthToken := inspection.State.PID, inspection.State.HealthToken
 	if err := os.WriteFile(paths.EnvFile, []byte("YSCAN_UNKNOWN_SETTING=broken\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +285,7 @@ func TestBackgroundServerPreservesEffectiveConfigurationAndDynamicStatus(t *test
 	if output, err := restart.CombinedOutput(); err == nil || !strings.Contains(string(output), "unknown configuration key") {
 		t.Fatalf("restart with invalid configuration: %v\n%s", err, output)
 	}
-	if inspection = appRuntime.InspectServerHealth(paths); inspection.Status != appRuntime.ServerRunning {
+	if inspection = appRuntime.InspectServerHealth(paths); inspection.Status != appRuntime.ServerRunning || inspection.State == nil || inspection.State.PID != stablePID || inspection.State.HealthToken != stableHealthToken {
 		t.Fatalf("invalid restart stopped the existing Server: %#v", inspection)
 	}
 	status = exec.Command(binary, "--home", home, "server", "status")
@@ -409,6 +410,33 @@ func TestServerServiceLogRotationAndTail(t *testing.T) {
 	}
 	if output.String() != "two\nthree\n" {
 		t.Fatalf("tail = %q", output.String())
+	}
+}
+
+func TestCapturedStandardOutputUsesRotatingServiceLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "yscan.log")
+	writer, err := appRuntime.OpenRotatingLogWriter(path, 1024, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore, err := appRuntime.CaptureProcessOutput(writer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 8; index++ {
+		_, _ = fmt.Fprintln(os.Stdout, strings.Repeat("stdout", 120))
+		_, _ = fmt.Fprintln(os.Stderr, strings.Repeat("stderr", 120))
+	}
+	if err := restore(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{path, path + ".1", path + ".2"} {
+		if info, err := os.Stat(expected); err != nil || info.Size() == 0 || info.Size() > 1024 {
+			t.Fatalf("captured rotated log %s info=%v err=%v", expected, info, err)
+		}
 	}
 }
 

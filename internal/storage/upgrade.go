@@ -102,20 +102,21 @@ func UpgradeLegacyHome(options HomeUpgradeOptions) (bool, error) {
 		keepWorking = false
 		return false, fmt.Errorf("verify upgraded database: %w", err)
 	}
-	if sameFilePath(sourcePath, options.Paths.LegacyDatabase) {
-		if err := os.Remove(sourcePath); err != nil {
-			return false, fmt.Errorf("retire legacy root database: %w; restore from %s if needed", err, backupPath)
-		}
-		if err := syncStorageDirectory(filepath.Dir(sourcePath)); err != nil {
-			return false, err
-		}
-	}
 	if err := os.Rename(workingPath, options.Paths.Database); err != nil {
 		return false, fmt.Errorf("publish upgraded database: %w; working file: %s; backup: %s", err, workingPath, backupPath)
 	}
 	keepWorking = false
 	if err := syncStorageDirectory(options.Paths.DataDir); err != nil {
 		return false, err
+	}
+	if sameFilePath(sourcePath, options.Paths.LegacyDatabase) {
+		if err := os.Remove(sourcePath); err != nil {
+			_ = os.Remove(options.Paths.Database)
+			return false, fmt.Errorf("retire legacy root database: %w; original remains at %s and backup at %s", err, sourcePath, backupPath)
+		}
+		if err := syncStorageDirectory(filepath.Dir(sourcePath)); err != nil {
+			return false, err
+		}
 	}
 	return true, nil
 }

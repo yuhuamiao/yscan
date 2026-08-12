@@ -5,13 +5,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +25,170 @@ import (
 	"golandproject/yscan/internal/schedule"
 	"golandproject/yscan/internal/storage"
 )
+
+type failingListener struct {
+	closed chan struct{}
+	once   chan struct{}
+}
+
+func (listener *failingListener) Accept() (net.Conn, error) {
+	select {
+	case <-listener.once:
+		return nil, errors.New("forced listener failure")
+	case <-listener.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (listener *failingListener) Close() error {
+	select {
+	case <-listener.closed:
+	default:
+		close(listener.closed)
+	}
+	return nil
+}
+func (*failingListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+func TestServeFailureDrainsActiveWorkersBeforeReturning(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &failingListener{closed: make(chan struct{}), once: make(chan struct{})}
+	workerContext, stopWorkers := context.WithCancel(context.Background())
+	var active sync.WaitGroup
+	active.Add(1)
+	workerStopped := make(chan struct{})
+	workerDatabaseResult := make(chan error, 1)
+	go func() {
+		defer active.Done()
+		<-workerContext.Done()
+		workerDatabaseResult <- db.Ping()
+		close(workerStopped)
+	}()
+	drained := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- serveServerWithLifecycle(context.Background(), &http.Server{Handler: http.NewServeMux()}, listener, stopWorkers, &active, func() error {
+			close(drained)
+			return nil
+		})
+	}()
+	close(listener.once)
+	err = <-result
+	if err == nil || !strings.Contains(err.Error(), "forced listener failure") {
+		t.Fatalf("serve failure = %v", err)
+	}
+	select {
+	case <-drained:
+	default:
+		t.Fatal("request drain callback was not invoked")
+	}
+	select {
+	case <-workerStopped:
+	default:
+		t.Fatal("API returned before active worker stopped")
+	}
+	if err := <-workerDatabaseResult; err != nil {
+		t.Fatalf("database closed before active worker stopped: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServeFailureKeepsDatabaseOpenBeyondFormerDrainTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires crossing the former 30 second shutdown timeout")
+	}
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &failingListener{closed: make(chan struct{}), once: make(chan struct{})}
+	workerContext, stopWorkers := context.WithCancel(context.Background())
+	var active sync.WaitGroup
+	active.Add(1)
+	workerCanceled := make(chan struct{})
+	workerDatabaseResult := make(chan error, 1)
+	go func() {
+		defer active.Done()
+		<-workerContext.Done()
+		close(workerCanceled)
+		time.Sleep(31 * time.Second)
+		workerDatabaseResult <- db.Ping()
+	}()
+	result := make(chan error, 1)
+	go func() {
+		result <- serveServerWithLifecycle(context.Background(), &http.Server{Handler: http.NewServeMux()}, listener, stopWorkers, &active, nil)
+	}()
+	close(listener.once)
+	select {
+	case <-workerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("worker cancellation was not delivered")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("API returned before the worker crossed 30 seconds: %v", err)
+	case <-time.After(30*time.Second + 100*time.Millisecond):
+	}
+	if err := db.Ping(); err != nil {
+		t.Fatalf("database became unavailable while worker was still draining: %v", err)
+	}
+	if err := <-workerDatabaseResult; err != nil {
+		t.Fatalf("worker lost database before final drain: %v", err)
+	}
+	if err := <-result; err == nil || !strings.Contains(err.Error(), "forced listener failure") {
+		t.Fatalf("serve failure = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLocalHealthBypassDoesNotAuthorizeOtherRoutesOrSources(t *testing.T) {
+	policy := AccessPolicy{
+		TrustedCIDRs:       []string{"192.0.2.0/24"},
+		LocalHealthAddress: "10.30.40.50",
+		LocalHealthToken:   "local-health-token",
+	}
+	handler := policy.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	request := httptest.NewRequest(http.MethodGet, "/api/healthz", nil)
+	request.RemoteAddr = "10.30.40.50:45000"
+	request.Header.Set(LocalHealthTokenHeader, "local-health-token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("local health response = %d", response.Code)
+	}
+
+	for _, test := range []struct {
+		name   string
+		path   string
+		remote string
+		token  string
+	}{
+		{name: "other route", path: "/api/assets", remote: "10.30.40.50:45000", token: "local-health-token"},
+		{name: "wrong token", path: "/api/healthz", remote: "10.30.40.50:45000", token: "wrong"},
+		{name: "other source", path: "/api/healthz", remote: "10.30.40.51:45000", token: "local-health-token"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, test.path, nil)
+			request.RemoteAddr = test.remote
+			request.Header.Set(LocalHealthTokenHeader, test.token)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("response = %d", response.Code)
+			}
+		})
+	}
+}
 
 func TestLegacyTaskCreationIsReadOnly(t *testing.T) {
 	for _, taskType := range []string{model.TaskTypeScanSubnet, model.TaskTypeScanSubnetVuln} {

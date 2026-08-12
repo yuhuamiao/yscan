@@ -26,8 +26,8 @@
 ## 环境要求
 
 - Go `1.26.1` 或更高版本
-- Linux 本地文件系统
-- WSL 请把程序放在 `~/yscan` 等 Linux 文件系统路径，不要放在 `/mnt/c`、`/mnt/d`
+- Linux 或 WSL；Windows 是后续正式发布方向，当前尚未完成原生验收
+- WSL 的 `/mnt/c`、`/mnt/d` 可以使用；升级和搬迁前仍建议先停止进程并备份目录
 - 漏洞验证需要本机安装 `nuclei` 和 [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates)
 
 ## 构建
@@ -49,6 +49,20 @@ go build -o yscan .
 ```
 
 首次执行扫描、启动服务或管理指纹库时，程序会在二进制所在目录创建 `.env`、`data/`、`reports/`、`logs/` 和 `run/`。从其他工作目录调用同一个二进制，仍使用这套数据。
+
+从旧版升级时先停止所有 `yscan` 进程，再显式迁移旧目录。旧便携部署把原来存放 `asm.db` 的目录传给 `--from-home`：
+
+```bash
+/opt/yscan/yscan --home /opt/yscan upgrade --from-home /path/to/old-yscan
+```
+
+旧 systemd 部署的数据通常位于 `/var/lib/yscan`：
+
+```bash
+sudo /opt/yscan/yscan --home /opt/yscan upgrade --from-home /var/lib/yscan
+```
+
+迁移会通过 SQLite 一致快照恢复可能存在的热 journal，并复制旧报告。若新 home 为空但当前工作目录发现旧 `asm.db`，程序会拒绝创建空库并打印对应迁移命令。
 
 ## 快速开始
 
@@ -106,6 +120,8 @@ go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 
 Nuclei 可执行文件和模板不会打包进 `yscan`，需要由部署环境单独维护。
 
+资产识别使用的内置指纹规则随 `yscan` 单二进制发布，首次业务运行会把固定修订初始化到本地数据库；规则升级只由显式的 `fingerprint upgrade` 命令触发。
+
 ## Web 控制台
 
 前台启动服务：
@@ -115,6 +131,8 @@ Nuclei 可执行文件和模板不会打包进 `yscan`，需要由部署环境�
 ```
 
 监听地址、受信 CIDR、SQLite 等待时间和 Nuclei 路径可以写入同目录 `.env`。配置优先级为命令行参数、进程环境变量、`.env`、内置默认值；修改后重启服务生效。
+
+当前调度执行的有效并发固定为 `1`。`.env` 中 `YSCAN_MAX_CONCURRENCY` 会作为后续并发能力的期望配置保存并显示，但在并发调度正式启用前不会提高实际并发，避免产生重叠扫描和旧观测覆盖。
 
 常用页面：
 
@@ -262,11 +280,13 @@ curl -X POST http://127.0.0.1:8080/api/scan-tasks \
 | `reports/scan-task-<taskId>-run-<runId>.md` | 给使用者阅读的扫描报告 |
 | `reports/scan-task-<taskId>-run-<runId>-audit.md` | 规则修订、证据和模板选择记录 |
 | `logs/` | 服务和运行日志 |
-| `run/` | 进程状态及 OS 锁文件 |
+| `run/` | Server 进程与健康状态 |
 
 用户报告先展示端点、技术栈、漏洞验证状态和发现结果。规则 ID、哈希、匹配条件等排查信息放在审计报告中。
 
 失败或取消的运行也会保留已经收集的结果并尝试生成报告，但不会成为下一次 Diff 的成功基准。
+
+任务、运行、快照、漏洞和报告默认永久保留。服务完成新运行时不会自动清理超过 90 天的历史；需要控制磁盘占用时，应先备份并等待后续显式清理命令，不要直接删除数据库关联的报告文件。
 
 ## 安装为系统服务
 
@@ -275,11 +295,12 @@ curl -X POST http://127.0.0.1:8080/api/scan-tasks \
 ```bash
 sudo useradd --system --home /opt/yscan --shell /usr/sbin/nologin yscan
 sudo make install
-sudo chown -R yscan:yscan /opt/yscan
 sudo systemctl daemon-reload
 sudo systemctl enable --now yscan
 curl --fail http://127.0.0.1:8080/api/healthz
 ```
+
+systemd 服务和日常 CLI 操作必须使用同一个 `yscan` 用户，避免 SQLite 和报告目录出现混合属主。安装后的二进制为只读；只有 `.env`、`data/`、`reports/`、`logs/` 和 `run/` 归运行用户写入。不建设共享用户组并发访问模型。
 
 服务默认监听 `127.0.0.1:8080`，配置位于 `/opt/yscan/.env`。便携模式停掉所有进程后可整体移动或删除目录；systemd 模式还必须先移除 unit：
 
@@ -288,9 +309,13 @@ sudo make uninstall
 # 确认已备份后，再手工删除 /opt/yscan
 ```
 
+`yscan server uninstall` 和 `make uninstall` 都只移除 systemd unit，不递归删除 home。数据目录必须由管理员确认备份和路径后手工处理。
+
 旧的 `yscan api` 在一个兼容周期内仍可启动同一 Server，但会输出弃用提示。
 
 收到 `SIGINT` 或 `SIGTERM` 后，服务会停止接收新请求，取消本进程启动的扫描，等待运行退出后关闭。重新启动时会先处理上次未完成的运行并生成报告，然后才开始监听 API。
+
+同一个 home 同时运行多个 Server（包括使用不同监听端口）属于不支持操作。日常使用请通过 `server status`、`start`、`stop` 和 `restart` 管理唯一实例。
 
 生成发布文件：
 

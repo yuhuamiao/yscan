@@ -19,9 +19,10 @@ const DefaultRunRetention = 90 * 24 * time.Hour
 // logical task or the current asset inventory. The most recent successful run
 // of each task remains available as the next Diff baseline.
 type RetentionPolicy struct {
-	DB     *sql.DB
-	Clock  Clock
-	MaxAge time.Duration
+	DB              *sql.DB
+	Clock           Clock
+	MaxAge          time.Duration
+	ReportDirectory string
 }
 
 type RetentionResult struct {
@@ -29,11 +30,15 @@ type RetentionResult struct {
 	DeletedReports int
 }
 
-func NewRetentionPolicy(db *sql.DB, clock Clock) *RetentionPolicy {
+func NewRetentionPolicy(db *sql.DB, clock Clock, reportDirectory ...string) *RetentionPolicy {
 	if clock == nil {
 		clock = ClockFunc(time.Now)
 	}
-	return &RetentionPolicy{DB: db, Clock: clock, MaxAge: DefaultRunRetention}
+	directory := ""
+	if len(reportDirectory) > 0 {
+		directory = filepath.Clean(strings.TrimSpace(reportDirectory[0]))
+	}
+	return &RetentionPolicy{DB: db, Clock: clock, MaxAge: DefaultRunRetention, ReportDirectory: directory}
 }
 
 // Prune deletes only terminal runs older than MaxAge. A report is first moved
@@ -64,7 +69,15 @@ func (policy *RetentionPolicy) Prune(ctx context.Context) (RetentionResult, erro
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		staged, err := stageReports([]string{candidate.ReportPath, candidate.AuditReportPath})
+		resolved := make([]string, 0, 2)
+		for _, stored := range []string{candidate.ReportPath, candidate.AuditReportPath} {
+			path, resolveErr := resolveRetainedReport(policy.ReportDirectory, stored)
+			if resolveErr != nil {
+				return result, fmt.Errorf("resolve report for scan task run %d: %w", candidate.ID, resolveErr)
+			}
+			resolved = append(resolved, path)
+		}
+		staged, err := stageReports(resolved)
 		if err != nil {
 			return result, fmt.Errorf("stage reports for scan task run %d: %w", candidate.ID, err)
 		}
@@ -91,6 +104,54 @@ func (policy *RetentionPolicy) Prune(ctx context.Context) (RetentionResult, erro
 		}
 	}
 	return result, nil
+}
+
+func resolveRetainedReport(reportDirectory, stored string) (string, error) {
+	stored = strings.TrimSpace(stored)
+	if stored == "" {
+		return "", nil
+	}
+	if strings.TrimSpace(reportDirectory) == "" {
+		if filepath.IsAbs(stored) {
+			return "", errors.New("retention report directory is required for absolute report paths")
+		}
+		return "", errors.New("retention report directory is required")
+	}
+	root, err := filepath.Abs(reportDirectory)
+	if err != nil {
+		return "", err
+	}
+	root = filepath.Clean(root)
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return "", fmt.Errorf("inspect retention report directory: %w", err)
+	}
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("retention report directory is not a regular directory: %s", root)
+	}
+	candidate := filepath.Clean(stored)
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(filepath.Dir(root), candidate)
+	}
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("report path is outside %s", root)
+	}
+	current := root
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		info, statErr := os.Lstat(current)
+		if errors.Is(statErr, os.ErrNotExist) {
+			break
+		}
+		if statErr != nil {
+			return "", statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("report path contains symbolic link: %s", current)
+		}
+	}
+	return candidate, nil
 }
 
 type stagedReport struct {

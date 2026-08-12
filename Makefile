@@ -2,6 +2,8 @@ BINARY ?= yscan
 PREFIX ?= /usr/local
 DESTDIR ?=
 YSCAN_HOME ?= /opt/yscan
+YSCAN_USER ?= yscan
+YSCAN_GROUP ?= yscan
 SYSTEMD_UNIT_DIR ?= /etc/systemd/system
 TARGET_OS ?= linux
 TARGET_ARCH ?= amd64
@@ -18,8 +20,14 @@ test:
 	go vet ./...
 
 install: build
-	install -d -m 0750 "$(DESTDIR)$(YSCAN_HOME)"
-	install -m 0755 "$(BINARY)" "$(DESTDIR)$(YSCAN_HOME)/$(BINARY)"
+	install -d -m 0750 -o root -g "$(YSCAN_GROUP)" "$(DESTDIR)$(YSCAN_HOME)"
+	install -m 0555 -o root -g root "$(BINARY)" "$(DESTDIR)$(YSCAN_HOME)/$(BINARY)"
+	install -d -m 0750 -o "$(YSCAN_USER)" -g "$(YSCAN_GROUP)" \
+		"$(DESTDIR)$(YSCAN_HOME)/data" "$(DESTDIR)$(YSCAN_HOME)/reports" \
+		"$(DESTDIR)$(YSCAN_HOME)/logs" "$(DESTDIR)$(YSCAN_HOME)/run"
+	@if [ ! -e "$(DESTDIR)$(YSCAN_HOME)/.env" ]; then \
+		install -m 0600 -o "$(YSCAN_USER)" -g "$(YSCAN_GROUP)" /dev/null "$(DESTDIR)$(YSCAN_HOME)/.env"; \
+	fi
 	install -d -m 0755 "$(DESTDIR)$(SYSTEMD_UNIT_DIR)"
 	install -m 0644 deploy/yscan.service "$(DESTDIR)$(SYSTEMD_UNIT_DIR)/yscan.service"
 

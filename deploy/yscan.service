@@ -10,16 +10,17 @@ Group=yscan
 WorkingDirectory=/opt/yscan
 EnvironmentFile=-/opt/yscan/.env
 ExecStart=/opt/yscan/yscan server
-ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5; do /usr/bin/curl --fail --silent http://127.0.0.1:8080/api/healthz >/dev/null && exit 0; sleep 1; done; exit 1'
+ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do /opt/yscan/yscan --home /opt/yscan server status >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=45
+TimeoutStopSec=infinity
 KillSignal=SIGTERM
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=/opt/yscan
+ReadOnlyPaths=/opt/yscan/yscan
+ReadWritePaths=/opt/yscan/.env /opt/yscan/data /opt/yscan/reports /opt/yscan/logs /opt/yscan/run
 
 [Install]
 WantedBy=multi-user.target

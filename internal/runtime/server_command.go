@@ -133,8 +133,8 @@ func (writer *RotatingLogWriter) rotate() error {
 }
 
 func StartBackgroundServer(paths HomePaths, effectiveArguments, serverArguments []string, timeout time.Duration) error {
-	if inspection := InspectServer(paths); inspection.Status != ServerStopped {
-		return fmt.Errorf("yscan Server is %s", inspection.Status)
+	if inspection := InspectServerHealth(paths); inspection.Status == ServerRunning {
+		return errors.New("yscan Server is already running")
 	}
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
