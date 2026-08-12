@@ -375,6 +375,18 @@ func TestHealthCheckAndRunStarterUseServiceContext(t *testing.T) {
 	}
 }
 
+func TestTrustedAccessPolicyAlwaysAllowsLocalHealthProbe(t *testing.T) {
+	policy := AccessPolicy{TrustedCIDRs: []string{"192.168.10.0/24"}}
+	called := false
+	handler := policy.Wrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	request := httptest.NewRequest(http.MethodGet, "/api/healthz", nil)
+	request.RemoteAddr = "127.0.0.1:45000"
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+	if !called {
+		t.Fatal("loopback health probe was rejected by trusted CIDR policy")
+	}
+}
+
 func TestScanTaskCreateResponseKeepsFullPortRangeCompact(t *testing.T) {
 	db := openScanTaskAPIDB(t)
 	service := schedule.NewTaskService(db, nil)

@@ -178,7 +178,7 @@ func (policy AccessPolicy) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host, _, _ := net.SplitHostPort(r.RemoteAddr)
 		ip := net.ParseIP(host)
-		allowed := false
+		allowed := ip != nil && ip.IsLoopback()
 		for _, network := range networks {
 			if network.Contains(ip) {
 				allowed = true
