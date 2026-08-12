@@ -7,9 +7,9 @@ Wants=network-online.target
 Type=simple
 User=yscan
 Group=yscan
-WorkingDirectory=/var/lib/yscan
-EnvironmentFile=-/etc/yscan/yscan.env
-ExecStart=/usr/local/bin/yscan api 127.0.0.1:8080
+WorkingDirectory=/opt/yscan
+EnvironmentFile=-/opt/yscan/.env
+ExecStart=/opt/yscan/yscan server
 ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5; do /usr/bin/curl --fail --silent http://127.0.0.1:8080/api/healthz >/dev/null && exit 0; sleep 1; done; exit 1'
 Restart=on-failure
 RestartSec=3
@@ -17,9 +17,9 @@ TimeoutStopSec=20
 KillSignal=SIGTERM
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectHome=true
+ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=/var/lib/yscan
+ReadWritePaths=/opt/yscan
 
 [Install]
 WantedBy=multi-user.target

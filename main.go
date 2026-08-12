@@ -737,6 +737,8 @@ func runMainArgs(rawArgs []string) error {
 		fmt.Println("yscan development")
 		return nil
 	}
+	var deprecatedAPI bool
+	args, deprecatedAPI = normalizeServerCommand(args)
 	homeOverride := cfg.Home
 	if homeOverride == "" {
 		homeOverride = strings.TrimSpace(os.Getenv("YSCAN_HOME"))
@@ -757,7 +759,7 @@ func runMainArgs(rawArgs []string) error {
 		return err
 	}
 	report.ConfigureHomeDirectory(paths.ReportsDir)
-	isServerCommand := len(args) > 0 && strings.EqualFold(strings.TrimSpace(args[0]), "api")
+	isServerCommand := len(args) > 0 && strings.EqualFold(strings.TrimSpace(args[0]), "server")
 	var serverSession *appRuntime.ServerSession
 	if isServerCommand {
 		listenAddress := runtimeConfig.ListenAddress
@@ -816,6 +818,9 @@ func runMainArgs(rawArgs []string) error {
 	}
 	defer managedDatabase.Close()
 	db := managedDatabase.DB
+	if deprecatedAPI {
+		log.Print("[WARN] 'yscan api' is deprecated; use 'yscan server'")
+	}
 	if _, err := fingerprint.InitializeEmbeddedSourcesIfEmpty(context.Background(), db); err != nil {
 		return err
 	}
@@ -833,6 +838,15 @@ func runMainArgs(rawArgs []string) error {
 	task.DNSResolveMode = cfg.DNSResolveMode
 	task.DNSDenyCIDRs = cfg.DNSDenyCIDRs
 	return runByArgs(args, task, db, runtimeConfig, serverSession)
+}
+
+func normalizeServerCommand(args []string) ([]string, bool) {
+	if len(args) == 0 || !strings.EqualFold(strings.TrimSpace(args[0]), "api") {
+		return args, false
+	}
+	normalized := append([]string(nil), args...)
+	normalized[0] = "server"
+	return normalized, true
 }
 
 func isTopLevelVersion(args []string) bool {
@@ -918,7 +932,7 @@ func printCLIUsage() {
 	fmt.Println("usage: yscan [--home <dir>] scan <internal-ip|cidr> [--vuln] [--port-spec <ports>]")
 	fmt.Println("       yscan subnet <internal-cidr> [--vuln] [--port-spec <ports>]")
 	fmt.Println("       yscan schedule help")
-	fmt.Println("       yscan api [listen_addr] [--allow-cidr <cidr>]...")
+	fmt.Println("       yscan server [listen_addr] [--allow-cidr <cidr>]...")
 	fmt.Println("       yscan legacy-list|legacy-status|legacy-findings ...")
 	fmt.Println("       yscan version")
 	fmt.Println("       yscan upgrade")
@@ -1004,7 +1018,7 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appR
 		printTaskFindings(db, taskID, severity)
 		return nil
 
-	case "api":
+	case "server":
 		addr := runtimeConfig.ListenAddress
 		policy := api.AccessPolicy{TrustedCIDRs: append([]string(nil), runtimeConfig.AllowCIDRs...)}
 		if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
@@ -1012,7 +1026,7 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appR
 		}
 		for index := 2; index < len(args); index++ {
 			if args[index] != "--allow-cidr" || index+1 >= len(args) {
-				return errors.New("usage: yscan api [listen_addr] [--allow-cidr <cidr>]...")
+				return errors.New("usage: yscan server [listen_addr] [--allow-cidr <cidr>]...")
 			}
 			policy.TrustedCIDRs = append(policy.TrustedCIDRs, strings.TrimSpace(args[index+1]))
 			index++

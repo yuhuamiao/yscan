@@ -26,8 +26,8 @@
 ## 环境要求
 
 - Go `1.26.1` 或更高版本
-- Linux、macOS、Windows 或 WSL
-- 一个可写工作目录，用于 `asm.db` 和 `reports/`
+- Linux 本地文件系统
+- WSL 请把程序放在 `~/yscan` 等 Linux 文件系统路径，不要放在 `/mnt/c`、`/mnt/d`
 - 漏洞验证需要本机安装 `nuclei` 和 [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates)
 
 ## 构建
@@ -48,7 +48,7 @@ go build -o yscan .
 ./yscan --help
 ```
 
-首次执行扫描、启动 API 或管理指纹库时，程序会在当前目录创建 `asm.db`，并初始化内置指纹规则。
+首次执行扫描、启动服务或管理指纹库时，程序会在二进制所在目录创建 `.env`、`data/`、`reports/`、`logs/` 和 `run/`。从其他工作目录调用同一个二进制，仍使用这套数据。
 
 ## 快速开始
 
@@ -108,11 +108,13 @@ Nuclei 可执行文件和模板不会打包进 `yscan`，需要由部署环境�
 
 ## Web 控制台
 
-启动服务：
+前台启动服务：
 
 ```bash
-./yscan api 127.0.0.1:8080
+./yscan server
 ```
+
+监听地址、受信 CIDR、SQLite 等待时间和 Nuclei 路径可以写入同目录 `.env`。配置优先级为命令行参数、进程环境变量、`.env`、内置默认值；修改后重启服务生效。
 
 常用页面：
 
@@ -130,14 +132,14 @@ Nuclei 可执行文件和模板不会打包进 `yscan`，需要由部署环境�
 API 没有登录页面。监听非回环地址时，必须至少配置一个允许访问的客户端 CIDR：
 
 ```bash
-./yscan api 0.0.0.0:8080 --allow-cidr 192.168.10.0/24
+./yscan server 0.0.0.0:8080 --allow-cidr 192.168.10.0/24
 ```
 
 `--allow-cidr` 可以重复使用。不在允许范围内的客户端会收到 `403`。不要把 API 直接暴露到互联网。
 
 ## 定时扫描
 
-API 进程同时负责定时任务调度。创建一个每天凌晨 2 点执行的网段任务：
+Server 进程同时负责 Web、API 和定时任务调度。创建一个每天凌晨 2 点执行的网段任务：
 
 ```bash
 ./yscan schedule create \
@@ -179,7 +181,7 @@ API 进程同时负责定时任务调度。创建一个每天凌晨 2 点执行�
 | `changes <task_id> <run_id> [baseline_run_id]` | 查看主机、端口和漏洞变化 |
 | `report <task_id> <run_id> [--audit]` | 查看用户报告或审计报告 |
 | `asset <internal_ip>` | 查看资产及端点画像 |
-| `api [addr] [--allow-cidr <cidr>]...` | 启动 API 和 Web 控制台 |
+| `server [addr] [--allow-cidr <cidr>]...` | 前台启动 Server、API 和 Web 控制台 |
 
 任务管理命令：
 
@@ -251,13 +253,16 @@ curl -X POST http://127.0.0.1:8080/api/scan-tasks \
 
 ## 数据与报告
 
-`yscan` 默认把数据写到启动目录：
+`yscan` 默认把数据写到二进制所在目录：
 
 | 路径 | 内容 |
 | --- | --- |
-| `asm.db` | 任务、运行、资产、端口、指纹和漏洞数据 |
+| `.env` | 启动配置 |
+| `data/asm.db` | 任务、运行、资产、端口、指纹和漏洞数据 |
 | `reports/scan-task-<taskId>-run-<runId>.md` | 给使用者阅读的扫描报告 |
 | `reports/scan-task-<taskId>-run-<runId>-audit.md` | 规则修订、证据和模板选择记录 |
+| `logs/` | 服务和运行日志 |
+| `run/` | 进程状态及 OS 锁文件 |
 
 用户报告先展示端点、技术栈、漏洞验证状态和发现结果。规则 ID、哈希、匹配条件等排查信息放在审计报告中。
 
@@ -265,24 +270,25 @@ curl -X POST http://127.0.0.1:8080/api/scan-tasks \
 
 ## 安装为系统服务
 
-安装二进制：
+安装到单目录 `/opt/yscan` 并安装 systemd unit：
 
 ```bash
+sudo useradd --system --home /opt/yscan --shell /usr/sbin/nologin yscan
 sudo make install
-```
-
-创建运行用户和数据目录，然后安装 systemd unit：
-
-```bash
-sudo useradd --system --home /var/lib/yscan --shell /usr/sbin/nologin yscan
-sudo install -d -o yscan -g yscan -m 0750 /var/lib/yscan /etc/yscan
-sudo install -m 0644 deploy/yscan.service /etc/systemd/system/yscan.service
+sudo chown -R yscan:yscan /opt/yscan
 sudo systemctl daemon-reload
 sudo systemctl enable --now yscan
 curl --fail http://127.0.0.1:8080/api/healthz
 ```
 
-服务默认监听 `127.0.0.1:8080`，数据目录为 `/var/lib/yscan`。可以在 `/etc/yscan/yscan.env` 中设置运行环境变量。
+服务默认监听 `127.0.0.1:8080`，配置位于 `/opt/yscan/.env`。便携模式停掉所有进程后可整体移动或删除目录；systemd 模式还必须先移除 unit：
+
+```bash
+sudo make uninstall
+# 确认已备份后，再手工删除 /opt/yscan
+```
+
+旧的 `yscan api` 在一个兼容周期内仍可启动同一 Server，但会输出弃用提示。
 
 收到 `SIGINT` 或 `SIGTERM` 后，服务会停止接收新请求，取消本进程启动的扫描，等待运行退出后关闭。重新启动时会先处理上次未完成的运行并生成报告，然后才开始监听 API。
 

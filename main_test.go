@@ -47,6 +47,17 @@ func TestTopLevelVersionDoesNotInitializeHome(t *testing.T) {
 	}
 }
 
+func TestNormalizeServerCommandKeepsOneServiceEntry(t *testing.T) {
+	server, deprecated := normalizeServerCommand([]string{"server", "127.0.0.1:8080"})
+	if deprecated || strings.Join(server, " ") != "server 127.0.0.1:8080" {
+		t.Fatalf("server normalization = %v, %t", server, deprecated)
+	}
+	legacy, deprecated := normalizeServerCommand([]string{"api", "127.0.0.1:9090", "--allow-cidr", "192.168.1.0/24"})
+	if !deprecated || strings.Join(legacy, " ") != "server 127.0.0.1:9090 --allow-cidr 192.168.1.0/24" {
+		t.Fatalf("API compatibility normalization = %v, %t", legacy, deprecated)
+	}
+}
+
 func TestRunAPIAndSchedulerStopsAPIWhenSchedulerFails(t *testing.T) {
 	apiStarted := make(chan struct{})
 	apiStopped := make(chan struct{})
