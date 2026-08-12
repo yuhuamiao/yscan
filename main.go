@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -727,7 +729,7 @@ func runMain() error {
 	return runMainArgs(os.Args[1:])
 }
 
-func runMainArgs(rawArgs []string) error {
+func runMainArgs(rawArgs []string) (returnErr error) {
 	args, cfg := parseCLIConfig(rawArgs)
 	if len(args) == 0 || isTopLevelHelp(args) {
 		printCLIUsage()
@@ -759,8 +761,28 @@ func runMainArgs(rawArgs []string) error {
 		return err
 	}
 	report.ConfigureHomeDirectory(paths.ReportsDir)
+	backgroundChild := false
+	if len(args) > 1 && strings.EqualFold(args[0], "server") && args[1] == "--background-child" {
+		backgroundChild = true
+		args = append([]string{"server"}, args[2:]...)
+	}
+	readyNotified := false
+	if backgroundChild {
+		defer func() {
+			if !readyNotified {
+				appRuntime.NotifyBackgroundReady(returnErr)
+			}
+		}()
+	}
+	if len(args) > 0 && strings.EqualFold(args[0], "server") {
+		handled, err := handleServerManagementCommand(paths, args[1:])
+		if err != nil || handled {
+			return err
+		}
+	}
 	isServerCommand := len(args) > 0 && strings.EqualFold(strings.TrimSpace(args[0]), "server")
 	var serverSession *appRuntime.ServerSession
+	var serviceLog *appRuntime.RotatingLogWriter
 	if isServerCommand {
 		listenAddress := runtimeConfig.ListenAddress
 		if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
@@ -771,6 +793,17 @@ func runMainArgs(rawArgs []string) error {
 			return err
 		}
 		defer serverSession.Close()
+		serviceLog, err = appRuntime.OpenRotatingLogWriter(filepath.Join(paths.LogsDir, "yscan.log"), runtimeConfig.LogMaxBytes, runtimeConfig.LogMaxFiles)
+		if err != nil {
+			return err
+		}
+		defer serviceLog.Close()
+		if backgroundChild {
+			log.SetOutput(serviceLog)
+		} else {
+			log.SetOutput(io.MultiWriter(os.Stderr, serviceLog))
+		}
+		defer log.SetOutput(os.Stderr)
 	} else {
 		effective, changed, err := appRuntime.ActiveServerConcurrency(paths, runtimeConfig.MaxConcurrency)
 		if err != nil {
@@ -837,7 +870,80 @@ func runMainArgs(rawArgs []string) error {
 	task.NucleiTemplates = runtimeConfig.NucleiTemplates
 	task.DNSResolveMode = cfg.DNSResolveMode
 	task.DNSDenyCIDRs = cfg.DNSDenyCIDRs
-	return runByArgs(args, task, db, runtimeConfig, serverSession)
+	return runByArgs(args, task, db, runtimeConfig, serverSession, func() error {
+		if err := serverSession.MarkRunning(); err != nil {
+			return err
+		}
+		if backgroundChild && !readyNotified {
+			appRuntime.NotifyBackgroundReady(nil)
+			readyNotified = true
+		}
+		return nil
+	})
+}
+
+func handleServerManagementCommand(paths appRuntime.HomePaths, args []string) (bool, error) {
+	if len(args) == 0 {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(args[0])) {
+	case "--background", "start":
+		return true, appRuntime.StartBackgroundServer(paths, args[1:], 2*time.Minute)
+	case "stop":
+		force := len(args) == 2 && args[1] == "--force"
+		if len(args) > 1 && !force {
+			return true, errors.New("usage: yscan server stop [--force]")
+		}
+		return true, appRuntime.StopServer(paths, 30*time.Second, force)
+	case "restart":
+		if err := appRuntime.StopServer(paths, 30*time.Second, false); err != nil {
+			return true, err
+		}
+		return true, appRuntime.StartBackgroundServer(paths, args[1:], 2*time.Minute)
+	case "status":
+		inspection := appRuntime.InspectServerHealth(paths)
+		fmt.Printf("Server: %s\n", inspection.Status)
+		if inspection.State != nil {
+			fmt.Printf("PID: %d\nInstance: %s\nListen: %s\nConcurrency: %d\n", inspection.State.PID, inspection.State.InstanceID, inspection.State.ListenAddress, inspection.State.MaxConcurrency)
+		}
+		if inspection.Error != "" {
+			fmt.Printf("Diagnostic: %s\n", inspection.Error)
+		}
+		if inspection.Status == appRuntime.ServerDegraded {
+			return true, errors.New("Server is degraded")
+		}
+		return true, nil
+	case "logs":
+		lines, follow := 100, true
+		for index := 1; index < len(args); index++ {
+			switch args[index] {
+			case "--lines":
+				if index+1 >= len(args) {
+					return true, errors.New("--lines requires a value")
+				}
+				value, err := strconv.Atoi(args[index+1])
+				if err != nil {
+					return true, err
+				}
+				lines, index = value, index+1
+			case "--no-follow":
+				follow = false
+			default:
+				return true, fmt.Errorf("unknown server logs option: %s", args[index])
+			}
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return true, appRuntime.PrintServerLogs(ctx, os.Stdout, filepath.Join(paths.LogsDir, "yscan.log"), lines, follow)
+	case "uninstall":
+		deleteHome := len(args) == 2 && args[1] == "--delete-home"
+		if len(args) > 1 && !deleteHome {
+			return true, errors.New("usage: yscan server uninstall [--delete-home]")
+		}
+		return true, appRuntime.UninstallSystemd(paths, deleteHome)
+	default:
+		return false, nil
+	}
 }
 
 func normalizeServerCommand(args []string) ([]string, bool) {
@@ -933,12 +1039,13 @@ func printCLIUsage() {
 	fmt.Println("       yscan subnet <internal-cidr> [--vuln] [--port-spec <ports>]")
 	fmt.Println("       yscan schedule help")
 	fmt.Println("       yscan server [listen_addr] [--allow-cidr <cidr>]...")
+	fmt.Println("       yscan server start|stop|restart|status|logs|uninstall")
 	fmt.Println("       yscan legacy-list|legacy-status|legacy-findings ...")
 	fmt.Println("       yscan version")
 	fmt.Println("       yscan upgrade")
 }
 
-func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appRuntime.Config, serverSession *appRuntime.ServerSession) error {
+func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appRuntime.Config, serverSession *appRuntime.ServerSession, serverReady func() error) error {
 	command := strings.ToLower(strings.TrimSpace(args[0]))
 	switch command {
 	case "help", "--help", "-h":
@@ -1044,8 +1151,11 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appR
 		}
 		runner.OnRecovered = func(run model.ScanTaskRun) error { return generateRecoveredScanTaskRunReport(db, run) }
 		service := schedule.NewTaskService(db, nil)
-		serviceErr := recoverThenRunAPIAndScheduler(serviceContext, runner.RecoverStartupState, func(ctx context.Context) error {
-			return api.StartServerWithScanTasksAndAccessPolicyContextReady(ctx, db, addr, func(taskType, target string) (int64, error) {
+		if err := runner.RecoverStartupState(); err != nil {
+			return fmt.Errorf("schedule startup recovery: %w", err)
+		}
+		serviceErr := runAPIAndSchedulerWithDrain(serviceContext, func(ctx context.Context, drained func() error) error {
+			return api.StartServerWithScanTasksAndAccessPolicyLifecycle(ctx, db, addr, func(taskType, target string) (int64, error) {
 				return runTaskAsync(db, task, taskType, target)
 			}, service, func(ctx context.Context, run model.ScanTaskRun) {
 				if err := executeLogicalScanTaskRun(ctx, db, task, run); err != nil {
@@ -1054,7 +1164,7 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appR
 					}
 					log.Printf("one-time ScanTask run %d failed: %v", run.ID, err)
 				}
-			}, policy, serverSession.MarkRunning)
+			}, policy, serverReady, drained)
 		}, runner.RunLoop)
 		if serviceErr != nil && serviceContext.Err() == nil {
 			_ = serverSession.MarkDegraded(serviceErr.Error())
@@ -1070,6 +1180,47 @@ func runByArgs(args []string, task model.Scanner, db *sql.DB, runtimeConfig appR
 	default:
 		return fmt.Errorf("unknown command: %s", command)
 	}
+}
+
+func runAPIAndSchedulerWithDrain(parent context.Context, runAPI func(context.Context, func() error) error, runScheduler func(context.Context) error) error {
+	apiContext, stopAPI := context.WithCancel(context.Background())
+	schedulerContext, stopScheduler := context.WithCancel(context.Background())
+	defer stopAPI()
+	defer stopScheduler()
+	go func() {
+		<-parent.Done()
+		stopAPI()
+	}()
+	results := make(chan serviceComponentResult, 2)
+	go func() {
+		results <- serviceComponentResult{name: "API server", err: runAPI(apiContext, func() error { stopScheduler(); return nil })}
+	}()
+	go func() {
+		results <- serviceComponentResult{name: "schedule runner", err: runScheduler(schedulerContext)}
+	}()
+	first := <-results
+	if first.name == "schedule runner" {
+		stopAPI()
+	} else {
+		stopScheduler()
+	}
+	select {
+	case second := <-results:
+		if parent.Err() != nil {
+			for _, result := range []serviceComponentResult{first, second} {
+				if result.err != nil && !errors.Is(result.err, context.Canceled) {
+					return fmt.Errorf("%s stopped: %w", result.name, result.err)
+				}
+			}
+			return nil
+		}
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("%s stopped, but shutdown did not drain within 30 seconds", first.name)
+	}
+	if first.err != nil {
+		return fmt.Errorf("%s stopped: %w", first.name, first.err)
+	}
+	return fmt.Errorf("%s stopped unexpectedly", first.name)
 }
 
 type serviceComponentResult struct {

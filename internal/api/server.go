@@ -83,8 +83,14 @@ func StartServerWithScanTasksAndAccessPolicyContext(ctx context.Context, db *sql
 }
 
 func StartServerWithScanTasksAndAccessPolicyContextReady(ctx context.Context, db *sql.DB, addr string, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter, policy AccessPolicy, ready func() error) error {
+	return StartServerWithScanTasksAndAccessPolicyLifecycle(ctx, db, addr, runTask, creator, startRun, policy, ready, nil)
+}
+
+func StartServerWithScanTasksAndAccessPolicyLifecycle(ctx context.Context, db *sql.DB, addr string, runTask TaskRunner, creator ScanTaskCreator, startRun ScanTaskRunStarter, policy AccessPolicy, ready, requestsDrained func() error) error {
 	var activeRuns sync.WaitGroup
-	handler, err := newHandlerWithScanTasksContextAndGroup(ctx, db, runTask, creator, startRun, &activeRuns)
+	workerContext, stopWorkers := context.WithCancel(context.Background())
+	defer stopWorkers()
+	handler, err := newHandlerWithScanTasksContextAndGroup(workerContext, db, runTask, creator, startRun, &activeRuns)
 	if err != nil {
 		return err
 	}
@@ -118,6 +124,12 @@ func StartServerWithScanTasksAndAccessPolicyContextReady(ctx context.Context, db
 		if err := server.Shutdown(shutdownContext); err != nil {
 			return fmt.Errorf("graceful API shutdown: %w", err)
 		}
+		if requestsDrained != nil {
+			if err := requestsDrained(); err != nil {
+				return fmt.Errorf("after API request drain: %w", err)
+			}
+		}
+		stopWorkers()
 		runsStopped := make(chan struct{})
 		go func() { activeRuns.Wait(); close(runsStopped) }()
 		select {

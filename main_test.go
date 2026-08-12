@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 
 	"golandproject/yscan/internal/model"
+	appRuntime "golandproject/yscan/internal/runtime"
 	"golandproject/yscan/internal/schedule"
 	"golandproject/yscan/internal/storage"
 	"golandproject/yscan/internal/workflow"
@@ -55,6 +57,46 @@ func TestNormalizeServerCommandKeepsOneServiceEntry(t *testing.T) {
 	legacy, deprecated := normalizeServerCommand([]string{"api", "127.0.0.1:9090", "--allow-cidr", "192.168.1.0/24"})
 	if !deprecated || strings.Join(legacy, " ") != "server 127.0.0.1:9090 --allow-cidr 192.168.1.0/24" {
 		t.Fatalf("API compatibility normalization = %v, %t", legacy, deprecated)
+	}
+}
+
+func TestServerServiceLogRotationAndTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "yscan.log")
+	writer, err := appRuntime.OpenRotatingLogWriter(path, 1024, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 5; index++ {
+		if _, err := writer.Write([]byte(strings.Repeat("x", 700) + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{path, path + ".1", path + ".2"} {
+		if _, err := os.Stat(expected); err != nil {
+			t.Fatalf("missing rotated log %s: %v", expected, err)
+		}
+	}
+	if _, err := os.Stat(path + ".3"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unbounded rotated log remains: %v", err)
+	}
+	for _, bounded := range []string{path, path + ".1", path + ".2"} {
+		info, err := os.Stat(bounded)
+		if err != nil || info.Size() > 1024 {
+			t.Fatalf("rotated log %s size=%d err=%v", bounded, info.Size(), err)
+		}
+	}
+	if err := os.WriteFile(path, []byte("one\ntwo\nthree\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	if err := appRuntime.PrintServerLogs(context.Background(), &output, path, 2, false); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "two\nthree\n" {
+		t.Fatalf("tail = %q", output.String())
 	}
 }
 
@@ -113,6 +155,42 @@ func TestRecoveryCompletesBeforeAPIAndSchedulerStart(t *testing.T) {
 	close(releaseRecovery)
 	if err := <-result; err == nil || !errors.Is(err, schedulerFailure) {
 		t.Fatalf("service result = %v", err)
+	}
+}
+
+func TestServerShutdownDrainsAPIRequestsBeforeSchedulerStops(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	requestEntered := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	schedulerStopped := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- runAPIAndSchedulerWithDrain(parent, func(ctx context.Context, drained func() error) error {
+			close(requestEntered)
+			<-ctx.Done()
+			<-releaseRequest
+			return drained()
+		}, func(ctx context.Context) error {
+			<-ctx.Done()
+			close(schedulerStopped)
+			return nil
+		})
+	}()
+	<-requestEntered
+	cancel()
+	select {
+	case <-schedulerStopped:
+		t.Fatal("scheduler stopped before the entered API request drained")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseRequest)
+	select {
+	case <-schedulerStopped:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not stop after API requests drained")
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("graceful service shutdown: %v", err)
 	}
 }
 
