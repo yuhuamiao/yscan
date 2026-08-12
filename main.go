@@ -22,6 +22,7 @@ import (
 	"golandproject/yscan/internal/model"
 	"golandproject/yscan/internal/pipeline"
 	"golandproject/yscan/internal/report"
+	appRuntime "golandproject/yscan/internal/runtime"
 	"golandproject/yscan/internal/scan"
 	"golandproject/yscan/internal/schedule"
 	"golandproject/yscan/internal/storage"
@@ -43,6 +44,7 @@ type cliConfig struct {
 	Templates      string
 	DNSResolveMode string
 	DNSDenyCIDRs   []string
+	Home           string
 }
 
 func runTask(db *sql.DB, baseTask model.Scanner, taskType, target string) {
@@ -425,6 +427,13 @@ func parseCLIConfig(args []string) ([]string, cliConfig) {
 			}
 		case strings.HasPrefix(current, "--dns-deny-cidr="):
 			cfg.DNSDenyCIDRs = append(cfg.DNSDenyCIDRs, strings.TrimSpace(strings.TrimPrefix(current, "--dns-deny-cidr=")))
+		case current == "--home":
+			if i+1 < len(args) {
+				cfg.Home = strings.TrimSpace(args[i+1])
+				i++
+			}
+		case strings.HasPrefix(current, "--home="):
+			cfg.Home = strings.TrimSpace(strings.TrimPrefix(current, "--home="))
 		default:
 			filtered = append(filtered, args[i])
 		}
@@ -724,8 +733,41 @@ func runMainArgs(rawArgs []string) error {
 		printCLIUsage()
 		return nil
 	}
+	if isTopLevelVersion(args) {
+		fmt.Println("yscan development")
+		return nil
+	}
+	homeOverride := cfg.Home
+	if homeOverride == "" {
+		homeOverride = strings.TrimSpace(os.Getenv("YSCAN_HOME"))
+	}
+	paths, err := appRuntime.ResolveHome("", homeOverride)
+	if err != nil {
+		return err
+	}
+	overrides := appRuntime.ConfigOverrides{}
+	if cfg.Templates != "" {
+		overrides[appRuntime.ConfigNucleiTemplates] = cfg.Templates
+	}
+	runtimeConfig, err := appRuntime.LoadConfig(paths, overrides, os.LookupEnv)
+	if err != nil {
+		return err
+	}
+	if err := paths.Prepare(); err != nil {
+		return err
+	}
+	database, err := paths.SelectDatabase()
+	if err != nil {
+		return err
+	}
+	// T358 keeps the established root database layout until the locked T362
+	// initialization and T363 migration protocol can publish data/asm.db.
+	databasePath := database.Path
+	if database.Mode == appRuntime.DatabaseUninitialized {
+		databasePath = paths.LegacyDatabase
+	}
 
-	db, err := storage.InitDB()
+	db, err := storage.InitDBAt(databasePath)
 	if err != nil {
 		return err
 	}
@@ -743,10 +785,22 @@ func runMainArgs(rawArgs []string) error {
 
 	task := model.Scanner{Network: "tcp"}
 
-	task.NucleiTemplates = cfg.Templates
+	task.NucleiTemplates = runtimeConfig.NucleiTemplates
 	task.DNSResolveMode = cfg.DNSResolveMode
 	task.DNSDenyCIDRs = cfg.DNSDenyCIDRs
 	return runByArgs(args, task, db)
+}
+
+func isTopLevelVersion(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(args[0])) {
+	case "version", "--version":
+		return true
+	default:
+		return false
+	}
 }
 
 func isTopLevelHelp(args []string) bool {
@@ -817,11 +871,12 @@ func runQuickV2Scan(ctx context.Context, db *sql.DB, baseTask model.Scanner, tar
 }
 
 func printCLIUsage() {
-	fmt.Println("usage: yscan scan <internal-ip|cidr> [--vuln] [--port-spec <ports>]")
+	fmt.Println("usage: yscan [--home <dir>] scan <internal-ip|cidr> [--vuln] [--port-spec <ports>]")
 	fmt.Println("       yscan subnet <internal-cidr> [--vuln] [--port-spec <ports>]")
 	fmt.Println("       yscan schedule help")
 	fmt.Println("       yscan api [listen_addr] [--allow-cidr <cidr>]...")
 	fmt.Println("       yscan legacy-list|legacy-status|legacy-findings ...")
+	fmt.Println("       yscan version")
 }
 
 func runByArgs(args []string, task model.Scanner, db *sql.DB) error {

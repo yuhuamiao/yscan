@@ -37,6 +37,16 @@ func TestTopLevelHelpDoesNotInitializeDatabase(t *testing.T) {
 	}
 }
 
+func TestTopLevelVersionDoesNotInitializeHome(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "missing-home")
+	if err := runMainArgs([]string{"--home", home, "--version"}); err != nil {
+		t.Fatalf("run version: %v", err)
+	}
+	if _, err := os.Stat(home); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("version initialized home: %v", err)
+	}
+}
+
 func TestRunAPIAndSchedulerStopsAPIWhenSchedulerFails(t *testing.T) {
 	apiStarted := make(chan struct{})
 	apiStopped := make(chan struct{})
