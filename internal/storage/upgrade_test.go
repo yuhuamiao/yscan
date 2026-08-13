@@ -60,13 +60,20 @@ func TestUpgradeLegacyHomeFailureLeavesOriginalAndBackup(t *testing.T) {
 }
 
 func TestUpgradeLegacyHomeRejectsInterruptedTemporaryDatabase(t *testing.T) {
-	paths := prepareLegacyUpgradeFixture(t, "")
-	temporary := filepath.Join(paths.DataDir, ".asm.db.upgrade-interrupted")
-	if err := os.WriteFile(temporary, []byte("partial"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := UpgradeLegacyHome(HomeUpgradeOptions{Paths: paths}); err == nil || !strings.Contains(err.Error(), temporary) || !strings.Contains(err.Error(), "integrity_check") {
-		t.Fatalf("temporary recovery diagnostic = %v", err)
+	for _, name := range []string{".asm.db.upgrade-interrupted", ".asm.db.original-interrupted"} {
+		t.Run(name, func(t *testing.T) {
+			paths := prepareLegacyUpgradeFixture(t, "")
+			temporary := filepath.Join(paths.DataDir, name)
+			if err := os.WriteFile(temporary, []byte("partial"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if pending, err := HomeMigrationPending(paths); err != nil || !pending {
+				t.Fatalf("pending=%t err=%v", pending, err)
+			}
+			if _, err := UpgradeLegacyHome(HomeUpgradeOptions{Paths: paths}); err == nil || !strings.Contains(err.Error(), temporary) || !strings.Contains(err.Error(), "integrity_check") {
+				t.Fatalf("temporary recovery diagnostic = %v", err)
+			}
+		})
 	}
 }
 
@@ -106,6 +113,65 @@ func TestUpgradeLegacyHomeRejectsExplicitMergeIntoInitializedTarget(t *testing.T
 	_ = current.Close()
 	if migrated, err := UpgradeLegacyHome(HomeUpgradeOptions{Paths: newPaths, SourceHome: oldPaths.Home}); err == nil || migrated || !strings.Contains(err.Error(), "automatic merge") {
 		t.Fatalf("merge = %t, %v", migrated, err)
+	}
+}
+
+func TestUpgradeCurrentDatabaseCreatesBackupAndAdvancesSchema(t *testing.T) {
+	paths := prepareCurrentUpgradeFixture(t)
+	if managed, err := OpenManagedDatabase(ManagedDatabaseOptions{Paths: paths}); !errors.Is(err, ErrDatabaseUpgradeRequired) || managed != nil {
+		t.Fatalf("low schema opened before upgrade: managed=%#v err=%v", managed, err)
+	}
+	migrated, err := UpgradeLegacyHome(HomeUpgradeOptions{Paths: paths})
+	if err != nil || !migrated {
+		t.Fatalf("current database upgrade=%t err=%v", migrated, err)
+	}
+	managed, err := OpenManagedDatabase(ManagedDatabaseOptions{Paths: paths})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer managed.Close()
+	assertUpgradeMarker(t, managed.DB, "current-before-upgrade")
+	version, exists, err := readSchemaVersion(managed.DB)
+	if err != nil || !exists || version != CurrentSchemaVersion {
+		t.Fatalf("upgraded schema version=%d exists=%t err=%v", version, exists, err)
+	}
+
+	backups, err := filepath.Glob(filepath.Join(paths.DataDir, "backups", "asm-before-upgrade-*.db"))
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("current database backups=%v err=%v", backups, err)
+	}
+	backup, err := sql.Open("sqlite3", backups[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	assertUpgradeMarker(t, backup, "current-before-upgrade")
+	version, exists, err = readSchemaVersion(backup)
+	if err != nil || !exists || version != 0 {
+		t.Fatalf("backup schema version=%d exists=%t err=%v", version, exists, err)
+	}
+}
+
+func TestUpgradeCurrentDatabaseFailureKeepsOriginalAndReadableBackup(t *testing.T) {
+	paths := prepareCurrentUpgradeFixture(t)
+	want := errors.New("injected current schema upgrade failure")
+	migrated, err := UpgradeLegacyHome(HomeUpgradeOptions{Paths: paths, InitializeContent: func(*sql.DB) error { return want }})
+	if migrated || !errors.Is(err, want) {
+		t.Fatalf("current database upgrade=%t err=%v", migrated, err)
+	}
+	original, err := sql.Open("sqlite3", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer original.Close()
+	assertUpgradeMarker(t, original, "current-before-upgrade")
+	version, exists, err := readSchemaVersion(original)
+	if err != nil || !exists || version != 0 {
+		t.Fatalf("failed upgrade changed original version=%d exists=%t err=%v", version, exists, err)
+	}
+	backups, _ := filepath.Glob(filepath.Join(paths.DataDir, "backups", "asm-before-upgrade-*.db"))
+	if len(backups) != 1 || verifySQLiteIntegrity(backups[0]) != nil {
+		t.Fatalf("failed current upgrade backup missing or invalid: %v", backups)
 	}
 }
 
@@ -209,4 +275,40 @@ func prepareLegacyUpgradeFixture(t *testing.T, reportPath string) appRuntime.Hom
 		t.Fatal(err)
 	}
 	return paths
+}
+
+func prepareCurrentUpgradeFixture(t *testing.T) appRuntime.HomePaths {
+	t.Helper()
+	paths, err := appRuntime.ResolveHome(os.Args[0], t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	managed, err := OpenManagedDatabase(ManagedDatabaseOptions{Paths: paths})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := managed.DB.Exec(`CREATE TABLE upgrade_marker (value TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := managed.DB.Exec(`INSERT INTO upgrade_marker (value) VALUES ('current-before-upgrade')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := managed.DB.Exec(`UPDATE yscan_schema SET version = 0 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := managed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return paths
+}
+
+func assertUpgradeMarker(t *testing.T, db *sql.DB, expected string) {
+	t.Helper()
+	var actual string
+	if err := db.QueryRow(`SELECT value FROM upgrade_marker`).Scan(&actual); err != nil || actual != expected {
+		t.Fatalf("upgrade marker=%q err=%v", actual, err)
+	}
 }

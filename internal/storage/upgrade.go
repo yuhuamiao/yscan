@@ -26,11 +26,16 @@ type HomeUpgradeOptions struct {
 }
 
 func HomeMigrationPending(paths appRuntime.HomePaths) (bool, error) {
-	matches, err := filepath.Glob(filepath.Join(paths.DataDir, ".asm.db.upgrade-*"))
-	if err != nil {
-		return false, err
+	for _, pattern := range []string{".asm.db.upgrade-*", ".asm.db.original-*"} {
+		matches, err := filepath.Glob(filepath.Join(paths.DataDir, pattern))
+		if err != nil {
+			return false, err
+		}
+		if len(matches) > 0 {
+			return true, nil
+		}
 	}
-	return len(matches) > 0, nil
+	return false, nil
 }
 
 // UpgradeLegacyHome performs an offline migration. It never coordinates with
@@ -58,11 +63,25 @@ func UpgradeLegacyHome(options HomeUpgradeOptions) (bool, error) {
 	if explicitSource && current {
 		return false, fmt.Errorf("target yscan home already contains a database at %s; automatic merge from %s is not supported", options.Paths.Database, sourceHome)
 	}
+	replacingCurrent := false
 	if !explicitSource && current {
 		if sourceExists && filepath.Clean(sourcePath) != filepath.Clean(options.Paths.Database) {
 			return false, fmt.Errorf("both current and legacy databases exist: %s and %s; move one aside after making a backup", options.Paths.Database, sourcePath)
 		}
-		return false, nil
+		version, exists, err := databaseSchemaVersion(options.Paths.Database)
+		if err != nil {
+			return false, fmt.Errorf("inspect current database schema: %w", err)
+		}
+		if exists && version > CurrentSchemaVersion {
+			return false, fmt.Errorf("%w: database=%d binary=%d", ErrDatabaseTooNew, version, CurrentSchemaVersion)
+		}
+		if exists && version == CurrentSchemaVersion {
+			return false, nil
+		}
+		sourceHome = options.Paths.Home
+		sourcePath = options.Paths.Database
+		sourceExists = true
+		replacingCurrent = true
 	}
 	if !sourceExists {
 		if explicitSource {
@@ -102,13 +121,10 @@ func UpgradeLegacyHome(options HomeUpgradeOptions) (bool, error) {
 		keepWorking = false
 		return false, fmt.Errorf("verify upgraded database: %w", err)
 	}
-	if err := os.Rename(workingPath, options.Paths.Database); err != nil {
+	if err := publishOfflineDatabase(workingPath, options.Paths.Database, replacingCurrent, identifier); err != nil {
 		return false, fmt.Errorf("publish upgraded database: %w; working file: %s; backup: %s", err, workingPath, backupPath)
 	}
 	keepWorking = false
-	if err := syncStorageDirectory(options.Paths.DataDir); err != nil {
-		return false, err
-	}
 	if sameFilePath(sourcePath, options.Paths.LegacyDatabase) {
 		if err := os.Remove(sourcePath); err != nil {
 			_ = os.Remove(options.Paths.Database)
@@ -122,14 +138,60 @@ func UpgradeLegacyHome(options HomeUpgradeOptions) (bool, error) {
 }
 
 func rejectUpgradeTemporaryFiles(paths appRuntime.HomePaths) error {
-	matches, err := filepath.Glob(filepath.Join(paths.DataDir, ".asm.db.upgrade-*"))
+	for _, pattern := range []string{".asm.db.upgrade-*", ".asm.db.original-*"} {
+		matches, err := filepath.Glob(filepath.Join(paths.DataDir, pattern))
+		if err != nil {
+			return err
+		}
+		if len(matches) > 0 {
+			return fmt.Errorf("an interrupted offline upgrade left temporary database %s; keep data/backups, inspect the temporary database with PRAGMA integrity_check, then either restore it manually or remove it before retrying", matches[0])
+		}
+	}
+	return nil
+}
+
+func databaseSchemaVersion(path string) (int, bool, error) {
+	databaseURL := url.URL{Scheme: "file", Path: path}
+	db, err := sql.Open("sqlite3", databaseURL.String()+"?mode=ro&_busy_timeout=5000")
 	if err != nil {
-		return err
+		return 0, false, err
 	}
-	if len(matches) == 0 {
-		return nil
+	defer db.Close()
+	if err := db.Ping(); err != nil {
+		return 0, false, err
 	}
-	return fmt.Errorf("an interrupted offline upgrade left temporary database %s; keep data/backups, inspect the temporary database with PRAGMA integrity_check, then either restore it manually or remove it before retrying", matches[0])
+	return readSchemaVersion(db)
+}
+
+func publishOfflineDatabase(workingPath, targetPath string, replacingCurrent bool, identifier string) error {
+	if !replacingCurrent {
+		if err := os.Rename(workingPath, targetPath); err != nil {
+			return err
+		}
+		return syncStorageDirectory(filepath.Dir(targetPath))
+	}
+	retiredPath := filepath.Join(filepath.Dir(targetPath), ".asm.db.original-"+identifier)
+	if err := os.Rename(targetPath, retiredPath); err != nil {
+		return fmt.Errorf("retain current database before publish: %w", err)
+	}
+	restore := func(cause error) error {
+		_ = os.Remove(targetPath)
+		if err := os.Rename(retiredPath, targetPath); err != nil {
+			return fmt.Errorf("%v; restore current database from %s: %w", cause, retiredPath, err)
+		}
+		_ = syncStorageDirectory(filepath.Dir(targetPath))
+		return cause
+	}
+	if err := os.Rename(workingPath, targetPath); err != nil {
+		return restore(err)
+	}
+	if err := syncStorageDirectory(filepath.Dir(targetPath)); err != nil {
+		return restore(err)
+	}
+	if err := os.Remove(retiredPath); err != nil {
+		return restore(fmt.Errorf("retire replaced database %s: %w", retiredPath, err))
+	}
+	return nil
 }
 
 func sameFilePath(left, right string) bool {
