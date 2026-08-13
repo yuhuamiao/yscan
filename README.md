@@ -62,7 +62,13 @@ go build -o yscan .
 sudo /opt/yscan/yscan --home /opt/yscan upgrade --from-home /var/lib/yscan
 ```
 
-迁移会通过 SQLite 一致快照恢复可能存在的热 journal，并复制旧报告。若新 home 为空但当前工作目录发现旧 `asm.db`，程序会拒绝创建空库并打印对应迁移命令。
+如果数据库已经位于当前 home 的 `data/asm.db`，但 schema 版本低于当前二进制，直接执行：
+
+```bash
+./yscan upgrade
+```
+
+升级会先在 `data/backups/` 创建 SQLite 一致备份，再在隔离副本上迁移和校验；失败时正式数据库保持不变。迁移旧 home 时还会复制已有报告。若新 home 为空但当前工作目录发现旧 `asm.db`，程序会拒绝创建空库并打印对应迁移命令。
 
 ## 快速开始
 
@@ -143,7 +149,33 @@ Nuclei 可执行文件和模板不会打包进 `yscan`，需要由部署环境�
 ./yscan server
 ```
 
-监听地址、受信 CIDR、SQLite 等待时间和 Nuclei 路径可以写入同目录 `.env`。配置优先级为命令行参数、进程环境变量、`.env`、内置默认值；修改后重启服务生效。
+直接使用二进制时，也可以让 Server 在后台运行并通过同一命令管理：
+
+```bash
+./yscan server start
+./yscan server status
+./yscan server logs                 # 默认显示最近 100 行并持续跟随
+./yscan server logs --lines 200 --no-follow
+./yscan server restart
+./yscan server stop
+```
+
+`restart` 会读取本次命令行、当前环境变量和 `.env` 后应用新配置，因此临时传给上一次 `start` 的参数不会自动成为新的默认配置。它会先校验新参数；非法地址、CIDR、未知参数或已占用的新端口不会停止现有 Server。停服后新实例启动失败时，程序会尝试按 `server.state` 中保存的旧有效参数恢复原服务，并明确返回重启失败。
+
+监听地址、受信 CIDR、SQLite 等待时间、日志轮转和 Nuclei 路径可以写入同目录 `.env`：
+
+```dotenv
+YSCAN_LISTEN_ADDR=127.0.0.1:8080
+YSCAN_ALLOW_CIDRS=
+YSCAN_MAX_CONCURRENCY=2
+YSCAN_SQLITE_BUSY_TIMEOUT=5s
+YSCAN_LOG_MAX_BYTES=10485760
+YSCAN_LOG_MAX_FILES=3
+YSCAN_NUCLEI_BINARY=nuclei
+YSCAN_NUCLEI_TEMPLATES=
+```
+
+`YSCAN_ALLOW_CIDRS` 使用逗号分隔多个 CIDR。Nuclei 相对路径以 yscan home 为基准。配置优先级为命令行参数、进程环境变量、`.env`、内置默认值；修改后重启服务生效。未知或重复的 `YSCAN_*` 配置会使业务命令和 Server 启动失败，并报告对应行号；`status`、`stop`、`logs` 和 `uninstall` 仍可用于管理已有服务。
 
 当前调度执行的有效并发固定为 `1`。`.env` 中 `YSCAN_MAX_CONCURRENCY` 会作为后续并发能力的期望配置保存并显示，但在并发调度正式启用前不会提高实际并发，避免产生重叠扫描和旧观测覆盖。
 
@@ -213,6 +245,9 @@ Server 进程同时负责 Web、API 和定时任务调度。创建一个每天�
 | `report <task_id> <run_id> [--audit]` | 查看用户报告或审计报告 |
 | `asset <internal_ip>` | 查看资产及端点画像 |
 | `server [addr] [--allow-cidr <cidr>]...` | 前台启动 Server、API 和 Web 控制台 |
+| `server start\|stop\|restart\|status` | 后台启动、停止、重启或检查 Server |
+| `server logs [--lines <n>] [--no-follow]` | 查看并跟随轮转服务日志 |
+| `upgrade [--from-home <legacy_home>]` | 离线升级当前数据库或迁移旧 home |
 
 任务管理命令：
 
