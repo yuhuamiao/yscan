@@ -33,6 +33,7 @@ func TestOpenManagedDatabaseInitializesAtomicallyAndRejectsNewerSchema(t *testin
 	if managed.Path != paths.Database || managed.Mode != appRuntime.DatabaseCurrent || calls.Load() != 1 {
 		t.Fatalf("managed=%#v calls=%d", managed, calls.Load())
 	}
+	assertPrivateDatabaseMode(t, paths.Database)
 	for pragma, want := range map[string]string{"journal_mode": "delete", "foreign_keys": "1", "busy_timeout": "1379"} {
 		var got string
 		if err := managed.DB.QueryRow("PRAGMA " + pragma).Scan(&got); err != nil || strings.ToLower(got) != want {
@@ -48,6 +49,17 @@ func TestOpenManagedDatabaseInitializesAtomicallyAndRejectsNewerSchema(t *testin
 	_, err = OpenManagedDatabase(ManagedDatabaseOptions{Paths: paths})
 	if !errors.Is(err, ErrDatabaseTooNew) {
 		t.Fatalf("newer database error = %v", err)
+	}
+}
+
+func assertPrivateDatabaseMode(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0600 {
+		t.Fatalf("database mode = %04o, want 0600: %s", mode, path)
 	}
 }
 
@@ -106,4 +118,31 @@ func TestManagedLegacyDatabaseDoesNotCreateCurrentDatabase(t *testing.T) {
 	if _, err := os.Stat(paths.Database); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("legacy open created current database: %v", err)
 	}
+}
+
+func TestOpenManagedDatabaseNormalizesExistingDatabasePermissions(t *testing.T) {
+	home := t.TempDir()
+	paths, err := appRuntime.ResolveHome(os.Args[0], home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	managed, err := OpenManagedDatabase(ManagedDatabaseOptions{Paths: paths})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := managed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(paths.Database, 0644); err != nil {
+		t.Fatal(err)
+	}
+	managed, err = OpenManagedDatabase(ManagedDatabaseOptions{Paths: paths})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer managed.Close()
+	assertPrivateDatabaseMode(t, paths.Database)
 }

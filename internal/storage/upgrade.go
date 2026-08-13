@@ -76,6 +76,9 @@ func UpgradeLegacyHome(options HomeUpgradeOptions) (bool, error) {
 			return false, fmt.Errorf("%w: database=%d binary=%d", ErrDatabaseTooNew, version, CurrentSchemaVersion)
 		}
 		if exists && version == CurrentSchemaVersion {
+			if err := os.Chmod(options.Paths.Database, 0600); err != nil {
+				return false, fmt.Errorf("secure current database permissions: %w", err)
+			}
 			return false, nil
 		}
 		sourceHome = options.Paths.Home
@@ -416,9 +419,6 @@ func backupSQLiteDatabase(source, target string) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	if err := os.Remove(temporaryPath); err != nil {
-		return err
-	}
 	defer os.Remove(temporaryPath)
 
 	sourceURL := url.URL{Scheme: "file", Path: source}
@@ -479,6 +479,9 @@ func backupSQLiteDatabase(source, target string) error {
 	}
 	if err := destinationDB.Close(); err != nil {
 		return err
+	}
+	if err := os.Chmod(temporaryPath, 0600); err != nil {
+		return fmt.Errorf("secure SQLite backup: %w", err)
 	}
 	if err := syncRegularFile(temporaryPath); err != nil {
 		return err

@@ -79,9 +79,6 @@ func initializeManagedDatabase(options ManagedDatabaseOptions) (*ManagedDatabase
 	if err := temporary.Close(); err != nil {
 		return nil, err
 	}
-	if err := os.Remove(temporaryPath); err != nil {
-		return nil, err
-	}
 	defer os.Remove(temporaryPath)
 
 	db, err := InitDBAt(temporaryPath)
@@ -113,6 +110,9 @@ func initializeManagedDatabase(options ManagedDatabaseOptions) (*ManagedDatabase
 		return nil, err
 	}
 	closeDB = false
+	if err := os.Chmod(temporaryPath, 0600); err != nil {
+		return nil, fmt.Errorf("secure initialized database: %w", err)
+	}
 	if err := syncRegularFile(temporaryPath); err != nil {
 		return nil, err
 	}
@@ -160,6 +160,10 @@ func openManagedDatabase(selection appRuntime.DatabaseSelection, busyTimeout tim
 	} else if version < MinimumSchemaVersion || version < CurrentSchemaVersion {
 		_ = db.Close()
 		return nil, fmt.Errorf("%w: database=%d binary=%d", ErrDatabaseUpgradeRequired, version, CurrentSchemaVersion)
+	}
+	if err := os.Chmod(selection.Path, 0600); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("secure database permissions: %w", err)
 	}
 	return &ManagedDatabase{DB: db, Path: selection.Path, Mode: selection.Mode}, nil
 }

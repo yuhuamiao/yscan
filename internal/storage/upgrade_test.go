@@ -22,6 +22,7 @@ func TestUpgradeLegacyHomeCreatesReadableBackupAndMigrates(t *testing.T) {
 	if _, err := os.Stat(paths.LegacyDatabase); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("legacy database remains: %v", err)
 	}
+	assertPrivateDatabaseMode(t, paths.Database)
 	managed, err := OpenManagedDatabase(ManagedDatabaseOptions{Paths: paths})
 	if err != nil {
 		t.Fatal(err)
@@ -38,6 +39,7 @@ func TestUpgradeLegacyHomeCreatesReadableBackupAndMigrates(t *testing.T) {
 	if err := verifySQLiteIntegrity(backups[0]); err != nil {
 		t.Fatalf("backup is unreadable: %v", err)
 	}
+	assertPrivateDatabaseMode(t, backups[0])
 }
 
 func TestUpgradeLegacyHomeFailureLeavesOriginalAndBackup(t *testing.T) {
@@ -130,6 +132,7 @@ func TestUpgradeCurrentDatabaseCreatesBackupAndAdvancesSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer managed.Close()
+	assertPrivateDatabaseMode(t, paths.Database)
 	assertUpgradeMarker(t, managed.DB, "current-before-upgrade")
 	version, exists, err := readSchemaVersion(managed.DB)
 	if err != nil || !exists || version != CurrentSchemaVersion {
@@ -140,6 +143,7 @@ func TestUpgradeCurrentDatabaseCreatesBackupAndAdvancesSchema(t *testing.T) {
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("current database backups=%v err=%v", backups, err)
 	}
+	assertPrivateDatabaseMode(t, backups[0])
 	backup, err := sql.Open("sqlite3", backups[0])
 	if err != nil {
 		t.Fatal(err)
@@ -173,6 +177,21 @@ func TestUpgradeCurrentDatabaseFailureKeepsOriginalAndReadableBackup(t *testing.
 	if len(backups) != 1 || verifySQLiteIntegrity(backups[0]) != nil {
 		t.Fatalf("failed current upgrade backup missing or invalid: %v", backups)
 	}
+}
+
+func TestUpgradeCurrentDatabaseNoopNormalizesPermissions(t *testing.T) {
+	paths := prepareLegacyUpgradeFixture(t, "")
+	if migrated, err := UpgradeLegacyHome(HomeUpgradeOptions{Paths: paths}); err != nil || !migrated {
+		t.Fatalf("initial upgrade=%t err=%v", migrated, err)
+	}
+	if err := os.Chmod(paths.Database, 0644); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := UpgradeLegacyHome(HomeUpgradeOptions{Paths: paths})
+	if err != nil || migrated {
+		t.Fatalf("current-schema upgrade=%t err=%v", migrated, err)
+	}
+	assertPrivateDatabaseMode(t, paths.Database)
 }
 
 func TestUpgradeM10SchemaThroughLegacyAndCurrentDatabasePaths(t *testing.T) {

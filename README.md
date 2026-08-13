@@ -50,7 +50,7 @@ go build -o yscan .
 
 首次执行扫描、启动服务或管理指纹库时，程序会在二进制所在目录创建 `.env`、`data/`、`reports/`、`logs/` 和 `run/`。从其他工作目录调用同一个二进制，仍使用这套数据。
 
-从旧版升级时先停止所有 `yscan` 进程，再显式迁移旧目录。旧便携部署把原来存放 `asm.db` 的目录传给 `--from-home`：
+从旧版升级时先停止所有 `yscan` 进程，再显式迁移旧目录。升级命令必须使用日常运行 `yscan` 的同一个系统用户，避免数据库和备份产生不同属主。旧便携部署把原来存放 `asm.db` 的目录传给 `--from-home`：
 
 ```bash
 /opt/yscan/yscan --home /opt/yscan upgrade --from-home /path/to/old-yscan
@@ -59,8 +59,10 @@ go build -o yscan .
 旧 systemd 部署的数据通常位于 `/var/lib/yscan`：
 
 ```bash
-sudo /opt/yscan/yscan --home /opt/yscan upgrade --from-home /var/lib/yscan
+sudo -u yscan /opt/yscan/yscan --home /opt/yscan upgrade --from-home /var/lib/yscan
 ```
+
+执行前应确认 `yscan` 用户对旧目录具有读取权限；不要为了迁移把整个旧目录改成所有用户可读。
 
 如果数据库已经位于当前 home 的 `data/asm.db`，但 schema 版本低于当前二进制，直接执行：
 
@@ -177,7 +179,7 @@ YSCAN_NUCLEI_TEMPLATES=
 
 `YSCAN_ALLOW_CIDRS` 使用逗号分隔多个 CIDR。Nuclei 相对路径以 yscan home 为基准。配置优先级为命令行参数、进程环境变量、`.env`、内置默认值；修改后重启服务生效。未知或重复的 `YSCAN_*` 配置会使业务命令和 Server 启动失败，并报告对应行号；`status`、`stop`、`logs` 和 `uninstall` 仍可用于管理已有服务。
 
-当前调度执行的有效并发固定为 `1`。`.env` 中 `YSCAN_MAX_CONCURRENCY` 会作为后续并发能力的期望配置保存并显示，但在并发调度正式启用前不会提高实际并发，避免产生重叠扫描和旧观测覆盖。
+当前调度执行的有效并发固定为 `1`。`.env` 中 `YSCAN_MAX_CONCURRENCY` 目前只保存期望配置，在并发调度正式启用前不会提高实际并发，避免产生重叠扫描和旧观测覆盖。
 
 常用页面：
 
@@ -202,7 +204,9 @@ API 没有登录页面。监听非回环地址时，必须至少配置一个允�
 
 ## 定时扫描
 
-Server 进程同时负责 Web、API 和定时任务调度。创建一个每天凌晨 2 点执行的网段任务：
+Server 进程同时负责 Web、API 和定时任务调度，因此定时任务要求 Server 持续运行。关闭终端中的前台 Server 会停止调度；长期运行应使用 `server start` 或 systemd。通过 CLI、Web 或 API 创建的定时任务遵循相同规则。
+
+Server 停止期间不会执行定时任务。超过调度容忍窗口的轮次会记录为 `skipped_misfire`，重启后不会补跑；后续计划时间仍会正常执行。创建一个每天凌晨 2 点执行的网段任务：
 
 ```bash
 ./yscan schedule create \
@@ -341,7 +345,8 @@ curl -X POST http://127.0.0.1:8080/api/scan-tasks \
 安装到单目录 `/opt/yscan` 并安装 systemd unit：
 
 ```bash
-sudo useradd --system --home /opt/yscan --shell /usr/sbin/nologin yscan
+getent group yscan >/dev/null || sudo groupadd --system yscan
+id -u yscan >/dev/null 2>&1 || sudo useradd --system --gid yscan --home /opt/yscan --shell /usr/sbin/nologin yscan
 sudo make install
 sudo systemctl daemon-reload
 sudo systemctl enable --now yscan
