@@ -9,6 +9,7 @@ User=yscan
 Group=yscan
 WorkingDirectory=/opt/yscan
 EnvironmentFile=-/opt/yscan/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/opt/yscan/yscan server
 ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do /opt/yscan/yscan --home /opt/yscan server status >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
 Restart=on-failure

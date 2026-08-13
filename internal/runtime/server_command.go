@@ -411,7 +411,7 @@ func UninstallSystemd(paths HomePaths) error {
 }
 
 // CaptureProcessOutput routes Go-level stdout and stderr through the same
-// rotating writer as log.Printf. It is used only by the detached Server child.
+// rotating writer as log.Printf for foreground, managed and detached Servers.
 func CaptureProcessOutput(output io.Writer) (func() error, error) {
 	if output == nil {
 		return nil, errors.New("process log output is required")

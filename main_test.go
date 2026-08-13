@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -277,6 +278,23 @@ func TestBackgroundServerPreservesEffectiveConfigurationAndDynamicStatus(t *test
 		t.Fatalf(".env background inspection = %#v", inspection)
 	}
 	stablePID, stableHealthToken := inspection.State.PID, inspection.State.HealthToken
+	for name, arguments := range map[string][]string{
+		"invalid address": {"server", "restart", "not-an-address"},
+		"invalid CIDR":    {"server", "restart", "--allow-cidr", "not-a-cidr"},
+		"unknown option":  {"server", "restart", "--unknown"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			restart := exec.Command(binary, append([]string{"--home", home}, arguments...)...)
+			restart.Dir = home
+			if output, err := restart.CombinedOutput(); err == nil {
+				t.Fatalf("invalid restart succeeded:\n%s", output)
+			}
+			current := appRuntime.InspectServerHealth(paths)
+			if current.Status != appRuntime.ServerRunning || current.State == nil || current.State.PID != stablePID || current.State.HealthToken != stableHealthToken {
+				t.Fatalf("invalid restart changed healthy Server: %#v", current)
+			}
+		})
+	}
 	if err := os.WriteFile(paths.EnvFile, []byte("YSCAN_UNKNOWN_SETTING=broken\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -344,6 +362,118 @@ func TestBackgroundServerPreservesEffectiveConfigurationAndDynamicStatus(t *test
 	if strings.Contains(string(unit), "127.0.0.1:8080") || strings.Contains(string(unit), "curl") || !strings.Contains(string(unit), "server status") {
 		t.Fatalf("systemd health command is not dynamic:\n%s", unit)
 	}
+}
+
+func TestForegroundServerScansUseRotatingServiceLog(t *testing.T) {
+	home := t.TempDir()
+	binary := filepath.Join(home, "yscan")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build foreground Server binary: %v\n%s", err, output)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	_ = listener.Close()
+	command := exec.Command(binary, "--home", home, "--listen", address, "--log-max-bytes", "1024", "--log-max-files", "2", "server")
+	command.Dir = home
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	paths, err := appRuntime.ResolveHome(binary, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		stop := exec.Command(binary, "--home", home, "server", "stop", "--force")
+		stop.Dir = home
+		_ = stop.Run()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = command.Process.Kill()
+		}
+	})
+	waitForServerStatus(t, paths, appRuntime.ServerRunning, 20*time.Second)
+
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	for index := 0; index < 20; index++ {
+		request, err := http.NewRequest(http.MethodPost, "http://"+address+"/api/scan-tasks", strings.NewReader(`{"target":"127.0.0.1","scan_type":"ip","mode":"once","config":{"port_spec":"1"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var created struct {
+			Task model.ScanTask    `json:"task"`
+			Run  model.ScanTaskRun `json:"run"`
+		}
+		decodeErr := json.NewDecoder(response.Body).Decode(&created)
+		_ = response.Body.Close()
+		if decodeErr != nil || response.StatusCode != http.StatusCreated || created.Run.ID == 0 {
+			t.Fatalf("create scan %d status=%d response=%#v err=%v", index, response.StatusCode, created, decodeErr)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			runResponse, err := client.Get(fmt.Sprintf("http://%s/api/scan-tasks/%d/runs/%d", address, created.Task.ID, created.Run.ID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var run model.ScanTaskRun
+			decodeErr := json.NewDecoder(runResponse.Body).Decode(&run)
+			_ = runResponse.Body.Close()
+			if decodeErr != nil || runResponse.StatusCode != http.StatusOK {
+				t.Fatalf("read scan %d status=%d run=%#v err=%v", index, runResponse.StatusCode, run, decodeErr)
+			}
+			if run.Status == model.ScanTaskRunStatusSuccess {
+				break
+			}
+			if run.Status == model.ScanTaskRunStatusFailed || run.Status == model.ScanTaskRunStatusCanceled || time.Now().After(deadline) {
+				t.Fatalf("scan %d did not complete successfully: %#v", index, run)
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
+	stop := exec.Command(binary, "--home", home, "server", "stop")
+	stop.Dir = home
+	if output, err := stop.CombinedOutput(); err != nil {
+		t.Fatalf("stop foreground Server: %v\n%s", err, output)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("foreground Server exit: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("foreground Server did not exit")
+	}
+	serviceLog := filepath.Join(paths.LogsDir, "yscan.log")
+	for _, path := range []string{serviceLog, serviceLog + ".1", serviceLog + ".2"} {
+		content, err := os.ReadFile(path)
+		if err != nil || !strings.Contains(string(content), "scan task run") {
+			t.Fatalf("rotated foreground scan log %s content=%q err=%v", path, content, err)
+		}
+	}
+}
+
+func waitForServerStatus(t *testing.T, paths appRuntime.HomePaths, expected appRuntime.ServerStatus, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if appRuntime.InspectServerHealth(paths).Status == expected {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("Server did not reach %s: %#v", expected, appRuntime.InspectServerHealth(paths))
 }
 
 func testNonLoopbackIPv4(t *testing.T) string {

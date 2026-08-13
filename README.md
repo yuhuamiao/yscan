@@ -97,6 +97,19 @@ sudo /opt/yscan/yscan --home /opt/yscan upgrade --from-home /var/lib/yscan
 go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 ```
 
+使用 systemd 时，服务以 `yscan` 用户运行，不能依赖管理员个人目录下的 `~/go/bin`。应将二进制安装到系统路径，或在 `/opt/yscan/.env` 中配置运行用户可访问的绝对路径：
+
+```bash
+sudo install -m 0755 "$(go env GOPATH)/bin/nuclei" /usr/local/bin/nuclei
+sudo -u yscan /usr/local/bin/nuclei -version
+
+# 也可以显式配置自带工具和模板目录
+YSCAN_NUCLEI_BINARY=/opt/yscan/tools/nuclei
+YSCAN_NUCLEI_TEMPLATES=/opt/yscan/nuclei-templates
+```
+
+绝对路径方案需确保 `yscan` 用户对 Nuclei 有执行权限、对模板目录有读取权限；启服前应以 `yscan` 用户执行一次版本和模板读取检查。
+
 指定模板目录并启用验证：
 
 ```bash

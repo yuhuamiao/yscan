@@ -787,7 +787,15 @@ func (executor logicalScanTaskRunExecutor) Execute(ctx context.Context, run mode
 	}
 }
 
-func executeLogicalScanTaskRun(ctx context.Context, db *sql.DB, baseTask model.Scanner, run model.ScanTaskRun) error {
+func executeLogicalScanTaskRun(ctx context.Context, db *sql.DB, baseTask model.Scanner, run model.ScanTaskRun) (returnErr error) {
+	log.Printf("scan task run %d started (%s %s)", run.ID, run.ScanType, run.Target)
+	defer func() {
+		if returnErr != nil {
+			log.Printf("scan task run %d finished with error: %v", run.ID, returnErr)
+			return
+		}
+		log.Printf("scan task run %d finished", run.ID)
+	}()
 	runTimeout := 30 * time.Minute
 	if run.ScanType == model.ScanTypeIP {
 		// The discovery budget is derived from scanner concurrency and the
@@ -985,16 +993,16 @@ func runMainArgs(rawArgs []string) (returnErr error) {
 			return err
 		}
 		defer serviceLog.Close()
-		if backgroundChild {
-			restoreOutput, captureErr := appRuntime.CaptureProcessOutput(serviceLog)
-			if captureErr != nil {
-				return captureErr
-			}
-			defer restoreOutput()
-			log.SetOutput(serviceLog)
-		} else {
-			log.SetOutput(io.MultiWriter(os.Stderr, serviceLog))
+		processOutput := io.Writer(serviceLog)
+		if !backgroundChild {
+			processOutput = io.MultiWriter(os.Stderr, serviceLog)
 		}
+		restoreOutput, captureErr := appRuntime.CaptureProcessOutput(processOutput)
+		if captureErr != nil {
+			return captureErr
+		}
+		defer restoreOutput()
+		log.SetOutput(processOutput)
 		defer log.SetOutput(os.Stderr)
 	}
 	migrationPending, err := storage.HomeMigrationPending(paths)
@@ -1127,6 +1135,9 @@ func handleServerManagementCommand(paths appRuntime.HomePaths, args []string, co
 	case "--background", "start":
 		return true, appRuntime.StartBackgroundServer(paths, effectiveBackgroundArguments(config, cli), args[1:], 2*time.Minute)
 	case "restart":
+		if _, _, err := validateServerStartup(append([]string{"server"}, args[1:]...), config); err != nil {
+			return true, err
+		}
 		if err := appRuntime.StopServer(paths, 30*time.Second, false); err != nil {
 			return true, err
 		}
@@ -1322,20 +1333,30 @@ type preparedServerStartup struct {
 	policy   api.AccessPolicy
 }
 
-func prepareServerStartup(args []string, runtimeConfig appRuntime.Config) (*preparedServerStartup, error) {
+func validateServerStartup(args []string, runtimeConfig appRuntime.Config) (string, api.AccessPolicy, error) {
 	addr := runtimeConfig.ListenAddress
 	policy := api.AccessPolicy{TrustedCIDRs: append([]string(nil), runtimeConfig.AllowCIDRs...)}
-	if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
+	index := 1
+	if len(args) >= 2 && strings.TrimSpace(args[1]) != "" && !strings.HasPrefix(strings.TrimSpace(args[1]), "--") {
 		addr = strings.TrimSpace(args[1])
+		index = 2
 	}
-	for index := 2; index < len(args); index++ {
+	for ; index < len(args); index++ {
 		if args[index] != "--allow-cidr" || index+1 >= len(args) {
-			return nil, errors.New("usage: yscan server [listen_addr] [--allow-cidr <cidr>]...")
+			return "", api.AccessPolicy{}, errors.New("usage: yscan server [listen_addr] [--allow-cidr <cidr>]...")
 		}
 		policy.TrustedCIDRs = append(policy.TrustedCIDRs, strings.TrimSpace(args[index+1]))
 		index++
 	}
 	if err := policy.Validate(addr); err != nil {
+		return "", api.AccessPolicy{}, err
+	}
+	return addr, policy, nil
+}
+
+func prepareServerStartup(args []string, runtimeConfig appRuntime.Config) (*preparedServerStartup, error) {
+	addr, policy, err := validateServerStartup(args, runtimeConfig)
+	if err != nil {
 		return nil, err
 	}
 	listener, err := net.Listen("tcp", addr)
