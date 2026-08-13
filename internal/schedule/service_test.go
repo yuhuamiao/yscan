@@ -57,6 +57,34 @@ func TestTaskServiceAppliesServerNucleiTemplateDefault(t *testing.T) {
 	}
 }
 
+func TestTaskServiceUpdateKeepsFrozenNucleiTemplatesAcrossDefaultChange(t *testing.T) {
+	db := openRunnerTestDB(t)
+	service := NewTaskService(db, nil).WithDefaultNucleiTemplates("/opt/yscan/templates-a")
+	created, _, err := service.Create(context.Background(), model.ScanTask{
+		Target: "127.0.0.1", ScanType: model.ScanTypeIP, Mode: model.ScanTaskModeScheduled,
+		Cron: "0 2 * * *", Timezone: "UTC", Config: model.ScanTaskConfig{VulnerabilityOn: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.WithDefaultNucleiTemplates("/opt/yscan/templates-b")
+	updated, err := service.Update(context.Background(), model.ScanTask{
+		ID: created.ID, Target: created.Target, ScanType: created.ScanType, Mode: created.Mode,
+		Cron: created.Cron, Timezone: created.Timezone, Status: created.Status,
+		Config: model.ScanTaskConfig{VulnerabilityOn: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Config.NucleiTemplates != "/opt/yscan/templates-a" || updated.ConfigHash != created.ConfigHash {
+		t.Fatalf("frozen templates changed across Server defaults: before=%#v after=%#v", created, updated)
+	}
+	run, launch, err := service.RunNow(context.Background(), created.ID)
+	if err != nil || !launch || run.Config.NucleiTemplates != "/opt/yscan/templates-a" || run.ConfigHash != created.ConfigHash {
+		t.Fatalf("manual run lost frozen templates: run=%#v launch=%t err=%v", run, launch, err)
+	}
+}
+
 func TestTaskServiceCreatesScheduledTaskWithoutInitialRun(t *testing.T) {
 	db := openRunnerTestDB(t)
 	service := NewTaskService(db, ClockFunc(func() time.Time { return time.Date(2026, time.July, 24, 2, 0, 0, 0, time.UTC) }))

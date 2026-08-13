@@ -169,6 +169,53 @@ func TestLoadConfigPrecedence(t *testing.T) {
 	}
 }
 
+func TestLoadConfigFreezesLegacyNucleiTemplatesEnvironment(t *testing.T) {
+	home := t.TempDir()
+	paths, err := ResolveHome(filepath.Join(home, "yscan"), home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	config, err := LoadConfig(paths, nil, func(key string) (string, bool) {
+		if key == LegacyNucleiTemplatesEnvironment {
+			return "legacy-templates", true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.NucleiTemplates != filepath.Join(home, "legacy-templates") {
+		t.Fatalf("legacy templates were not frozen relative to home: %q", config.NucleiTemplates)
+	}
+
+	config, err = LoadConfig(paths, ConfigOverrides{ConfigNucleiTemplates: "configured-templates"}, func(key string) (string, bool) {
+		if key == LegacyNucleiTemplatesEnvironment {
+			return "legacy-templates", true
+		}
+		return "", false
+	})
+	if err != nil || config.NucleiTemplates != filepath.Join(home, "configured-templates") {
+		t.Fatalf("legacy environment overrode configured templates: config=%#v err=%v", config, err)
+	}
+
+	config, err = LoadConfig(paths, nil, func(key string) (string, bool) {
+		switch key {
+		case ConfigNucleiTemplates:
+			return "", true
+		case LegacyNucleiTemplatesEnvironment:
+			return "legacy-templates", true
+		default:
+			return "", false
+		}
+	})
+	if err != nil || config.NucleiTemplates != "" {
+		t.Fatalf("explicit empty new environment did not disable legacy input: config=%#v err=%v", config, err)
+	}
+}
+
 func TestLoadConfigReportsUnknownAndDuplicateKeys(t *testing.T) {
 	for _, test := range []struct {
 		name    string

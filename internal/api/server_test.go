@@ -571,9 +571,9 @@ func TestScanTaskCreateResponseKeepsFullPortRangeCompact(t *testing.T) {
 	}
 }
 
-func TestScanTaskAPIUpdateAndRunNowKeepServerNucleiDefaults(t *testing.T) {
+func TestScanTaskAPIUpdateAndRunNowKeepFrozenNucleiDefaults(t *testing.T) {
 	db := openScanTaskAPIDB(t)
-	const defaultTemplates = "/opt/yscan/nuclei-templates"
+	const defaultTemplates = "/opt/yscan/templates-a"
 	service := schedule.NewTaskService(db, schedule.ClockFunc(func() time.Time {
 		return time.Date(2026, time.August, 13, 9, 0, 0, 0, time.UTC)
 	})).WithDefaultNucleiTemplates(defaultTemplates)
@@ -598,6 +598,7 @@ func TestScanTaskAPIUpdateAndRunNowKeepServerNucleiDefaults(t *testing.T) {
 	if created.Task.Config.NucleiTemplates != defaultTemplates || created.Task.ConfigHash == "" {
 		t.Fatalf("created task did not freeze Server defaults: %#v", created.Task)
 	}
+	service.WithDefaultNucleiTemplates("/opt/yscan/templates-b")
 
 	taskPath := "/api/scan-tasks/" + strconv.FormatInt(created.Task.ID, 10)
 	updatedResponse := httptest.NewRecorder()

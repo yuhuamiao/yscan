@@ -270,12 +270,32 @@ func TestBackgroundServerPreservesEffectiveConfigurationAndDynamicStatus(t *test
 	}
 	start = exec.Command(binary, "--home", home, "server", "start")
 	start.Dir = home
+	start.Env = append(os.Environ(), "NUCLEI_TEMPLATES=legacy-templates")
 	if output, err := start.CombinedOutput(); err != nil {
 		t.Fatalf("start from .env: %v\n%s", err, output)
 	}
 	inspection = appRuntime.InspectServerHealth(paths)
 	if inspection.Status != appRuntime.ServerRunning || inspection.State == nil || inspection.State.ListenAddress != envAddress {
 		t.Fatalf(".env background inspection = %#v", inspection)
+	}
+	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{Proxy: nil}}
+	request, err := http.NewRequest(http.MethodPost, "http://"+envAddress+"/api/scan-tasks", strings.NewReader(`{"target":"127.0.0.1","scan_type":"ip","mode":"scheduled","cron":"0 2 * * *","timezone":"UTC","config":{"port_spec":"1","vulnerability_on":true}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	createdResponse, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		Task model.ScanTask `json:"task"`
+	}
+	decodeErr := json.NewDecoder(createdResponse.Body).Decode(&created)
+	_ = createdResponse.Body.Close()
+	wantLegacyTemplates := filepath.Join(home, "legacy-templates")
+	if decodeErr != nil || createdResponse.StatusCode != http.StatusCreated || created.Task.Config.NucleiTemplates != wantLegacyTemplates {
+		t.Fatalf("legacy templates were not frozen by real Server: status=%d task=%#v err=%v", createdResponse.StatusCode, created.Task, decodeErr)
 	}
 	stablePID, stableHealthToken := inspection.State.PID, inspection.State.HealthToken
 	for name, arguments := range map[string][]string{

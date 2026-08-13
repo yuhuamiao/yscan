@@ -417,7 +417,7 @@ func warnIfNucleiMissing() {
 func warnIfNucleiTemplatesMissing(templatesPath string) {
 	if resolved, err := vuln.ResolveNucleiTemplatesPath(templatesPath); err != nil {
 		log.Printf("[WARN] %v", err)
-		log.Print("[WARN] 可通过 --templates <dir> 或 NUCLEI_TEMPLATES 环境变量指定模板目录。")
+		log.Print("[WARN] 可通过 --templates <dir> 或 YSCAN_NUCLEI_TEMPLATES 配置模板目录。")
 	} else {
 		log.Printf("[INFO] nuclei templates: %s", resolved)
 	}

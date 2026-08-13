@@ -381,17 +381,7 @@ func ResolveNucleiTemplatesPath(input string) (string, error) {
 	if p := strings.TrimSpace(input); p != "" {
 		return validateNucleiTemplatesPath(p)
 	}
-
-	for _, p := range nucleiTemplatesFallbackPaths() {
-		if strings.TrimSpace(p) == "" {
-			continue
-		}
-		if resolved, err := validateNucleiTemplatesPath(p); err == nil {
-			return resolved, nil
-		}
-	}
-
-	return "", fmt.Errorf("%w: specify --templates <path>", ErrTemplateDirectoryMissing)
+	return "", fmt.Errorf("%w: configure YSCAN_NUCLEI_TEMPLATES or --templates <path>", ErrTemplateDirectoryMissing)
 }
 
 func nucleiBinaryNames() []string {
@@ -399,31 +389,6 @@ func nucleiBinaryNames() []string {
 		return []string{"nuclei.exe", "nuclei"}
 	}
 	return []string{"nuclei"}
-}
-
-func nucleiTemplatesFallbackPaths() []string {
-	var out []string
-
-	if env := strings.TrimSpace(os.Getenv("NUCLEI_TEMPLATES")); env != "" {
-		out = append(out, env)
-	}
-
-	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
-		out = append(out,
-			filepath.Join(home, "nuclei-templates"),
-			filepath.Join(home, ".local", "nuclei-templates"),
-			filepath.Join(home, ".config", "nuclei", "templates"),
-		)
-	}
-
-	if cwd, err := os.Getwd(); err == nil && strings.TrimSpace(cwd) != "" {
-		out = append(out,
-			filepath.Join(cwd, "nuclei-templates"),
-			filepath.Join(cwd, "templates", "nuclei"),
-		)
-	}
-
-	return out
 }
 
 func validateNucleiTemplatesPath(input string) (string, error) {

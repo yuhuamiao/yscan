@@ -99,12 +99,20 @@ func (service *TaskService) Update(ctx context.Context, task model.ScanTask) (mo
 	if service.DB == nil {
 		return model.ScanTask{}, errors.New("scan task service database is required")
 	}
+	current, err := storage.GetScanTask(service.DB, task.ID)
+	if err != nil {
+		return model.ScanTask{}, err
+	}
 	normalizedTarget, err := NormalizeInternalScanTarget(task.ScanType, task.Target)
 	if err != nil {
 		return model.ScanTask{}, err
 	}
 	task.Target = normalizedTarget
-	service.applyConfigDefaults(&task.Config)
+	if strings.TrimSpace(task.Config.NucleiTemplates) == "" && strings.TrimSpace(current.Config.NucleiTemplates) != "" {
+		task.Config.NucleiTemplates = current.Config.NucleiTemplates
+	} else {
+		service.applyConfigDefaults(&task.Config)
+	}
 	ports, err := scan.ParsePortSpec(task.Config.PortSpec)
 	if err != nil {
 		return model.ScanTask{}, fmt.Errorf("invalid port_spec: %w", err)

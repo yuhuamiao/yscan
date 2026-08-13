@@ -117,7 +117,7 @@ YSCAN_NUCLEI_TEMPLATES=/opt/yscan/nuclei-templates
 ./yscan --templates /path/to/nuclei-templates subnet 192.168.10.0/24 --vuln
 ```
 
-模板目录也可以通过 `NUCLEI_TEMPLATES` 环境变量指定。未显式指定时，程序会检查用户目录和当前目录中的常见模板路径。
+模板目录也可以通过 `YSCAN_NUCLEI_TEMPLATES` 环境变量或同目录 `.env` 指定。旧的 `NUCLEI_TEMPLATES` 仅作为启动时兼容输入：Server 会立即将它解析成固定路径并冻结到任务配置，扫描执行阶段不会再次读取该变量。未配置模板目录时，漏洞验证会明确报告模板目录缺失，不会从当前工作目录或用户目录隐式选择模板。
 
 `yscan` 不会对每个端口执行整套模板。它会先根据服务、产品和 CPE 选择候选模板，再应用只读策略和审核清单。Nuclei 进程默认禁用交互和重定向，限制为每秒 25 个请求、5 个并发，并排除 `intrusive`、`dos`、`auth` 标签。
 

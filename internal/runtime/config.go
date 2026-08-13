@@ -14,6 +14,8 @@ import (
 
 const ConfigProtocolVersion = 1
 
+const LegacyNucleiTemplatesEnvironment = "NUCLEI_TEMPLATES"
+
 const (
 	ConfigListenAddress     = "YSCAN_LISTEN_ADDR"
 	ConfigAllowCIDRs        = "YSCAN_ALLOW_CIDRS"
@@ -60,9 +62,17 @@ func LoadConfig(paths HomePaths, overrides ConfigOverrides, lookupEnv func(strin
 	if lookupEnv == nil {
 		lookupEnv = os.LookupEnv
 	}
+	_, configuredTemplatesInEnvironment := lookupEnv(ConfigNucleiTemplates)
 	for key := range values {
 		if value, ok := lookupEnv(key); ok {
 			values[key] = strings.TrimSpace(value)
+		}
+	}
+	_, configuredTemplatesInOverrides := overrides[ConfigNucleiTemplates]
+	configuredTemplatesInFile := strings.TrimSpace(fileValues[ConfigNucleiTemplates]) != ""
+	if !configuredTemplatesInEnvironment && !configuredTemplatesInOverrides && !configuredTemplatesInFile {
+		if value, ok := lookupEnv(LegacyNucleiTemplatesEnvironment); ok {
+			values[ConfigNucleiTemplates] = strings.TrimSpace(value)
 		}
 	}
 	for key, value := range overrides {
