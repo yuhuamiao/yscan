@@ -298,6 +298,28 @@ func TestBackgroundServerPreservesEffectiveConfigurationAndDynamicStatus(t *test
 		t.Fatalf("legacy templates were not frozen by real Server: status=%d task=%#v err=%v", createdResponse.StatusCode, created.Task, decodeErr)
 	}
 	stablePID, stableHealthToken := inspection.State.PID, inspection.State.HealthToken
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	occupiedAddress := occupied.Addr().String()
+	restart := exec.Command(binary, "--home", home, "server", "restart", occupiedAddress)
+	restart.Dir = home
+	if output, err := restart.CombinedOutput(); err == nil || !strings.Contains(string(output), "address already in use") {
+		_ = occupied.Close()
+		t.Fatalf("restart to occupied address: %v\n%s", err, output)
+	}
+	if current := appRuntime.InspectServerHealth(paths); current.Status != appRuntime.ServerRunning || current.State == nil || current.State.PID != stablePID || current.State.HealthToken != stableHealthToken {
+		_ = occupied.Close()
+		t.Fatalf("occupied restart changed healthy Server: %#v", current)
+	}
+	response, err := client.Get("http://" + envAddress + "/api/healthz")
+	if err != nil || response.StatusCode != http.StatusOK {
+		_ = occupied.Close()
+		t.Fatalf("API failed after occupied restart: status=%v err=%v", response, err)
+	}
+	_ = response.Body.Close()
+	_ = occupied.Close()
 	for name, arguments := range map[string][]string{
 		"invalid address": {"server", "restart", "not-an-address"},
 		"invalid CIDR":    {"server", "restart", "--allow-cidr", "not-a-cidr"},
@@ -318,7 +340,7 @@ func TestBackgroundServerPreservesEffectiveConfigurationAndDynamicStatus(t *test
 	if err := os.WriteFile(paths.EnvFile, []byte("YSCAN_UNKNOWN_SETTING=broken\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	restart := exec.Command(binary, "--home", home, "server", "restart")
+	restart = exec.Command(binary, "--home", home, "server", "restart")
 	restart.Dir = home
 	if output, err := restart.CombinedOutput(); err == nil || !strings.Contains(string(output), "unknown configuration key") {
 		t.Fatalf("restart with invalid configuration: %v\n%s", err, output)
@@ -381,6 +403,43 @@ func TestBackgroundServerPreservesEffectiveConfigurationAndDynamicStatus(t *test
 	}
 	if strings.Contains(string(unit), "127.0.0.1:8080") || strings.Contains(string(unit), "curl") || !strings.Contains(string(unit), "server status") {
 		t.Fatalf("systemd health command is not dynamic:\n%s", unit)
+	}
+}
+
+func TestRestartBackgroundServerRestoresPreviousListenerAfterStartFailure(t *testing.T) {
+	paths, err := appRuntime.ResolveHome(os.Args[0], t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	session, err := appRuntime.AcquireServerSession(paths, "127.0.0.1:18080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.MarkRunning(); err != nil {
+		t.Fatal(err)
+	}
+	// StopServer requires a process identity created by yscan, so this focused
+	// recovery test exercises the post-stop start sequence directly.
+	_ = session.Close()
+	calls := 0
+	start := func(arguments []string) error {
+		calls++
+		if calls == 1 {
+			return errors.New("injected new listener failure")
+		}
+		if len(arguments) != 1 || arguments[0] != "127.0.0.1:18080" {
+			t.Fatalf("recovery arguments=%v", arguments)
+		}
+		return nil
+	}
+	// A stopped state makes StopServer a no-op and leaves the start/recovery
+	// behavior deterministic without sending a signal to the test process.
+	err = restartBackgroundServer(paths, []string{"127.0.0.1:19090"}, "127.0.0.1:18080", start)
+	if err == nil || !strings.Contains(err.Error(), "was restored") || calls != 2 {
+		t.Fatalf("restart recovery calls=%d err=%v", calls, err)
 	}
 }
 

@@ -1135,16 +1135,55 @@ func handleServerManagementCommand(paths appRuntime.HomePaths, args []string, co
 	case "--background", "start":
 		return true, appRuntime.StartBackgroundServer(paths, effectiveBackgroundArguments(config, cli), args[1:], 2*time.Minute)
 	case "restart":
-		if _, _, err := validateServerStartup(append([]string{"server"}, args[1:]...), config); err != nil {
+		desiredAddress, _, err := validateServerStartup(append([]string{"server"}, args[1:]...), config)
+		if err != nil {
 			return true, err
 		}
-		if err := appRuntime.StopServer(paths, 30*time.Second, false); err != nil {
+		inspection := appRuntime.InspectServerHealth(paths)
+		if inspection.Status == appRuntime.ServerRunning && inspection.State != nil && !sameServerListenAddress(inspection.State.ListenAddress, desiredAddress) {
+			probe, err := net.Listen("tcp", desiredAddress)
+			if err != nil {
+				return true, fmt.Errorf("validate restart listen address %s: %w", desiredAddress, err)
+			}
+			if err := probe.Close(); err != nil {
+				return true, fmt.Errorf("release restart listen address %s: %w", desiredAddress, err)
+			}
+		}
+		oldAddress := ""
+		if inspection.Status == appRuntime.ServerRunning && inspection.State != nil {
+			oldAddress = inspection.State.ListenAddress
+		}
+		start := func(serverArguments []string) error {
+			return appRuntime.StartBackgroundServer(paths, effectiveBackgroundArguments(config, cli), serverArguments, 2*time.Minute)
+		}
+		if err := restartBackgroundServer(paths, args[1:], oldAddress, start); err != nil {
 			return true, err
 		}
-		return true, appRuntime.StartBackgroundServer(paths, effectiveBackgroundArguments(config, cli), args[1:], 2*time.Minute)
+		return true, nil
 	default:
 		return false, nil
 	}
+}
+
+func sameServerListenAddress(left, right string) bool {
+	return strings.EqualFold(strings.TrimSpace(left), strings.TrimSpace(right))
+}
+
+func restartBackgroundServer(paths appRuntime.HomePaths, serverArguments []string, oldAddress string, start func([]string) error) error {
+	if err := appRuntime.StopServer(paths, 30*time.Second, false); err != nil {
+		return err
+	}
+	if err := start(serverArguments); err != nil {
+		if strings.TrimSpace(oldAddress) == "" {
+			return err
+		}
+		recoveryErr := start([]string{oldAddress})
+		if recoveryErr != nil {
+			return fmt.Errorf("restart failed: %v; restoring previous listener %s also failed: %w", err, oldAddress, recoveryErr)
+		}
+		return fmt.Errorf("restart failed: %w; previous listener %s was restored", err, oldAddress)
+	}
+	return nil
 }
 
 func handleServerControlCommand(paths appRuntime.HomePaths, args []string) (bool, error) {
