@@ -175,6 +175,53 @@ func TestUpgradeCurrentDatabaseFailureKeepsOriginalAndReadableBackup(t *testing.
 	}
 }
 
+func TestUpgradeM10SchemaThroughLegacyAndCurrentDatabasePaths(t *testing.T) {
+	for _, location := range []string{"legacy-root", "current-data"} {
+		t.Run(location, func(t *testing.T) {
+			paths := prepareM10UpgradeFixture(t, location)
+			if location == "current-data" {
+				if managed, err := OpenManagedDatabase(ManagedDatabaseOptions{Paths: paths}); !errors.Is(err, ErrDatabaseUpgradeRequired) || managed != nil {
+					t.Fatalf("M10 current database opened before upgrade: managed=%#v err=%v", managed, err)
+				}
+			}
+
+			migrated, err := UpgradeLegacyHome(HomeUpgradeOptions{Paths: paths})
+			if err != nil || !migrated {
+				t.Fatalf("M10 %s upgrade=%t err=%v", location, migrated, err)
+			}
+			managed, err := OpenManagedDatabase(ManagedDatabaseOptions{Paths: paths})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer managed.Close()
+			assertM10UpgradeResult(t, managed.DB)
+
+			backups, err := filepath.Glob(filepath.Join(paths.DataDir, "backups", "asm-before-upgrade-*.db"))
+			if err != nil || len(backups) != 1 {
+				t.Fatalf("M10 %s backups=%v err=%v", location, backups, err)
+			}
+			backup, err := sql.Open("sqlite3", backups[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer backup.Close()
+			if err := verifySQLiteIntegrity(backups[0]); err != nil {
+				t.Fatalf("M10 backup integrity: %v", err)
+			}
+			if version, exists, err := readSchemaVersion(backup); err != nil || exists || version != 0 {
+				t.Fatalf("M10 backup schema version=%d exists=%t err=%v", version, exists, err)
+			}
+			if hasTrigger, err := sqliteTableHasColumn(backup, "scan_task_runs", "trigger"); err != nil || hasTrigger {
+				t.Fatalf("M10 backup unexpectedly has trigger column=%t err=%v", hasTrigger, err)
+			}
+			var legacyPorts int
+			if err := backup.QueryRow(`SELECT COUNT(*) FROM scan_task_run_ports WHERE scan_task_run_id = 1 AND ip = '127.0.0.1' AND port = 22 AND banner = 'SSH-2.0-legacy'`).Scan(&legacyPorts); err != nil || legacyPorts != 1 {
+				t.Fatalf("M10 backup port count=%d err=%v", legacyPorts, err)
+			}
+		})
+	}
+}
+
 func TestUpgradeLegacyHomeRejectsUnsafeReportPaths(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -303,6 +350,77 @@ func prepareCurrentUpgradeFixture(t *testing.T) appRuntime.HomePaths {
 		t.Fatal(err)
 	}
 	return paths
+}
+
+func prepareM10UpgradeFixture(t *testing.T, location string) appRuntime.HomePaths {
+	t.Helper()
+	paths, err := appRuntime.ResolveHome(os.Args[0], t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	schema, err := os.ReadFile(filepath.Join("..", "workflow", "testdata", "t293", "m10-legacy.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	databasePath := paths.LegacyDatabase
+	if location == "current-data" {
+		databasePath = paths.Database
+	}
+	legacy, err := sql.Open("sqlite3", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(string(schema)); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("create M10 fixture: %v", err)
+	}
+	if _, err := legacy.Exec(`UPDATE scan_task_runs SET report_path = 'reports/run.md' WHERE id = 1`); err != nil {
+		_ = legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(paths.ReportsDir, "run.md"), []byte("legacy user report"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(paths.ReportsDir, "run-audit.md"), []byte("legacy audit report"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return paths
+}
+
+func assertM10UpgradeResult(t *testing.T, db *sql.DB) {
+	t.Helper()
+	version, exists, err := readSchemaVersion(db)
+	if err != nil || !exists || version != CurrentSchemaVersion {
+		t.Fatalf("upgraded M10 schema version=%d exists=%t err=%v", version, exists, err)
+	}
+	for _, column := range []string{"trigger", "stage", "progress", "audit_report_path", "snapshot_written_at"} {
+		exists, err := sqliteTableHasColumn(db, "scan_task_runs", column)
+		if err != nil || !exists {
+			t.Fatalf("upgraded M10 scan_task_runs.%s exists=%t err=%v", column, exists, err)
+		}
+	}
+	var target, configHash string
+	if err := db.QueryRow(`SELECT target, config_hash FROM scan_tasks WHERE id = 1`).Scan(&target, &configHash); err != nil || target != "127.0.0.1" || configHash != "m10-fixture-config" {
+		t.Fatalf("upgraded M10 task target=%q hash=%q err=%v", target, configHash, err)
+	}
+	var status, trigger, stage, reportPath, auditPath string
+	var progress int
+	if err := db.QueryRow(`SELECT status, trigger, stage, progress, report_path, audit_report_path FROM scan_task_runs WHERE id = 1`).Scan(&status, &trigger, &stage, &progress, &reportPath, &auditPath); err != nil {
+		t.Fatal(err)
+	}
+	if status != "success" || trigger != "scheduled" || stage != "completed" || progress != 100 || reportPath != "reports/run.md" || auditPath != "reports/run-audit.md" {
+		t.Fatalf("upgraded M10 run status=%q trigger=%q stage=%q progress=%d report=%q audit=%q", status, trigger, stage, progress, reportPath, auditPath)
+	}
+	var service, product, banner string
+	if err := db.QueryRow(`SELECT service_type, product, banner FROM scan_task_run_ports WHERE scan_task_run_id = 1 AND ip = '127.0.0.1' AND port = 22`).Scan(&service, &product, &banner); err != nil || service != "ssh" || product != "legacy" || banner != "SSH-2.0-legacy" {
+		t.Fatalf("upgraded M10 port service=%q product=%q banner=%q err=%v", service, product, banner, err)
+	}
 }
 
 func assertUpgradeMarker(t *testing.T, db *sql.DB, expected string) {
