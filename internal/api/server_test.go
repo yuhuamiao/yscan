@@ -571,6 +571,73 @@ func TestScanTaskCreateResponseKeepsFullPortRangeCompact(t *testing.T) {
 	}
 }
 
+func TestScanTaskAPIUpdateAndRunNowKeepServerNucleiDefaults(t *testing.T) {
+	db := openScanTaskAPIDB(t)
+	const defaultTemplates = "/opt/yscan/nuclei-templates"
+	service := schedule.NewTaskService(db, schedule.ClockFunc(func() time.Time {
+		return time.Date(2026, time.August, 13, 9, 0, 0, 0, time.UTC)
+	})).WithDefaultNucleiTemplates(defaultTemplates)
+	started := make(chan model.ScanTaskRun, 1)
+	handler, err := newHandlerWithScanTasks(db, func(string, string) (int64, error) { return 1, nil }, service, func(_ context.Context, run model.ScanTaskRun) {
+		started <- run
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	createBody := `{"target":"127.0.0.1","scan_type":"ip","mode":"scheduled","cron":"0 2 * * *","timezone":"UTC","config":{"port_spec":"80","vulnerability_on":true,"nuclei_templates":""}}`
+	createdResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createdResponse, httptest.NewRequest(http.MethodPost, "/api/scan-tasks", bytes.NewBufferString(createBody)))
+	if createdResponse.Code != http.StatusCreated {
+		t.Fatalf("create response=%d %s", createdResponse.Code, createdResponse.Body.String())
+	}
+	var created createScanTaskResponse
+	if err := json.Unmarshal(createdResponse.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Task.Config.NucleiTemplates != defaultTemplates || created.Task.ConfigHash == "" {
+		t.Fatalf("created task did not freeze Server defaults: %#v", created.Task)
+	}
+
+	taskPath := "/api/scan-tasks/" + strconv.FormatInt(created.Task.ID, 10)
+	updatedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(updatedResponse, httptest.NewRequest(http.MethodPut, taskPath, bytes.NewBufferString(createBody)))
+	if updatedResponse.Code != http.StatusOK {
+		t.Fatalf("update response=%d %s", updatedResponse.Code, updatedResponse.Body.String())
+	}
+	var updated model.ScanTask
+	if err := json.Unmarshal(updatedResponse.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Config.NucleiTemplates != defaultTemplates || updated.ConfigHash != created.Task.ConfigHash {
+		t.Fatalf("no-op update changed frozen defaults: before=%#v after=%#v", created.Task, updated)
+	}
+
+	getResponse := httptest.NewRecorder()
+	handler.ServeHTTP(getResponse, httptest.NewRequest(http.MethodGet, taskPath, nil))
+	var stored model.ScanTask
+	if err := json.Unmarshal(getResponse.Body.Bytes(), &stored); err != nil || getResponse.Code != http.StatusOK {
+		t.Fatalf("get response=%d task=%#v err=%v", getResponse.Code, stored, err)
+	}
+	if stored.Config.NucleiTemplates != defaultTemplates || stored.ConfigHash != created.Task.ConfigHash {
+		t.Fatalf("stored task changed frozen defaults: %#v", stored)
+	}
+
+	runNowResponse := httptest.NewRecorder()
+	handler.ServeHTTP(runNowResponse, httptest.NewRequest(http.MethodPost, taskPath+"/run-now", nil))
+	if runNowResponse.Code != http.StatusAccepted {
+		t.Fatalf("run-now response=%d %s", runNowResponse.Code, runNowResponse.Body.String())
+	}
+	select {
+	case run := <-started:
+		if run.Config.NucleiTemplates != defaultTemplates || run.ConfigHash != created.Task.ConfigHash {
+			t.Fatalf("run snapshot lost Server defaults: %#v", run)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run-now did not launch the frozen run")
+	}
+}
+
 func TestMigratedScanTaskNoOpAPIEditKeepsDiffComparable(t *testing.T) {
 	databasePath := filepath.Join(t.TempDir(), "migrated-no-op.db")
 	db, err := storage.InitDBAt(databasePath)

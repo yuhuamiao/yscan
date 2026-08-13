@@ -19,7 +19,6 @@ import (
 	"golandproject/yscan/internal/diff"
 	"golandproject/yscan/internal/model"
 	"golandproject/yscan/internal/report"
-	"golandproject/yscan/internal/schedule"
 	"golandproject/yscan/internal/storage"
 	"golandproject/yscan/internal/web"
 )
@@ -28,6 +27,7 @@ type TaskRunner func(taskType, target string) (int64, error)
 
 type ScanTaskCreator interface {
 	Create(context.Context, model.ScanTask) (model.ScanTask, *model.ScanTaskRun, error)
+	Update(context.Context, model.ScanTask) (model.ScanTask, error)
 }
 
 type ScanTaskRunOperator interface {
@@ -422,7 +422,7 @@ func newHandlerWithScanTasksContextAndGroup(serviceContext context.Context, db *
 					writeJSON(w, http.StatusNotFound, map[string]string{"error": "scan task not found"})
 					return
 				}
-				updated, err := schedule.NewTaskService(db, nil).Update(r.Context(), model.ScanTask{ID: taskID, Target: strings.TrimSpace(req.Target), ScanType: strings.TrimSpace(req.ScanType), Mode: strings.TrimSpace(req.Mode), Cron: strings.TrimSpace(req.Cron), Timezone: strings.TrimSpace(req.Timezone), Config: req.Config, Status: current.Status})
+				updated, err := creator.Update(r.Context(), model.ScanTask{ID: taskID, Target: strings.TrimSpace(req.Target), ScanType: strings.TrimSpace(req.ScanType), Mode: strings.TrimSpace(req.Mode), Cron: strings.TrimSpace(req.Cron), Timezone: strings.TrimSpace(req.Timezone), Config: req.Config, Status: current.Status})
 				if err != nil {
 					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 					return
