@@ -988,6 +988,9 @@ func runMainArgs(rawArgs []string) (returnErr error) {
 			return err
 		}
 		defer serverSession.Close()
+		if err := serverSession.SetRestartArguments(effectiveBackgroundArguments(runtimeConfig, cfg), args[1:]); err != nil {
+			return err
+		}
 		serviceLog, err = appRuntime.OpenRotatingLogWriter(filepath.Join(paths.LogsDir, "yscan.log"), runtimeConfig.LogMaxBytes, runtimeConfig.LogMaxFiles)
 		if err != nil {
 			return err
@@ -1150,13 +1153,22 @@ func handleServerManagementCommand(paths appRuntime.HomePaths, args []string, co
 			}
 		}
 		oldAddress := ""
+		oldEffectiveArguments := []string(nil)
+		oldServerArguments := []string(nil)
 		if inspection.Status == appRuntime.ServerRunning && inspection.State != nil {
 			oldAddress = inspection.State.ListenAddress
+			oldEffectiveArguments = inspection.State.RestartEffectiveArguments
+			oldServerArguments = inspection.State.RestartServerArguments
 		}
-		start := func(serverArguments []string) error {
-			return appRuntime.StartBackgroundServer(paths, effectiveBackgroundArguments(config, cli), serverArguments, 2*time.Minute)
+		newEffectiveArguments := effectiveBackgroundArguments(config, cli)
+		start := func(effectiveArguments, serverArguments []string) error {
+			return appRuntime.StartBackgroundServer(paths, effectiveArguments, serverArguments, 2*time.Minute)
 		}
-		if err := restartBackgroundServer(paths, args[1:], oldAddress, start); err != nil {
+		if len(oldEffectiveArguments) == 0 {
+			oldEffectiveArguments = newEffectiveArguments
+			oldServerArguments = []string{oldAddress}
+		}
+		if err := restartBackgroundServer(paths, newEffectiveArguments, args[1:], oldEffectiveArguments, oldServerArguments, oldAddress, start); err != nil {
 			return true, err
 		}
 		return true, nil
@@ -1169,15 +1181,15 @@ func sameServerListenAddress(left, right string) bool {
 	return strings.EqualFold(strings.TrimSpace(left), strings.TrimSpace(right))
 }
 
-func restartBackgroundServer(paths appRuntime.HomePaths, serverArguments []string, oldAddress string, start func([]string) error) error {
+func restartBackgroundServer(paths appRuntime.HomePaths, effectiveArguments, serverArguments, oldEffectiveArguments, oldServerArguments []string, oldAddress string, start func([]string, []string) error) error {
 	if err := appRuntime.StopServer(paths, 30*time.Second, false); err != nil {
 		return err
 	}
-	if err := start(serverArguments); err != nil {
+	if err := start(effectiveArguments, serverArguments); err != nil {
 		if strings.TrimSpace(oldAddress) == "" {
 			return err
 		}
-		recoveryErr := start([]string{oldAddress})
+		recoveryErr := start(oldEffectiveArguments, oldServerArguments)
 		if recoveryErr != nil {
 			return fmt.Errorf("restart failed: %v; restoring previous listener %s also failed: %w", err, oldAddress, recoveryErr)
 		}

@@ -26,9 +26,15 @@ func TestServerSessionStateAndStaleRecovery(t *testing.T) {
 	if err := session.MarkRunning(); err != nil {
 		t.Fatal(err)
 	}
+	if err := session.SetRestartArguments([]string{"--listen", "127.0.0.1:8080"}, []string{"127.0.0.1:8080"}); err != nil {
+		t.Fatal(err)
+	}
 	inspection := InspectServer(paths)
 	if inspection.Status != ServerRunning || inspection.State == nil || inspection.State.HealthToken == "" {
 		t.Fatalf("running inspection = %#v", inspection)
+	}
+	if strings.Join(inspection.State.RestartEffectiveArguments, " ") != "--listen 127.0.0.1:8080" || strings.Join(inspection.State.RestartServerArguments, " ") != "127.0.0.1:8080" {
+		t.Fatalf("restart arguments were not persisted: %#v", inspection.State)
 	}
 	if err := session.MarkDegraded("scheduler stopped"); err != nil {
 		t.Fatal(err)

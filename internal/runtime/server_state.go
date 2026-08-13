@@ -23,13 +23,15 @@ const (
 
 // ServerState is health metadata, not an inter-process lock.
 type ServerState struct {
-	PID           int          `json:"pid"`
-	Status        ServerStatus `json:"status"`
-	ListenAddress string       `json:"listen_address"`
-	HealthToken   string       `json:"health_token"`
-	StartedAt     time.Time    `json:"started_at"`
-	UpdatedAt     time.Time    `json:"updated_at"`
-	Diagnostic    string       `json:"diagnostic,omitempty"`
+	PID                       int          `json:"pid"`
+	Status                    ServerStatus `json:"status"`
+	ListenAddress             string       `json:"listen_address"`
+	HealthToken               string       `json:"health_token"`
+	StartedAt                 time.Time    `json:"started_at"`
+	UpdatedAt                 time.Time    `json:"updated_at"`
+	Diagnostic                string       `json:"diagnostic,omitempty"`
+	RestartEffectiveArguments []string     `json:"restart_effective_arguments,omitempty"`
+	RestartServerArguments    []string     `json:"restart_server_arguments,omitempty"`
 }
 
 type ServerInspection struct {
@@ -66,6 +68,21 @@ func AcquireServerSessionForStartup(paths HomePaths, listenAddress string) (*Ser
 }
 
 func (session *ServerSession) MarkRunning() error { return session.update(ServerRunning, "") }
+
+func (session *ServerSession) SetRestartArguments(effective, server []string) error {
+	if session == nil {
+		return errors.New("server session is unavailable")
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.closed {
+		return errors.New("server session is closed")
+	}
+	session.state.RestartEffectiveArguments = append([]string(nil), effective...)
+	session.state.RestartServerArguments = append([]string(nil), server...)
+	session.state.UpdatedAt = time.Now().UTC()
+	return writeServerStateAtomic(session.paths.ServerState, session.state)
+}
 
 func (session *ServerSession) MarkDegraded(diagnostic string) error {
 	return session.update(ServerDegraded, diagnostic)

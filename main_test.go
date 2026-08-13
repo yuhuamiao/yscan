@@ -425,19 +425,22 @@ func TestRestartBackgroundServerRestoresPreviousListenerAfterStartFailure(t *tes
 	// recovery test exercises the post-stop start sequence directly.
 	_ = session.Close()
 	calls := 0
-	start := func(arguments []string) error {
+	start := func(effectiveArguments, serverArguments []string) error {
 		calls++
 		if calls == 1 {
+			if len(effectiveArguments) != 1 || effectiveArguments[0] != "new-effective" {
+				t.Fatalf("new effective arguments=%v", effectiveArguments)
+			}
 			return errors.New("injected new listener failure")
 		}
-		if len(arguments) != 1 || arguments[0] != "127.0.0.1:18080" {
-			t.Fatalf("recovery arguments=%v", arguments)
+		if len(effectiveArguments) != 1 || effectiveArguments[0] != "old-effective" || len(serverArguments) != 1 || serverArguments[0] != "127.0.0.1:18080" {
+			t.Fatalf("recovery effective=%v server=%v", effectiveArguments, serverArguments)
 		}
 		return nil
 	}
 	// A stopped state makes StopServer a no-op and leaves the start/recovery
 	// behavior deterministic without sending a signal to the test process.
-	err = restartBackgroundServer(paths, []string{"127.0.0.1:19090"}, "127.0.0.1:18080", start)
+	err = restartBackgroundServer(paths, []string{"new-effective"}, []string{"127.0.0.1:19090"}, []string{"old-effective"}, []string{"127.0.0.1:18080"}, "127.0.0.1:18080", start)
 	if err == nil || !strings.Contains(err.Error(), "was restored") || calls != 2 {
 		t.Fatalf("restart recovery calls=%d err=%v", calls, err)
 	}
